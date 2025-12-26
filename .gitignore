@@ -1,0 +1,80 @@
+# Python cache / compiled
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Dependency metadata
+*.egg-info/
+.eggs/
+
+# Build / packaging
+build/
+dist/
+wheelhouse/
+
+# Logs
+*.log
+
+# Coverage / testing
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / editor
+.vscode/
+.idea/
+*.iml
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment & secrets
+.env
+.env.*
+*.env
+
+# Cache
+.cache/
+
+# Node (if any frontend assets)
+node_modules/
+
+
+.claudek8s/secrets.yaml
+.env
+
+secrets.yaml
+
+# Kubernetes / local scripts
+script/
+scripts/
+
+# SSH / certs / keys
+*.pem
+*.key
+
+# Docker / compose local overrides
+docker-compose.override.yml
+.envrc
+
+# Misc editor backups
+*.swp
+*.bak
+*~
+*.py.save
+
+# k8s
+secrets.yaml
+
+Api360-backend/
