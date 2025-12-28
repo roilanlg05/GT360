@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from datetime import date, time
+from datetime import date, time, datetime
 from typing import Dict, Optional
 
 
@@ -27,7 +27,25 @@ class CreateTrip(BaseModel):
     pick_up_time: time
     pick_up_location: str
     drop_off_location: str
-    asigned_to: str
+    assigned_driver: str
     airline: str
     flight_number: str
     riders: dict[str, int]
+
+
+class TripResponse(BaseModel):
+    id: str
+    assigned_driver: Optional[str] = None
+    location_id: str
+    pick_up_date: date
+    pick_up_time: time
+    pick_up_location: str
+    drop_off_location: str
+    airline: str
+    flight_number: str
+    riders: Optional[Dict[str, int]] = None
+    started_at: Optional[datetime] = None
+    picked_up_at: Optional[datetime] = None
+    dropped_off_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime

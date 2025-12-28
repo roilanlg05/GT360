@@ -1,0 +1,1 @@
+from .trip_model import *

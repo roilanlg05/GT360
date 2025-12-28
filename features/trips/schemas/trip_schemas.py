@@ -1,12 +1,13 @@
 from psqlmodel import table, Column, PSQLModel, Relation, Relationship, UniqueConstraint, CheckConstraint
 from psqlmodel.orm.types import uuid, jsonb, timestamptz, date, time
 from psqlmodel.utils import gen_default_uuid, now
-from features.auth.schemas import Driver, Location
+from features.auth.schemas import Driver, Location, Organization
 
 @table("trips", unique_together=[
     "location_id", "pick_up_date", 
     "pick_up_time", "airline", 
-    "flight_number", "pick_up_location"
+    "flight_number", "pick_up_location", 
+    "drop_off_location"
 ])
 class Trip(PSQLModel):
 
@@ -17,14 +18,14 @@ class Trip(PSQLModel):
 
     assigned_driver: uuid = Column(
         default=None,
-        foreign_key="drivers.id",
+        foreign_key=Driver.id,
         on_delete="SET NULL",
         index=True,
         nullable=True,
     )
 
     location_id: uuid = Column(
-            foreign_key="locations.id",
+            foreign_key=Location.id,
             on_delete="CASCADE",
             nullable=False,
             index=True,
@@ -81,7 +82,8 @@ class Trip(PSQLModel):
 @table('trips_history', unique_together=[
     "location_id", "pick_up_date", 
     "pick_up_time", "airline", 
-    "flight_number", "pick_up_location"
+    "flight_number", "pick_up_location",
+    "drop_off_location"
 ])
 class TripHistory(PSQLModel):
 
@@ -162,7 +164,7 @@ class Airport(PSQLModel):
         primary_key=True
     )
 
-    code: str = Column(max_len=10, nullable=False, index=True)
+    code: str = Column(max_len=10, nullable=False, index=True, unique=True)
     
     name: str = Column(max_len=150, nullable=False)
     

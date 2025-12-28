@@ -189,10 +189,14 @@ async def sign_in(
         "role": user.role
     }
 
-    if user.manager and user.role == "manager":
-        metadata["organization_id"] = str(user.manager.organization_id) if user.manager.organization_id else None
-    elif user.crew and user.role == "crew":
-        metadata["airline"] = user.crew.airline
+    if user.role == "manager":
+        org_row = await session.exec(Select(Manager.organization_id).Where(Manager.id == user.id)).first()
+        if org_row[0] and org_row.organization_id:
+            metadata["organization_id"] = str(org_row.organization_id)
+    elif user.role == "crew":
+        airline_row = await session.exec(Select(Crew.airline).Where(Crew.id == user.id)).first()
+        if airline_row[0] and airline_row.airline:
+            metadata["airline"] = airline_row.airline
 
     access_token = encode_token(str(user.id), metadata)
     raw, token_hash, exp = gen_refresh_token()
@@ -220,6 +224,7 @@ async def sign_in(
 @router.post("/sign-out/", status_code=200)
 async def sign_out(
     request: Request,
+    response: Response,
     session: AsyncSession = Depends(get_db)
     ):
 
@@ -233,6 +238,10 @@ async def sign_out(
     user_id = request.state.user_data.get("id")
 
     await revoke_all_user_refresh(session, user_id)
+
+    delete_cookies(
+        response, 
+        ["refresh_token", "expires_at"])
 
     return JSONResponse({"message": "All cookies revoked"}, status_code=200)
 
@@ -262,10 +271,15 @@ async def refresh_token(
     }
 
     # Agregar campos específicos del rol
-    if user.manager and user.role == "manager":
-        metadata["organization_id"] = str(user.manager.organization_id) if user.manager.organization_id else None
-    elif user.crew and user.role == "crew":
-        metadata["airline"] = user.crew.airline           
+    if user.role == "manager":
+        org_row = await session.exec(Select(Manager.organization_id).Where(Manager.id == user.id)).first()
+        if org_row[0] and org_row.organization_id:
+            metadata["organization_id"] = str(org_row.organization_id)
+    elif user.role == "crew":
+        airline_row = await session.exec(Select(Crew.airline).Where(Crew.id == user.id)).first()
+        if airline_row[0] and airline_row.airline:
+            metadata["airline"] = airline_row.airline
+               
 
     access_token = encode_token(str(user.id), metadata)
     access_token.update({"type": "bearer"})
@@ -290,6 +304,7 @@ async def refresh_token(
 async def change_password(
     data: PasswordUpdate, 
     user_id: str,
+    response: Response,
     session: AsyncSession = Depends(get_db), 
     ) -> dict:
 
@@ -302,17 +317,22 @@ async def change_password(
         raise HTTPException(status_code=e.status_code, detail=e.detail)
     
     if not await verify_password(session, data.current_password, user.password_hash, user_id):
-        raise HTTPException(status_code=401, detail="Incorrect current password")
+        raise HTTPException(status_code=403, detail="Incorrect current password")
     
     if await verify_password(session, data.new_password, user.password_hash, user_id):
         raise HTTPException(status_code=409, detail="The new password must be different from your current password.")
 
     user.password_hash = hash_pwd(data.new_password)
     session.add(user)
-    await session.commit()
 
     # Revocar todos los refresh tokens
     await revoke_all_user_refresh(session, user_id)
+
+    await session.commit()
+
+    delete_cookies(
+        response, 
+        ["refresh_token", "expires_at"])
 
     return JSONResponse({"message":"Password reset successful. Please sign in again with your new password."}, status_code=200)
     

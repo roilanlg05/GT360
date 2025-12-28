@@ -18,6 +18,7 @@ class BaseAppSettings(BaseSettings):
     JWT_SECRET_KEY: Optional[str] = os.getenv("JWT_SECRET_KEY")
     ALGORITHM: str = os.getenv("ALGORITHM")
     PEPPER: Optional[str] = os.getenv("PEPPER")
+    WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET")
     PUBLIC_PATHS: list[str] = [
         "/v1/auth/register",
         "/v1/auth/sign-in", 
@@ -32,7 +33,8 @@ class BaseAppSettings(BaseSettings):
         "/v1/auth/register/organization",
         "/health",
         "/ready",
-        "/v1/auth/verify-data"
+        "/v1/auth/verify-data",
+        "/v1/webhooks/trips"
     ]
 
     class Config:

@@ -1,4 +1,4 @@
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from features.auth.schemas import User, Manager, Crew, Token
 from psqlmodel import Select
 from argon2 import PasswordHasher
@@ -9,8 +9,11 @@ from shared.settings import settings
 from shared.redis.redis_client import redis_client
 import secrets
 import hashlib
+from features.trips.utils import get_locations_by_org_id
 
 ph = PasswordHasher()
+
+WEBHOOK_SECRET=settings.WEBHOOK_SECRET
 
 def now() -> datetime:
     """
@@ -286,11 +289,9 @@ def set_cookies(response, data:dict):
             httponly=True, 
             secure=False,  
             samesite="lax",
-            domain="192.168.0.133",
+            #domain="192.168.0.133",
             path="/",
             max_age=30 * 24 * 60 * 60,  # 30 días
-            expires = None,
-            partitioned = False
         )
 
 
@@ -308,12 +309,12 @@ def delete_cookies(response, cookies:list[str]):
 
     for cookie in cookies:
         response.delete_cookie(
-            key=cookie, 
+            key=cookie,
             path="/",
             httponly=True,
-            secure=False,        # Descomentar con HTTPS
-            samesite="lax",
-            domain="192.168.0.133",
+            secure=False,  # Cambia a True si usas HTTPS en producción
+            samesite="lax", 
+            #domain="192.168.0.133", # Descomenta y ajusta el dominio si lo usas en set_cookies
         )
 
 
@@ -342,7 +343,7 @@ async def revoke_all_user_refresh(session, user_id: str):
         r.revoked = True
         session.add(r)
         
-    await session.commit()
+    await session.flush()
     return len(rows)
 
 async def get_refresh_by_hash(session, refresh_token: str) -> Token | None:
@@ -418,19 +419,207 @@ async def validate_refresh(session, refresh_token) -> Token:
 
 def get_token(request):
 
-    auth_header = request.headers.get("Authorization")
+    """
+    Extracts the Bearer token from the Authorization header in a standard HTTP request.
 
+    Args:
+        request: The incoming HTTP request object.
+
+    Raises:
+        ValueError: If the Authorization header is missing or does not contain a Bearer token.
+
+    Returns:
+        str: The extracted Bearer token.
+    """
+    auth_header = request.headers.get("Authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
         raise ValueError("Missing authentication token")
-    
     token = auth_header.split(" ", 1)[1].strip()
+    if not token:
+        raise ValueError("Missing authentication token")
+    return token
 
+def get_ws_token(ws):
+
+    """
+    Extracts the Bearer token from the Authorization header in a WebSocket connection.
+
+    Args:
+        ws: The WebSocket connection object.
+
+    Raises:
+        ValueError: If the authorization header is missing or does not contain a Bearer token.
+
+    Returns:
+        str: The extracted Bearer token.
+    """
+    auth_header = ws.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise ValueError("Missing authentication token")
+    token = auth_header.split(" ", 1)[1].strip()
     if not token:
         raise ValueError("Missing authentication token")
     return token
 
 async def blacklist_token(token: str, exp_seconds: int = 300):
+    """
+    Blacklists a JWT token by storing it in Redis with an expiration time.
+
+    Args:
+        token (str): The JWT token to blacklist.
+        exp_seconds (int, optional): Expiration time in seconds for the blacklist entry. Default is 300 seconds.
+
+    Raises:
+        ValueError: If the token is already blacklisted.
+
+    Returns:
+        None
+    """
     if await redis_client.exists(f"blacklist:{token}"):
         raise ValueError("Token revoked")
-    
     await redis_client.setex(f"blacklist:{token}", exp_seconds, "blacklisted")
+
+def verify_role(roles: list):
+        
+    """
+    Checks if the current user has at least one of the required roles.
+
+    Args:
+        roles: List of roles to check against the user's assigned roles.
+
+    Raises:
+        HTTPException: If the user does not have any of the required roles.
+
+    Returns:
+        None. Proceeds if the user has the required role(s).
+    """
+
+    def _dep(request: Request):
+        user_data = request.state.user_data
+        print(f"USER DATA: {user_data}")
+        if not user_data:
+            raise HTTPException(status_code=401, detail="Missing or invalid authentication")
+        #
+        role = None
+        if user_data:
+            role = user_data.get("role")
+            print(f"USER ROLE: {role}")
+        if not role or role not in roles:
+            raise HTTPException(
+                status_code=403,
+                detail="Not Authorized: We couldn't validate the role"
+            )
+        return user_data
+    return _dep
+
+#===================================================================================
+# Webhook Auth
+#===================================================================================
+
+import hmac
+import hashlib
+import time
+from typing import Tuple, Optional
+
+def _parse_signature_header(signature: str) -> Tuple[Optional[int], Optional[str]]:
+    """
+    Parses a signature header for webhook verification.
+
+    Accepts:
+        - "t=1700000000,v1=abcdef..." (with timestamp)
+        - "v1=abcdef..." (without timestamp)
+        - "abcdef..." (raw hex signature)
+
+    Args:
+        signature (str): The signature header value.
+
+    Returns:
+        tuple: (timestamp as int or None, hex signature as str or None)
+    """
+    if not signature:
+        return None, None
+
+    sig = signature.strip()
+
+    # Case: "t=...,v1=..."
+    if "t=" in sig and "v1=" in sig:
+        parts = [p.strip() for p in sig.split(",")]
+        t_val = None
+        v1_val = None
+        for p in parts:
+            if p.startswith("t="):
+                try:
+                    t_val = int(p.split("=", 1)[1].strip())
+                except Exception:
+                    t_val = None
+            elif p.startswith("v1="):
+                v1_val = p.split("=", 1)[1].strip()
+        return t_val, v1_val
+
+    # Case: "v1=..."
+    if sig.startswith("v1="):
+        return None, sig.split("=", 1)[1].strip()
+
+    # Case: raw hex
+    return None, sig
+
+
+def verify_webhook_signature(raw_body: bytes, signature: str, secret: str) -> bool:
+    """
+    Verifies an HMAC SHA256 signature for webhook requests using a timing-safe comparison.
+
+    Recommended usage: signature header "t=<unix>,v1=<hex>"
+    Anti-replay: rejects if timestamp is outside a 5-minute window.
+
+    Args:
+        raw_body (bytes): The raw request body.
+        signature (str): The signature header value.
+        secret (str): The shared secret for HMAC.
+
+    Returns:
+        bool: True if the signature is valid, False otherwise.
+    """
+    if not secret or not isinstance(secret, str):
+        return False
+
+    ts, provided_hex = _parse_signature_header(signature)
+    if not provided_hex:
+        return False
+
+    # Anti-replay (if timestamp is present)
+    if ts is not None:
+        now = int(time.time())
+        # 5-minute window (adjust if needed)
+        if abs(now - ts) > 300:
+            return False
+        msg = f"{ts}.".encode("utf-8") + raw_body
+    else:
+        # Less secure fallback (no timestamp)
+        msg = raw_body
+
+    expected_hex = hmac.new(
+        key=secret.encode("utf-8"),
+        msg=msg,
+        digestmod=hashlib.sha256
+    ).hexdigest()
+
+    # compare_digest requires same type/format
+    return hmac.compare_digest(expected_hex, provided_hex)
+
+
+async def user_can_access_location(session, org_id, location_id):
+    """
+    Checks if a user (by org_id) can access a specific location_id.
+
+    Args:
+        org_id (str): The organization ID.
+        location_id (str): The location ID to check.
+
+    Returns:
+        bool: True if the user can access the location, False otherwise.
+    """
+
+    locations = await get_locations_by_org_id(session, org_id)
+    location_ids = [loc["id"] for loc in locations]  # Ajusta según la estructura de tu objeto location
+
+    return location_id in location_ids

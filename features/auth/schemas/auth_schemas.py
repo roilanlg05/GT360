@@ -105,7 +105,7 @@ class Driver(PSQLModel):
 @table("supervisors", schema="auth")
 class Supervisor(PSQLModel):
 
-    id: uuid = Column(foreign_key=User.id, primary_key=True, unique=True)
+    id: uuid = Column(foreign_key=User.id, primary_key=True)
     
     organization_id: uuid = Column(
         foreign_key="organizations.id", 
@@ -122,7 +122,7 @@ class Supervisor(PSQLModel):
     profile_pic_url: str = Column(unique=True)
 
     user: Relation[User] = Relationship(cascade=True)
-    permissions: Relation[list["Permission"]] = Relationship(secondary="supervisors_permissions", cascade=True)
+    permissions: Relation[list["Permission"]] = Relationship(secondary="auth.supervisors_permissions", cascade=True)
 
 @table("permissions", schema="auth")
 class Permission(PSQLModel):
@@ -130,12 +130,12 @@ class Permission(PSQLModel):
     name: str = Column(nullable=False, index=True)
     description: str = Column(default=None)
 
-    supervisors: Relation[list[Supervisor]] = Relationship(secondary="supervisors_permissions", cascade=True)
+    supervisors: Relation[list[Supervisor]] = Relationship(secondary="auth.supervisors_permissions", cascade=True)
 
 @table("supervisors_permissions", schema="auth")
 class SupervisorsPermission(PSQLModel):
-    user_id: uuid = Column(foreign_key="auth.supervisors.id")
-    permission_id: uuid = Column(foreign_key="auth.permissions.id")
+    user_id: uuid = Column(foreign_key="auth.supervisors.id", nullable=False)
+    permission_id: uuid = Column(foreign_key="auth.permissions.id", nullable=False)
 
 @table("tokens", schema="auth")
 class Token(PSQLModel):
@@ -180,7 +180,7 @@ class Organization(PSQLModel):
     manager_id: uuid = Column(
         default=None,
         foreign_key = Manager.id, 
-        on_delete="SET NULL",  # <-- SET NULL para no borrar la organización
+        on_delete="CASCADE",  
         index=True,
         nullable=True,
         unique=True
