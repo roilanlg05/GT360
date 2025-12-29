@@ -79,16 +79,15 @@ class WSManager:
 
     async def route_location_event(self, location_id: str, trip_id: Optional[str], payload: dict) -> None:
         """
-        Recibe evento (desde Redis Pub/Sub) y lo distribuye:
-        - Siempre a los conectados en la location (si quieres refrescar listas)
-        - Y/o solo a los suscritos al trip_id (si quieres granularidad)
+        Distributes events:
+        - If trip_id is given, only to those subscribed to that trip.
+        - If trip_id is None, to all in the location (for general events).
         """
         async with self._lock:
-            loc_targets = set(self.rooms.get(location_id, set()))
-            trip_targets = set(self.trip_subscribers.get(trip_id, set())) if trip_id else set()
-
-            # Dedupe: si un WS está en ambos, se envía una sola vez
-            targets = list(loc_targets.union(trip_targets))
+            if trip_id:
+                targets = set(self.trip_subscribers.get(trip_id, set()))
+            else:
+                targets = set(self.rooms.get(location_id, set()))
 
         dead = []
         for ws in targets:
