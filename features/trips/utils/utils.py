@@ -1,7 +1,8 @@
 import json
 from shared.redis.redis_client import redis_client
 from psqlmodel import Select
-from features.auth.schemas import Location
+from shared.db.schemas import Location
+
 
 async def save_trip_event_to_redis(trip_id: str, event_data: dict):
     """

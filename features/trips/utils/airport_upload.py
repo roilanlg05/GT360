@@ -12,7 +12,7 @@ import os
 from psqlmodel import Session, create_engine, Select
 
 # 🔁 Ajusta este import al módulo donde tengas definido tu modelo Airport
-from ..schemas import Airport  # por ejemplo
+from shared.db.schemas import Airport  # por ejemplo
 
 # 📌 Ruta al CSV (ajusta según dónde lo tengas)
 CSV_PATH = Path("features/trips/utils/files/AIRPORTS.csv")
@@ -23,7 +23,7 @@ CSV_PATH = Path("features/trips/utils/files/AIRPORTS.csv")
 
 
 engine = create_engine(
-    username="hashdown",
+    username="gt360",
     password="Rlg*020305",
     database="gt360",
     ensure_database=False,
@@ -31,10 +31,7 @@ engine = create_engine(
     auto_startup=False,
     check_schema_drift=False,
     debug=True,
-    models_path=[
-        "features/auth/schemas/auth_schemas.py", 
-        "features/trips/schemas/trip_schemas.py"
-    ],
+    models_path="shared/db/schemas/",
     ignore_duplicates=True
 )
 

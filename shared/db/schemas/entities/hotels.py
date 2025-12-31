@@ -1,0 +1,1 @@
+from psqlmodel import PSQLModel, Column, table

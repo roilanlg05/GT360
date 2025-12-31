@@ -1,5 +1,5 @@
 from fastapi import HTTPException, Request
-from features.auth.schemas import User, Manager, Crew, Token
+from shared.db.schemas import User, Manager, Crew, Token
 from psqlmodel import Select
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
@@ -265,8 +265,8 @@ async def save_refresh_in_db(
         revoked=False,
         token_type="refresh"
     )
-    session.add(refresh_token)
-    await session.commit() 
+    session.add(refresh_token) 
+    await session.commit()
 
     return refresh_token
 
@@ -432,28 +432,6 @@ def get_token(request):
         str: The extracted Bearer token.
     """
     auth_header = request.headers.get("Authorization")
-    if not auth_header or not auth_header.startswith("Bearer "):
-        raise ValueError("Missing authentication token")
-    token = auth_header.split(" ", 1)[1].strip()
-    if not token:
-        raise ValueError("Missing authentication token")
-    return token
-
-def get_ws_token(ws):
-
-    """
-    Extracts the Bearer token from the Authorization header in a WebSocket connection.
-
-    Args:
-        ws: The WebSocket connection object.
-
-    Raises:
-        ValueError: If the authorization header is missing or does not contain a Bearer token.
-
-    Returns:
-        str: The extracted Bearer token.
-    """
-    auth_header = ws.headers.get("Authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
         raise ValueError("Missing authentication token")
     token = auth_header.split(" ", 1)[1].strip()

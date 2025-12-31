@@ -27,7 +27,7 @@ class CreateTrip(BaseModel):
     pick_up_time: time
     pick_up_location: str
     drop_off_location: str
-    assigned_driver: str
+    assigned_driver: str | None = None
     airline: str
     flight_number: str
     riders: dict[str, int]

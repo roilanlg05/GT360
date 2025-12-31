@@ -3,8 +3,8 @@ from fastapi.responses import JSONResponse
 from psqlmodel import Select, AsyncSession
 from features.auth.models.user_model import CreateCrewMember, UserData, CreateManager
 from features.auth.models.auth_model import EmailPasswordRequestForm, PasswordUpdate, NewPassword
-from features.auth.schemas import User, Crew, Manager, Organization
-from shared.db import get_db
+from shared.db.schemas import User, Crew, Manager, Organization
+from shared.db.db_config import get_db
 from shared.settings import settings
 from datetime import timedelta
 from features.auth.utils import(
@@ -290,6 +290,8 @@ async def refresh_token(
                 "session": access_token,
                 "user_data": metadata 
                 }}
+    
+    await session.commit()
     
     set_cookies(
         response,

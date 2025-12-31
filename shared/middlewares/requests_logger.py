@@ -2,7 +2,6 @@ import logging
 from datetime import datetime, timezone
 from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi import Request
-from fastapi.responses import JSONResponse
 
 
 logger = logging.getLogger(__name__) 

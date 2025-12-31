@@ -2,19 +2,15 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from shared.redis.redis_client import redis_client as redis
 from features.trips.utils.ws_manager import manager
 import json
-from shared.db import engine, AsyncSession
+from shared.db.db_config import engine, AsyncSession
 from psqlmodel import Select
-from typing import Set
-from features.trips.schemas import Trip
-from features.auth.utils import user_can_access_location, decode_token, get_ws_token
+from typing import Set, List
+from shared.db.schemas import Trip
+from features.auth.utils import user_can_access_location, decode_token
 
 router = APIRouter()
 
 async def send_snapshot(ws: WebSocket, location_id: str) -> None:
-    """
-    “Muy importante”: al conectar, enviar lo que esté en Redis primero (TTL 5 min),
-    para que el UI pinte rápido antes de depender de updates.
-    """
     idx_key = f"loc:{location_id}:trips"
     trip_ids = await redis.smembers(idx_key)
 
@@ -22,13 +18,22 @@ async def send_snapshot(ws: WebSocket, location_id: str) -> None:
         await ws.send_json({"type": "snapshot", "location_id": location_id, "trips": []})
         return
 
-    keys = [f"trip:{tid}" for tid in trip_ids]
+    # smembers puede devolver bytes; normalizamos a str
+    norm_ids = []
+    for tid in trip_ids:
+        if isinstance(tid, (bytes, bytearray)):
+            tid = tid.decode("utf-8", errors="ignore")
+        norm_ids.append(str(tid))
+
+    keys = [f"trip:{tid}" for tid in norm_ids]
     values = await redis.mget(keys)
 
     trips = []
     for v in values:
         if not v:
             continue
+        if isinstance(v, (bytes, bytearray)):
+            v = v.decode("utf-8", errors="ignore")
         try:
             trips.append(json.loads(v))
         except Exception:
@@ -37,28 +42,19 @@ async def send_snapshot(ws: WebSocket, location_id: str) -> None:
     await ws.send_json({"type": "snapshot", "location_id": location_id, "trips": trips})
 
 
-# ----------------- WEBSOCKET ENDPOINT -----------------
-
 @router.websocket("/ws/trips")
-async def ws_location_trips(ws: WebSocket, location_id: str):
-
-    try:
-        token = get_ws_token(ws)
-    except Exception:
-        await ws.close(code=1008)
-        return
-
+async def ws_location_trips(ws: WebSocket, location_id: str, token: str):
     try:
         claims = decode_token(token)
     except Exception:
         await ws.close(code=1008)
         return
-    
+
     metadata = claims.get("metadata")
     if not metadata:
         await ws.close(code=1008)
         return
-    
+
     org_id = metadata.get("organization_id")
 
     async with AsyncSession(engine) as session:
@@ -67,11 +63,7 @@ async def ws_location_trips(ws: WebSocket, location_id: str):
             return
 
     await manager.connect(ws, location_id, claims)
-
-    # Arranca listener Redis para esta location (una sola vez por proceso)
     await manager.ensure_location_listener(location_id)
-
-    # Snapshot primero (redis)
     await send_snapshot(ws, location_id)
 
     try:
@@ -81,49 +73,68 @@ async def ws_location_trips(ws: WebSocket, location_id: str):
             trip_ids = set(msg.get("trip_ids", []))
 
             if action == "subscribe":
-                # Validación simple/rápida:
-                # - si el trip está cacheado, verifica location_id dentro del JSON
-                # - si no está cacheado, lo normal es consultar DB (o rechazar hasta snapshot)
-                valid: Set[str] = set()
+                requested: Set[str] = set()
+
+                # normalizar ids a str y limpiar vacíos
                 for tid in trip_ids:
-                    raw = await redis.get(f"trip:{tid}")
-                    if raw:
-                        try:
-                            trip = json.loads(raw)
-                            if str(trip.get("location_id")) == str(location_id):
-                                valid.add(tid)
-                        except Exception:
+                    if isinstance(tid, (bytes, bytearray)):
+                        tid = tid.decode("utf-8", errors="ignore")
+                    tid = str(tid).strip()
+                    if tid:
+                        requested.add(tid)
+
+                if not requested:
+                    await ws.send_json({"type": "subscribed", "trip_ids": [], "trips": []})
+                    continue
+
+                # 1) Redis: un solo MGET
+                keys = [f"trip:{tid}" for tid in requested]
+                vals = await redis.mget(keys)
+
+                valid: Set[str] = set()
+                now: List[dict] = []
+                missing: List[str] = []
+
+                for tid, raw in zip(requested, vals):
+                    if not raw:
+                        missing.append(tid)
+                        continue
+
+                    if isinstance(raw, (bytes, bytearray)):
+                        raw = raw.decode("utf-8", errors="ignore")
+
+                    try:
+                        trip = json.loads(raw)
+                        if str(trip.get("location_id")) == str(location_id):
+                            valid.add(tid)
+                            now.append(trip)
+                        else:
+                            # existe pero es de otra location -> inválido
                             pass
-                    else:
-                        async with AsyncSession(engine) as session:
-                            try:
-                                result = await session.exec(
-                                    Select(Trip).Where((Trip.id == tid) & (Trip.location_id == location_id))
-                                ).first()
+                    except Exception:
+                        # si está corrupto, lo validamos por DB
+                        missing.append(tid)
 
-                                print("RESULTS: ", result)
+                # 2) DB: una sola query con .In(...)
+                if missing:
+                    async with AsyncSession(engine) as session:
+                        try:
+                            rows = await session.exec(
+                                Select(Trip).Where(
+                                    (Trip.location_id == location_id) & (Trip.id.In(missing))
+                                )
+                            ).all() or []
 
-                                trip = result.model_dump(mode="json")
-                                if trip:
-                                    valid.add(tid)
-                            except Exception as e:
-                                print(e)
+                            for r in rows:
+                                valid.add(str(r.id))
+
+                        except Exception as e:
+                            print("DB validate error:", e)
 
                 await manager.subscribe_trips(ws, valid)
 
-                # Opcional: responder con el estado actual cacheado de esos trips
-                # para pintar inmediatamente (si existía)
-                if valid:
-                    keys = [f"trip:{tid}" for tid in valid]
-                    vals = await redis.mget(keys)
-                    now = []
-                    for v in vals:
-                        if v:
-                            try: now.append(json.loads(v))
-                            except: pass
-                    await ws.send_json({"type": "subscribed", "trip_ids": list(valid), "trips": now})
-                else:
-                    await ws.send_json({"type": "subscribed", "trip_ids": []})
+                # responder con trips cacheados (solo Redis). Los validados por DB pueden no estar en Redis todavía.
+                await ws.send_json({"type": "subscribed", "trip_ids": list(valid), "trips": now})
 
             elif action == "unsubscribe":
                 await manager.unsubscribe_trips(ws, trip_ids)
@@ -131,6 +142,7 @@ async def ws_location_trips(ws: WebSocket, location_id: str):
 
             else:
                 await ws.send_json({"type": "error", "detail": "Unknown action"})
+
     except WebSocketDisconnect:
         await manager.disconnect(ws)
     except Exception:

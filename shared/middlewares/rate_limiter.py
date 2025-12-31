@@ -21,7 +21,10 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         super().__init__(app)
         self.default_limit = default_limit
         self.default_window = default_window
-        self.route_limits = {
+        self.route_limits = {}
+
+        """
+        
             "/v1/auth/register/crew-member": (3, 60),
             "/v1/auth/register/manager": (1000, 60),
             "/v1/auth/sign-in": (5, 60),
@@ -31,7 +34,8 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             "/v1/auth/verify-email": (5, 60),
             "/v1/auth/verify-data": (3, 60),
             "/health": (1000, 60),
-        }
+        
+        """
     
     def _get_limit_for_path(self, path: str) -> tuple[int, int]:
         """Obtiene el límite y ventana para una ruta específica."""

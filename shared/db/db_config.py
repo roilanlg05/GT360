@@ -1,6 +1,5 @@
 from psqlmodel import AsyncSession, create_async_engine
 from typing import AsyncGenerator
-from features.auth.schemas import *
 from shared.settings import settings
 
 engine = create_async_engine(
@@ -14,10 +13,8 @@ engine = create_async_engine(
     debug=True,
     max_pool_size=50,
     auto_adjust_pool_size=True,
-    models_path=[
-        "features/auth/schemas/auth_schemas.py", 
-        "features/trips/schemas/trip_schemas.py"
-    ],
+    models_path=
+        "shared/db/schemas/",
     ignore_duplicates=True,
     pool_close_timeout=10.0
 )

@@ -1,8 +1,8 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException, Query, Depends, Request, Response
 from fastapi.responses import JSONResponse
-from shared.db import get_db
+from shared.db.db_config import get_db
 from psqlmodel import Select, Count, Delete, AsyncSession
-from features.trips.schemas import Trip as TripDB, Location, Airport, Organization
+from shared.db.schemas import Trip as TripDB, Location, Airport, Organization
 from features.trips.utils.trip_importer import load_trips_from_bytes
 from features.trips.models import TripUpdate, CreateTrip
 from datetime import date, time, timezone
@@ -94,8 +94,13 @@ async def upload_trips(
     await session.refresh(location)
 
     # Crear los trips
+   
     created = 0
+    trips_to_create = []
+    trips = []
+
     try:
+        # 1. Construir la lista de objetos en memoria (rápido)
         for t in trips_import:
             db_trip = TripDB(
                 location_id=location.id,
@@ -107,30 +112,43 @@ async def upload_trips(
                 flight_number=t.flight_number,
                 riders=t.riders,
             )
-            session.add(db_trip)
+            trips_to_create.append(db_trip)
             created += 1
 
-        await session.commit()
+        # 2. Insertar todo el lote de una sola vez (optimizado)
+        if trips_to_create:
+            # Procesar en chunks si son miles (ej. 5000) para no saturar la consulta
+            chunk_size = 5000
+            for i in range(0, len(trips_to_create), chunk_size):
+                batch = trips_to_create[i : i + chunk_size]
+                
+                # [NUEVO] Usar BulkInsert (PascalCase) para máxima velocidad.
+                trips = (
+                    await session.BulkInsert(batch)
+                        .Returning(TripDB)
+                        .OrderBy(
+                            TripDB.pick_up_date,
+                            TripDB.pick_up_time
+                        )
+                        .Asc()
+                        .Limit(50)
+                        .to_dicts()
+                )
+
+            # Confirmar la transacción
+            await session.commit()
 
     except Exception as e:
+        # Tu manejo de errores original
         msg = str(e)
+        print(e)
         if "DETAIL:" in msg:
             msg = msg.split("DETAIL:", 1)[1].strip()
         raise HTTPException(
             status_code=422,
             detail=f"We couldn't validate the schedule: {msg}"
         )
-    
-    trips_stmt = (
-        Select(TripDB)
-        .OrderBy(
-            TripDB.pick_up_date,
-            TripDB.pick_up_time
-        )
-        .Asc()
-        .Limit(10)
-    )
-    trips = await session.exec(trips_stmt).to_dicts()
+
 
     return {
         "status": "ok",
@@ -156,36 +174,35 @@ async def create_trip(
         raise HTTPException(status_code=400, detail="ID de location inválido")
     
     try:
-        # Ensure pick_up_date/time are proper Python date/time objects before saving.
-        # If they arrive as ISO strings, parse them; otherwise keep as-is.
+        # preparar payload y convertir strings a date/time si vienen como texto
         trip_payload = trip_data.model_dump(exclude_unset=True)
-        # parse ISO date string -> date
         if "pick_up_date" in trip_payload and isinstance(trip_payload.get("pick_up_date"), str):
             trip_payload["pick_up_date"] = date.fromisoformat(trip_payload["pick_up_date"])
-        # parse ISO time string -> time
         if "pick_up_time" in trip_payload and isinstance(trip_payload.get("pick_up_time"), str):
             trip_payload["pick_up_time"] = time.fromisoformat(trip_payload["pick_up_time"])
-        # Ensure timezone-aware time for DB (column is TIME WITH TIME ZONE)
         if "pick_up_time" in trip_payload and isinstance(trip_payload.get("pick_up_time"), time) and trip_payload["pick_up_time"].tzinfo is None:
             trip_payload["pick_up_time"] = trip_payload["pick_up_time"].replace(tzinfo=timezone.utc)
-        
-        trip = TripDB(
-            location_id=location_id, 
-            **trip_payload
-        )
 
+        trip = TripDB(location_id=location_id, **trip_payload)
         session.add(trip)
-        
-        await session.commit()
+        # flush para obtener ids y validar DB antes del commit
+        await session.flush()
 
-        trip.model_dump(mode="json")
+        # commit dentro del try: si algo falla después (p. ej. serialización), entra en except
+        await session.commit()
+        await session.refresh(trip)
+
+        trip_json = trip.model_dump(mode="json")
+        return JSONResponse(status_code=200, content={"data": trip_json})
 
     except Exception as e:
+        # intentar rollback, ignorando errores del rollback mismo
+        try:
+            await session.rollback()
+        except Exception:
+            pass
         raise HTTPException(status_code=400, detail=str(e))
     
-    return JSONResponse(status_code=200, content={"data": trip})
-    
-
 @router.get("/v1/locations/{location_id}/trips")
 async def get_trips(
     location_id: str,
@@ -384,9 +401,7 @@ async def edit_trip(
     # Comprobar existencia del trip
     sel_stmt = Select(TripDB).Where((TripDB.id == uuid_id) & (TripDB.location_id == uuid_location_id))
     trip = await session.exec(sel_stmt).first()
-    if trip:
-        print("Psqlmodel:", trip) #[0].model_dump(mode="json")
-    else:
+    if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
 
     # Actualizar datos del trip: parsear strings ISO a date/time si es necesario
@@ -402,8 +417,12 @@ async def edit_trip(
     for key, value in update_data.items():
         setattr(trip, key, value)
 
+    session.add(trip)
+
     await session.commit()
     trip = trip.model_dump(mode="json")
+
+    print("TRIP UPDATED: ", trip)
     
     return JSONResponse(content={"status": "ok", "trip": trip})
 
@@ -431,6 +450,8 @@ async def delete_location(
         Delete(Location)
         .Where(Location.id == location_id)
     )
+
+    await session.commit()
 
     return JSONResponse(status_code=200, content={"data": f"Location {location_id} deleted successfully"})
 
