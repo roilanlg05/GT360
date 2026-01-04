@@ -24,7 +24,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="GT360", version="0.1.0", lifespan=lifespan)
 
-#app.add_middleware(HTTPErrorHandler)
+app.add_middleware(HTTPErrorHandler)  # Maneja errores 500 con headers CORS
 app.add_middleware(RateLimitMiddleware)
 app.add_middleware(VerifyToken)
 app.add_middleware(RequestLoggerMiddleware)

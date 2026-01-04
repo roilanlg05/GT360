@@ -158,10 +158,19 @@ async def upload_trips(
 
             # Convertir nombres de hoteles a objetos Hotel y hacer bulk insert
             if hotels_set:
-                hotel_objects = [Hotel(name=name, location_id=location.id) for name in hotels_set]
-                hotels_objs = await session.BulkInsert(hotel_objects).Returning(Hotel).all()
-                # Serializar hoteles a JSON (convierte UUIDs a strings)
-                hotels_result = [h.model_dump(mode="json") for h in hotels_objs]
+                # Consultar hoteles existentes para esta location
+                existing_hotels_stmt = Select(Hotel.name).Where(Hotel.location_id == location.id)
+                existing_hotels_result = await session.exec(existing_hotels_stmt).all()
+                existing_hotel_names = {h for h in existing_hotels_result}
+                
+                # Filtrar solo los hoteles nuevos
+                new_hotels = hotels_set - existing_hotel_names
+                
+                if new_hotels:
+                    hotel_objects = [Hotel(name=name, location_id=location.id) for name in new_hotels]
+                    hotels_objs = await session.BulkInsert(hotel_objects).Returning(Hotel).all()
+                    # Serializar hoteles a JSON (convierte UUIDs a strings)
+                    hotels_result = [h.model_dump(mode="json") for h in hotels_objs]
 
         # Confirmar la transacción solo si todo salió bien
         await session.commit()
@@ -271,9 +280,24 @@ async def get_trips(
     """
     Obtiene una lista paginada de trips.
     """
+    from uuid import UUID
+
+    # Validar UUID de location
+    try:
+        location_uuid = UUID(location_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de location inválido")
+
+    # Validar existencia de location
+    location = await session.exec(
+        Select(Location).Where(Location.id == location_uuid)
+    ).first()
+
+    if not location:
+        raise HTTPException(status_code=404, detail="Location no encontrada")
 
     # Construir condiciones dinámicas según parámetros opcionales
-    filters = [TripDB.location_id == location_id]
+    filters = [TripDB.location_id == location_uuid]
     # filtros exactos
     if pick_up_date:
         filters.append(TripDB.pick_up_date == pick_up_date)
@@ -334,17 +358,20 @@ async def get_trips(
 
     rows = await session.exec(trips_stmt).all()
 
+    # Retornar lista vacía si no hay trips (en lugar de 404)
     if not rows:
-        raise HTTPException(
-            status_code=404,
-            detail="No trips matching your filters or search criteria."
-        )
-    
-    trips=[]
-    
+        return {
+            "data": [],
+            "skip": skip,
+            "limit": limit,
+            "total": 0
+        }
+
+    trips = []
+
     for row in rows:
         trips.append(row[0].model_dump(mode="json"))
-    
+
     total = rows[0][1] if rows else 0
 
     return {
@@ -473,6 +500,7 @@ async def edit_trip(
     session.add(trip)
 
     await session.commit()
+    await session.refresh(trip)  # Asegurar datos actualizados (updated_at, etc.)
     trip = trip.model_dump(mode="json")
 
     print("TRIP UPDATED: ", trip)
@@ -499,42 +527,107 @@ async def delete_location(
     session: AsyncSession = Depends(get_db),
     _role=Depends(verify_role(["manager"]))
 ):
+    from uuid import UUID
+
+    # Validar UUID de location
+    try:
+        location_uuid = UUID(location_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de location inválido")
+
+    # Validar existencia de location
+    location = await session.exec(
+        Select(Location).Where(Location.id == location_uuid)
+    ).first()
+
+    if not location:
+        raise HTTPException(status_code=404, detail="Location no encontrada")
+
+    # Eliminar location (CASCADE eliminará trips, hotels, etc.)
     await session.exec(
         Delete(Location)
-        .Where(Location.id == location_id)
+        .Where(Location.id == location_uuid)
     )
 
     await session.commit()
 
     return JSONResponse(status_code=200, content={"data": f"Location {location_id} deleted successfully"})
 
-
-@router.patch("/v1/locations/{location_id}")
-async def edit_location(
+@router.get("/v1/location/{location_id}/hotels")
+async def get_hotels(
     location_id: str,
-    location_data: LocationZoneUpdate,
     session: AsyncSession = Depends(get_db),
-    _role = Depends(verify_role(["manager", "driver"]))
-    ):
+    name: Optional[str] = None,
+    exact: bool = Query(False, description="If true, match exact name; otherwise partial match"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    _role=Depends(verify_role(["manager"]))
+):
+    """
+    Obtiene una lista paginada de hoteles para una location.
+    Permite buscar por nombre exacto o parcial.
+    """
+    from uuid import UUID
 
-    location = await session.get(Location, location_id)
+    try:
+        location_uuid = UUID(location_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de location inválido")
+
+    # Validar existencia de location
+    location = await session.exec(
+        Select(Location).Where(Location.id == location_uuid)
+    ).first()
 
     if not location:
         raise HTTPException(status_code=404, detail="Location no encontrada")
 
-    if location_data.point is not None:
-        location.point = location_data.point
-    if location_data.radio_zone is not None:
-        location.radio_zone = location_data.radio_zone
+    # Construir filtros
+    filters = [Hotel.location_id == location_uuid]
+    
+    if name:
+        if exact:
+            filters.append(Hotel.name == name)
+        else:
+            filters.append(Hotel.name.ilike(f"%{name}%"))
 
-    session.add(location)
-    await session.commit()
+    from functools import reduce
+    combined_filter = reduce(lambda a, b: a & b, filters)
 
-    return JSONResponse(content={"status": "ok", "location": location.model_dump(mode="json")})
+    # Query con conteo total usando window function
+    total_count_col = Count(Hotel.id).Over().As("total_count")
+    hotels_stmt = (
+        Select(Hotel, total_count_col)
+        .Where(combined_filter)
+        .OrderBy(Hotel.name.Asc())
+        .Offset(skip)
+        .Limit(limit)
+    )
 
-@router.patch("/v1/hotels/{hotel_id}")
+    rows = await session.exec(hotels_stmt).all()
+
+    if not rows:
+        return {
+            "data": [],
+            "skip": skip,
+            "limit": limit,
+            "total": 0
+        }
+
+    hotels = [row[0].model_dump(mode="json") for row in rows]
+    total = rows[0][1] if rows else 0
+
+    return {
+        "data": hotels,
+        "skip": skip,
+        "limit": limit,
+        "total": total
+    }
+
+@router.patch("/v1/location/{location_id}/hotels/{hotel_id}")
 async def edit_hotel(
     hotel_id: str,
+    location_id: str,
     hotel_data: HotelPointUpdate,
     session: AsyncSession = Depends(get_db),
     _role=Depends(verify_role(["manager"]))
@@ -550,6 +643,9 @@ async def edit_hotel(
         raise HTTPException(status_code=400, detail="ID de hotel inválido")
 
     hotel = await session.get(Hotel, uuid_hotel_id)
+
+    if hotel.location_id != location_id:
+        raise HTTPException(status_code=404, detail="Hotel no encontrado")
 
     if not hotel:
         raise HTTPException(status_code=404, detail="Hotel no encontrado")
