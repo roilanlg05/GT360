@@ -30,3 +30,5 @@ openpyxl
 pandas
 xlrd
 orjson 
+
+timezonefinder

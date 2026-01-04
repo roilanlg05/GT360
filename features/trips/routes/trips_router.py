@@ -2,13 +2,14 @@ from fastapi import APIRouter, UploadFile, File, HTTPException, Query, Depends, 
 from fastapi.responses import JSONResponse
 from shared.db.db_config import get_db
 from psqlmodel import Select, Count, Delete, AsyncSession
-from shared.db.schemas import Trip as TripDB, Location, Airport, Organization
+from shared.db.schemas import Trip as TripDB, Location, Airport, Organization, Hotel
 from features.trips.utils.trip_importer import load_trips_from_bytes
-from features.trips.models import TripUpdate, CreateTrip
+from features.trips.models import TripUpdate, CreateTrip, LocationZoneUpdate, HotelPointUpdate
 from datetime import date, time, timezone
+from zoneinfo import ZoneInfo
 from typing import Optional
 from features.auth.utils import verify_role
-from features.trips.utils import get_locations_by_org_id
+from features.trips.utils import get_locations_by_org_id, tz_from_latlon
 
 
 
@@ -74,19 +75,22 @@ async def upload_trips(
         .Where((Location.name == airport) & (Location.organization_id == org_id))
     ).first()
 
+    radio = 0.0
+
     if not location:
-        # Crear Location
+        # Crear Location con timezone basado en coordenadas del aeropuerto
         location = Location(
             organization_id=organization.id,
             name=airport,
-            point=
-            {
-            "type": "Point", 
-            "coordinates": [
-                airportdb.longitude, 
-                airportdb.latitude
+            point={
+                "type": "Point",
+                "coordinates": [
+                    airportdb.longitude, 
+                    airportdb.latitude
                 ]
-            }
+            },
+            radio_zone = radio,
+            timezone=tz_from_latlon(airportdb.latitude, airportdb.longitude)
         )
     
     session.add(location)
@@ -98,14 +102,22 @@ async def upload_trips(
     created = 0
     trips_to_create = []
     trips = []
+    hotels_set = set()
+    hotels_result = []
 
     try:
+        # Obtener el timezone de la location para asignar correctamente a los tiempos
+        location_tz = ZoneInfo(location.timezone)
+        
         # 1. Construir la lista de objetos en memoria (rápido)
         for t in trips_import:
+            # El pick_up_time del Excel viene como hora local, reemplazar tzinfo con el tz correcto
+            pick_up_time_local = t.pick_up_time.replace(tzinfo=location_tz)
+            
             db_trip = TripDB(
                 location_id=location.id,
                 pick_up_date=t.pick_up_date,
-                pick_up_time=t.pick_up_time,
+                pick_up_time=pick_up_time_local,
                 pick_up_location=t.pick_up_location,
                 drop_off_location=t.drop_off_location,
                 airline=t.airline,
@@ -113,6 +125,13 @@ async def upload_trips(
                 riders=t.riders,
             )
             trips_to_create.append(db_trip)
+            
+            # Guardar nombres de hoteles únicos (strings, no objetos)
+            if db_trip.pick_up_location.upper() != location.name.upper():
+                hotels_set.add(db_trip.pick_up_location.strip())
+            if db_trip.drop_off_location.upper() != location.name.upper():
+                hotels_set.add(db_trip.drop_off_location.strip())
+
             created += 1
 
         # 2. Insertar todo el lote de una sola vez (optimizado)
@@ -123,7 +142,7 @@ async def upload_trips(
                 batch = trips_to_create[i : i + chunk_size]
                 
                 # [NUEVO] Usar BulkInsert (PascalCase) para máxima velocidad.
-                trips = (
+                trips_objs = (
                     await session.BulkInsert(batch)
                         .Returning(TripDB)
                         .OrderBy(
@@ -132,14 +151,28 @@ async def upload_trips(
                         )
                         .Asc()
                         .Limit(50)
-                        .to_dicts()
+                        .all()
                 )
+                # Serializar trips a JSON (convierte UUIDs a strings)
+                trips = [t.model_dump(mode="json") for t in trips_objs]
 
-            # Confirmar la transacción
-            await session.commit()
+            # Convertir nombres de hoteles a objetos Hotel y hacer bulk insert
+            if hotels_set:
+                hotel_objects = [Hotel(name=name, location_id=location.id) for name in hotels_set]
+                hotels_objs = await session.BulkInsert(hotel_objects).Returning(Hotel).all()
+                # Serializar hoteles a JSON (convierte UUIDs a strings)
+                hotels_result = [h.model_dump(mode="json") for h in hotels_objs]
+
+        # Confirmar la transacción solo si todo salió bien
+        await session.commit()
 
     except Exception as e:
-        # Tu manejo de errores original
+        # Rollback en caso de error
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+        
         msg = str(e)
         print(e)
         if "DETAIL:" in msg:
@@ -149,14 +182,17 @@ async def upload_trips(
             detail=f"We couldn't validate the schedule: {msg}"
         )
 
-
-    return {
-        "status": "ok",
-        "uploaded_rows": created,
-        "location_id": str(location.id),
-        "airport_code": airport,
-        "trips": trips
-    }
+    return JSONResponse(
+            content={
+                "status": "ok",
+                "uploaded_rows": created,
+                "location_id": str(location.id),
+                "airport_code": airport,
+                "trips": trips,
+                "hotels": hotels_result
+            }, 
+            status_code=201
+    )
 
 @router.post("/v1/locations/{location_id}/trips")
 async def create_trip(
@@ -169,9 +205,17 @@ async def create_trip(
     
     try:
         from uuid import UUID
-        location_id = UUID(location_id)
+        location_uuid = UUID(location_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="ID de location inválido")
+    
+    # Obtener la location para acceder a su timezone
+    location = await session.exec(
+        Select(Location).Where(Location.id == location_uuid)
+    ).first()
+    
+    if not location:
+        raise HTTPException(status_code=404, detail="Location no encontrada")
     
     try:
         # preparar payload y convertir strings a date/time si vienen como texto
@@ -180,10 +224,12 @@ async def create_trip(
             trip_payload["pick_up_date"] = date.fromisoformat(trip_payload["pick_up_date"])
         if "pick_up_time" in trip_payload and isinstance(trip_payload.get("pick_up_time"), str):
             trip_payload["pick_up_time"] = time.fromisoformat(trip_payload["pick_up_time"])
+        # Asignar el timezone correcto de la location
         if "pick_up_time" in trip_payload and isinstance(trip_payload.get("pick_up_time"), time) and trip_payload["pick_up_time"].tzinfo is None:
-            trip_payload["pick_up_time"] = trip_payload["pick_up_time"].replace(tzinfo=timezone.utc)
+            location_tz = ZoneInfo(location.timezone)
+            trip_payload["pick_up_time"] = trip_payload["pick_up_time"].replace(tzinfo=location_tz)
 
-        trip = TripDB(location_id=location_id, **trip_payload)
+        trip = TripDB(location_id=location_uuid, **trip_payload)
         session.add(trip)
         # flush para obtener ids y validar DB antes del commit
         await session.flush()
@@ -398,11 +444,17 @@ async def edit_trip(
     except ValueError:
         raise HTTPException(status_code=400, detail="ID de location inválido")
 
-    # Comprobar existencia del trip
-    sel_stmt = Select(TripDB).Where((TripDB.id == uuid_id) & (TripDB.location_id == uuid_location_id))
-    trip = await session.exec(sel_stmt).first()
-    if not trip:
+    # Comprobar existencia del trip y obtener la location para el timezone
+    sel_stmt = (
+        Select(TripDB, Location)
+        .Join(Location, TripDB.location_id == Location.id)
+        .Where((TripDB.id == uuid_id) & (TripDB.location_id == uuid_location_id))
+    )
+    result = await session.exec(sel_stmt).first()
+    if not result:
         raise HTTPException(status_code=404, detail="Trip not found")
+    
+    trip, location = result
 
     # Actualizar datos del trip: parsear strings ISO a date/time si es necesario
     update_data = trip_update.model_dump(exclude_unset=True)
@@ -410,9 +462,10 @@ async def edit_trip(
         update_data["pick_up_date"] = date.fromisoformat(update_data["pick_up_date"])
     if "pick_up_time" in update_data and isinstance(update_data.get("pick_up_time"), str):
         update_data["pick_up_time"] = time.fromisoformat(update_data["pick_up_time"])
-    # Ensure timezone-aware time for DB (column is TIME WITH TIME ZONE)
+    # Asignar el timezone correcto de la location
     if "pick_up_time" in update_data and isinstance(update_data.get("pick_up_time"), time) and update_data["pick_up_time"].tzinfo is None:
-        update_data["pick_up_time"] = update_data["pick_up_time"].replace(tzinfo=timezone.utc)
+        location_tz = ZoneInfo(location.timezone)
+        update_data["pick_up_time"] = update_data["pick_up_time"].replace(tzinfo=location_tz)
 
     for key, value in update_data.items():
         setattr(trip, key, value)
@@ -454,4 +507,64 @@ async def delete_location(
     await session.commit()
 
     return JSONResponse(status_code=200, content={"data": f"Location {location_id} deleted successfully"})
+
+
+@router.patch("/v1/locations/{location_id}")
+async def edit_location(
+    location_id: str,
+    location_data: LocationZoneUpdate,
+    session: AsyncSession = Depends(get_db),
+    _role = Depends(verify_role(["manager", "driver"]))
+    ):
+
+    location = await session.get(Location, location_id)
+
+    if not location:
+        raise HTTPException(status_code=404, detail="Location no encontrada")
+
+    if location_data.point is not None:
+        location.point = location_data.point
+    if location_data.radio_zone is not None:
+        location.radio_zone = location_data.radio_zone
+
+    session.add(location)
+    await session.commit()
+
+    return JSONResponse(content={"status": "ok", "location": location.model_dump(mode="json")})
+
+@router.patch("/v1/hotels/{hotel_id}")
+async def edit_hotel(
+    hotel_id: str,
+    hotel_data: HotelPointUpdate,
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["manager"]))
+):
+    """
+    Actualiza el point y/o radio_zone de un hotel.
+    """
+    from uuid import UUID
+
+    try:
+        uuid_hotel_id = UUID(hotel_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de hotel inválido")
+
+    hotel = await session.get(Hotel, uuid_hotel_id)
+
+    if not hotel:
+        raise HTTPException(status_code=404, detail="Hotel no encontrado")
+
+    if hotel_data.point is not None:
+        hotel.point = hotel_data.point
+    if hotel_data.radio_zone is not None:
+        hotel.radio_zone = hotel_data.radio_zone
+    if hotel_data.address is not None:
+        hotel.address = hotel_data.address
+
+    session.add(hotel)
+    await session.commit()
+    await session.refresh(hotel)
+
+    return JSONResponse(content={"status": "ok", "hotel": hotel.model_dump(mode="json")})
+
 

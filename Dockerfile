@@ -23,8 +23,13 @@ COPY . /app
 RUN useradd -m appuser && chown -R appuser /app
 USER appuser
 
+RUN python -m psqlmodel profile save 'dev' \
+    --username gt360 --password Rlg*020305 \
+	-db gt360 --host postgres \
+	--models-path 'shared/db/schemas/auth/' 'shared/db/schemas/entities/' 'shared/db/schemas/trips/' --default
+
 EXPOSE 8000
 
 # default command to run FastAPI with uvicorn
 
-CMD ["uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips='127.0.0.1'"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "127.0.0.1"]

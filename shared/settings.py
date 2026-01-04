@@ -8,7 +8,7 @@ load_dotenv()
 
 class BaseAppSettings(BaseSettings):
     BASE_URL: str = "https://web.gt360.app"
-    BACKEND_URL: str = "http://127.0.0.1:8000"
+    BACKEND_URL: str = "http://app:8000"
     POSTGRES_SERVER: str = os.getenv("POSTGRES_SERVER")
     POSTGRES_PORT: str = os.getenv("POSTGRES_PORT")
     POSTGRES_DB: str = os.getenv("POSTGRES_DB")

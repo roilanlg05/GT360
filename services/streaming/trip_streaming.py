@@ -1,178 +1,3 @@
-'''from shared.db.schemas import Trip
-from psqlmodel import create_async_engine, Subscribe
-from shared.settings import settings
-
-import httpx, asyncio, uuid, json, time, hmac, hashlib, random
-
-SECRET = settings.WEBHOOK_SECRET
-WEBHOOK_BATCH_URL = f"{settings.BACKEND_URL}/v1/webhooks/trips/batch"
-
-def sign_body(secret: str, body: bytes, ts: int) -> str:
-    msg = f"{ts}.".encode("utf-8") + body
-    sig = hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
-    return f"t={ts},v1={sig}"
-
-def build_event(payload: dict) -> dict | None:
-    event_type = payload.get("event")
-    old = payload.get("old") or {}
-    new = payload.get("new") or {}
-
-    trip_id = str((new.get("id") or old.get("id") or "")).strip()
-    location_id = str((new.get("location_id") or old.get("location_id") or "")).strip()
-    if not trip_id or not location_id:
-        return None
-
-    return {
-        "event_id": str(uuid.uuid4()),
-        "event_type": event_type,
-        "trip_id": trip_id,
-        "location_id": location_id,
-        "trip": old if event_type == "delete" else new,
-    }
-
-async def post_batch_with_retry(client: httpx.AsyncClient, batch: dict, max_retries: int = 8):
-    body = json.dumps(batch, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-
-    for attempt in range(max_retries + 1):
-        ts = int(time.time())
-        signature = sign_body(SECRET, body, ts)
-        headers = {"Content-Type": "application/json", "x-webhook-secret": signature}
-
-        try:
-            resp = await client.post(WEBHOOK_BATCH_URL, content=body, headers=headers)
-            print("[HTTP]", resp.status_code, "events=", len(batch["events"]))
-
-            if 200 <= resp.status_code < 300:
-                return True
-
-            if resp.status_code in (408, 425, 429, 500, 502, 503, 504):
-                ra = resp.headers.get("retry-after")
-                if ra:
-                    try:
-                        await asyncio.sleep(float(ra))
-                        continue
-                    except Exception:
-                        pass
-                raise httpx.HTTPStatusError(f"{resp.status_code}: {resp.text}", request=resp.request, response=resp)
-
-            print("Batch non-retryable:", resp.status_code, resp.text)
-            return False
-
-        except Exception as e:
-            print(f"[HTTP] attempt={attempt} error={repr(e)}")
-            if attempt >= max_retries:
-                print("Batch failed permanently:", "batch_id=", batch.get("batch_id"))
-                return False
-            backoff = min(2 ** attempt, 20) + random.random()
-            await asyncio.sleep(backoff)
-
-async def composer(event_q: asyncio.Queue, batch_q: asyncio.Queue):
-    """
-    Lee eventos individuales y arma batches de 100.
-    FLUSH_INTERVAL asegura que si llegan pocos eventos, igual se manden.
-    """
-    MAX_BATCH = 100
-    FLUSH_INTERVAL = 0.2
-
-    buffer: list[dict] = []
-    last_flush = time.monotonic()
-
-    while True:
-        timeout = max(0.0, FLUSH_INTERVAL - (time.monotonic() - last_flush))
-
-        ev = None
-        try:
-            ev = await asyncio.wait_for(event_q.get(), timeout=timeout)
-        except asyncio.TimeoutError:
-            pass
-
-        if ev is not None:
-            buffer.append(ev)
-            event_q.task_done()
-
-        if buffer and (len(buffer) >= MAX_BATCH or (time.monotonic() - last_flush) >= FLUSH_INTERVAL):
-            batch = {
-                "batch_id": str(uuid.uuid4()),
-                "sent_at": int(time.time()),
-                "source": "trips-subscriber",
-                "events": buffer,
-            }
-            buffer = []
-            last_flush = time.monotonic()
-
-            # backpressure: si batch_q se llena, composer se pausa aquí
-            await batch_q.put(batch)
-            print("[BATCH] queued batch events=", len(batch["events"]))
-
-async def sender(batch_q: asyncio.Queue, client: httpx.AsyncClient):
-    """
-    Envía batches uno por uno. Solo toma el siguiente cuando termina el anterior.
-    """
-    while True:
-        batch = await batch_q.get()
-        try:
-            ok = await post_batch_with_retry(client, batch)
-            if not ok:
-                # si quieres, re-enqueue o log; yo lo dejo logeado
-                pass
-        finally:
-            batch_q.task_done()
-
-async def main():
-    if not SECRET:
-        raise RuntimeError("Invalid WEBHOOK_SECRET.")
-
-    # Cola de eventos individuales (rápida)
-    event_q: asyncio.Queue = asyncio.Queue(maxsize=200_000)
-
-    # Cola de batches ya listos (controla memoria y ritmo de envío)
-    batch_q: asyncio.Queue = asyncio.Queue(maxsize=2_000)  # 2000 * 100 = 200k eventos en el peor caso
-
-    limits = httpx.Limits(max_connections=10, max_keepalive_connections=10)
-    timeout = httpx.Timeout(30.0, connect=5.0)
-
-    async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
-        composer_task = asyncio.create_task(composer(event_q, batch_q))
-        sender_task = asyncio.create_task(sender(batch_q, client))
-
-        async_engine = create_async_engine(
-            username=settings.POSTGRES_USER,
-            password=settings.POSTGRES_PASSWORD,
-            port=settings.POSTGRES_PORT,
-            host=settings.POSTGRES_SERVER,
-            database=settings.POSTGRES_DB,
-            debug=True,
-            models_path="__main__",
-        )
-
-        async def on_trip_change(payload):
-            ev = build_event(payload)
-            if ev:
-                # rápido. si se llena, aplica backpressure natural
-                await event_q.put(ev)
-
-        sub = Subscribe.engine(async_engine, use_engine_pool=False)
-
-        try:
-            await sub(Trip).OnEvent("change").Exec(on_trip_change).StartAsync()
-        finally:
-            try:
-                await sub.StopAsync()
-            except Exception:
-                pass
-
-            # drenar colas antes de salir
-            await event_q.join()
-            await batch_q.join()
-
-            composer_task.cancel()
-            sender_task.cancel()
-            await asyncio.gather(composer_task, sender_task, return_exceptions=True)
-
-if __name__ == "__main__":
-    asyncio.run(main())
-'''
-
 from shared.db.schemas import Trip
 from psqlmodel import create_async_engine, Subscribe
 from shared.settings import settings
@@ -371,8 +196,8 @@ async def main():
 
     async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
         composer_task = asyncio.create_task(composer(event_q, batch_q))
-        sender_task = [asyncio.create_task(sender(batch_q, client)) for _ in range(3)]
-        hb_task = asyncio.create_task(heartbeat(event_q, batch_q))  # quítalo si no lo quieres
+        sender_tasks = [asyncio.create_task(sender(batch_q, client)) for _ in range(3)]
+        hb_task = asyncio.create_task(heartbeat(event_q, batch_q))
 
         async_engine = create_async_engine(
             username=settings.POSTGRES_USER,
@@ -382,6 +207,7 @@ async def main():
             database=settings.POSTGRES_DB,
             debug=True,
             models_path="__main__",
+            pool_close_timeout=10.0,  # Timeout para cierre del pool
         )
 
         async def on_trip_change(payload):
@@ -394,18 +220,27 @@ async def main():
         try:
             await sub(Trip).OnEvent("change").Exec(on_trip_change).StartAsync()
         finally:
+            # 1. Detener suscripción
             try:
                 await sub.StopAsync()
             except Exception:
                 pass
+            
+            # 2. Cerrar el engine (usa el timeout configurado)
+            try:
+                await async_engine.dispose_async()
+            except Exception:
+                pass
 
-            # drenar colas antes de salir
+            # 3. Drenar colas antes de salir
             await event_q.join()
             await batch_q.join()
 
-            for t in (composer_task, sender_task, hb_task):
+            # 4. Cancelar todas las tasks
+            all_tasks = [composer_task, *sender_tasks, hb_task]
+            for t in all_tasks:
                 t.cancel()
-            await asyncio.gather(composer_task, sender_task, hb_task, return_exceptions=True)
+            await asyncio.gather(*all_tasks, return_exceptions=True)
 
 if __name__ == "__main__":
     # Recomendado: ejecuta con `python -u script.py` para prints inmediatos

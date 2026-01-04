@@ -9,5 +9,6 @@ from .entities.supervisors import Supervisor
 from .entities.organizations import Organization
 from .entities.locations import Location
 from .entities.airports import Airport
+from .entities.hotels import Hotel
 from .trips.trips import Trip
 from .trips.trips_history import TripHistory

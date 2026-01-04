@@ -20,7 +20,6 @@ class WSManager:
 
     def __init__(self) -> None:
         self.rooms: Dict[str, Set[WebSocket]] = {}
-        self.trip_subscribers: Dict[str, Set[WebSocket]] = {}
         self.ws_meta: Dict[WebSocket, dict] = {}
 
         self.location_listener_tasks: Dict[str, asyncio.Task] = {}
@@ -36,7 +35,6 @@ class WSManager:
                 "user_id": claims.get("sub"),
                 "role": metadata.get("role"),
                 "org_id": metadata.get("organization_id"),
-                "trip_ids": set(),
             }
 
     async def disconnect(self, ws: WebSocket) -> None:
@@ -54,38 +52,8 @@ class WSManager:
                 self.rooms.pop(loc, None)
                 task_to_cancel = self.location_listener_tasks.pop(loc, None)
 
-            # limpiar subs por trip
-            for tid in list(meta["trip_ids"]):
-                subs = self.trip_subscribers.get(tid)
-                if subs:
-                    subs.discard(ws)
-                    if not subs:
-                        self.trip_subscribers.pop(tid, None)
-
         if task_to_cancel:
             task_to_cancel.cancel()
-
-    async def subscribe_trips(self, ws: WebSocket, trip_ids: Set[str]) -> None:
-        async with self._lock:
-            meta = self.ws_meta.get(ws)
-            if not meta:
-                return
-            for tid in trip_ids:
-                self.trip_subscribers.setdefault(tid, set()).add(ws)
-                meta["trip_ids"].add(tid)
-
-    async def unsubscribe_trips(self, ws: WebSocket, trip_ids: Set[str]) -> None:
-        async with self._lock:
-            meta = self.ws_meta.get(ws)
-            if not meta:
-                return
-            for tid in trip_ids:
-                subs = self.trip_subscribers.get(tid)
-                if subs:
-                    subs.discard(ws)
-                    if not subs:
-                        self.trip_subscribers.pop(tid, None)
-                meta["trip_ids"].discard(tid)
 
     async def _safe_send(self, ws: WebSocket, payload: dict) -> bool:
         try:
@@ -94,12 +62,11 @@ class WSManager:
         except Exception:
             return False
 
-    async def route_location_event(self, location_id: str, trip_id: Optional[str], payload: dict) -> None:
+    async def route_location_event(self, location_id: str, payload: dict) -> None:
+        location_id = str(location_id)
+
         async with self._lock:
-            if trip_id:
-                targets = set(self.trip_subscribers.get(trip_id, set()))
-            else:
-                targets = set(self.rooms.get(location_id, set()))
+            targets = set(self.rooms.get(location_id, set()))
 
         dead = []
         for ws in targets:
@@ -131,20 +98,6 @@ class WSManager:
             return None
         return None
 
-    async def _cleanup_deleted_trip_subscribers(self, trip_id: str) -> None:
-        """
-        Opcional: si un trip se borra, limpiar suscriptores a ese trip
-        para evitar mantener sets creciendo si el frontend no desuscribe.
-        """
-        async with self._lock:
-            subs = self.trip_subscribers.pop(trip_id, None)
-            if not subs:
-                return
-            for ws in subs:
-                meta = self.ws_meta.get(ws)
-                if meta:
-                    meta["trip_ids"].discard(trip_id)
-
     async def _dispatch_single(self, location_id: str, ev: dict) -> None:
         trip_id = ev.get("trip_id")
         event_type = ev.get("event_type") or ev.get("event") or "db_update"
@@ -159,11 +112,7 @@ class WSManager:
         if isinstance(trip, dict):
             payload["trip"] = trip
 
-        await self.route_location_event(location_id, trip_id, payload)
-
-        # Si es delete, limpiamos subs de ese trip (opcional y seguro)
-        if event_type == "delete" and trip_id:
-            await self._cleanup_deleted_trip_subscribers(str(trip_id))
+        await self.route_location_event(location_id, payload)
 
     async def _location_listener(self, location_id: str) -> None:
         """
@@ -201,7 +150,7 @@ class WSManager:
                         "location_id": location_id,
                         "events": events,
                     }
-                    await self.route_location_event(location_id, None, ws_payload)
+                    await self.route_location_event(location_id, ws_payload)
                     continue
 
                 # Opción 2: reenviar item por item (default)

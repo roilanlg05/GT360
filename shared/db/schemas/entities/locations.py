@@ -16,14 +16,15 @@ class Location(PSQLModel):
         foreign_key="entities.organizations.id", 
         on_delete="CASCADE",
         nullable=False,
-        index=True,
-        unique=True
+        index=True
     )
 
     name: str = Column(nullable=False, index=True)
 
-    point: jsonb = Column(
-        default=None
-    )
+    point: jsonb = Column(default=None)
+
+    radio_zone: float = Column(default=None)
 
     created_at: timestamptz = Column(default=now)
+
+    timezone: str = Column(default="America/New_York")

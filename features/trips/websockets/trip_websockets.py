@@ -3,9 +3,6 @@ from shared.redis.redis_client import redis_client as redis
 from features.trips.utils.ws_manager import manager
 import json
 from shared.db.db_config import engine, AsyncSession
-from psqlmodel import Select
-from typing import Set, List
-from shared.db.schemas import Trip
 from features.auth.utils import user_can_access_location, decode_token
 
 router = APIRouter()
@@ -70,75 +67,31 @@ async def ws_location_trips(ws: WebSocket, location_id: str, token: str):
         while True:
             msg = await ws.receive_json()
             action = msg.get("action")
-            trip_ids = set(msg.get("trip_ids", []))
+
+            # --- Ping/Pong con validación de token ---
+            if action == "ping":
+                ping_token = msg.get("token")
+                if not ping_token:
+                    await ws.send_json({"type": "error", "code": 401, "detail": "Token required"})
+                    await ws.close(code=1008)
+                    return
+                
+                try:
+                    decode_token(ping_token)
+                    await ws.send_json({"type": "pong"})
+                except Exception:
+                    await ws.send_json({"type": "error", "code": 401, "detail": "Invalid or expired token"})
+                    await ws.close(code=1008)
+                    return
+                continue
 
             if action == "subscribe":
-                requested: Set[str] = set()
-
-                # normalizar ids a str y limpiar vacíos
-                for tid in trip_ids:
-                    if isinstance(tid, (bytes, bytearray)):
-                        tid = tid.decode("utf-8", errors="ignore")
-                    tid = str(tid).strip()
-                    if tid:
-                        requested.add(tid)
-
-                if not requested:
-                    await ws.send_json({"type": "subscribed", "trip_ids": [], "trips": []})
-                    continue
-
-                # 1) Redis: un solo MGET
-                keys = [f"trip:{tid}" for tid in requested]
-                vals = await redis.mget(keys)
-
-                valid: Set[str] = set()
-                now: List[dict] = []
-                missing: List[str] = []
-
-                for tid, raw in zip(requested, vals):
-                    if not raw:
-                        missing.append(tid)
-                        continue
-
-                    if isinstance(raw, (bytes, bytearray)):
-                        raw = raw.decode("utf-8", errors="ignore")
-
-                    try:
-                        trip = json.loads(raw)
-                        if str(trip.get("location_id")) == str(location_id):
-                            valid.add(tid)
-                            now.append(trip)
-                        else:
-                            # existe pero es de otra location -> inválido
-                            pass
-                    except Exception:
-                        # si está corrupto, lo validamos por DB
-                        missing.append(tid)
-
-                # 2) DB: una sola query con .In(...)
-                if missing:
-                    async with AsyncSession(engine) as session:
-                        try:
-                            rows = await session.exec(
-                                Select(Trip).Where(
-                                    (Trip.location_id == location_id) & (Trip.id.In(missing))
-                                )
-                            ).all() or []
-
-                            for r in rows:
-                                valid.add(str(r.id))
-
-                        except Exception as e:
-                            print("DB validate error:", e)
-
-                await manager.subscribe_trips(ws, valid)
-
-                # responder con trips cacheados (solo Redis). Los validados por DB pueden no estar en Redis todavía.
-                await ws.send_json({"type": "subscribed", "trip_ids": list(valid), "trips": now})
+                # Suscripción por location - ya está conectado a la room
+                await ws.send_json({"type": "subscribed", "location_id": location_id})
 
             elif action == "unsubscribe":
-                await manager.unsubscribe_trips(ws, trip_ids)
-                await ws.send_json({"type": "unsubscribed", "trip_ids": list(trip_ids)})
+                # Desuscripción de la location
+                await ws.send_json({"type": "unsubscribed", "location_id": location_id})
 
             else:
                 await ws.send_json({"type": "error", "detail": "Unknown action"})

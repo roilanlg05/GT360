@@ -422,9 +422,9 @@ def _process_excel_sync(
                 if airline and airline.upper() != airlinex.upper():
                     raise ValueError("Se ha detectado mas de una aerolinea en el archivo, necesitas una subscripcion para cargar mas de una aerolinea")
 
-                pickup_dt = dropoff_dt - timedelta(minutes=20)
+                pickup_dt = dropoff_dt  # Usar la hora exacta del Excel sin modificar
                 pick_up_date = pickup_dt.date()
-                pick_up_time = pickup_dt.time().replace(tzinfo=timezone.utc)  # <-- AÑADE tzinfo
+                pick_up_time = pickup_dt.time().replace(tzinfo=timezone.utc)
 
                 drop_off_location = airport_code or "AIRPORT"
 

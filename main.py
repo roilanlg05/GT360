@@ -20,9 +20,7 @@ app = FastAPI()
 async def lifespan(app: FastAPI):
     await engine.startup_async()
     yield
-    # Opcional pero recomendado:
-    if engine._async_pool:
-        await engine._async_pool.close()
+    await engine.dispose_async()
 
 app = FastAPI(title="GT360", version="0.1.0", lifespan=lifespan)
 
@@ -35,7 +33,8 @@ app.add_middleware(
     allow_origins=[
         "https://www.gt360.com",
         "https://gt360.com",
-	    "https://web.gt360.app"
+	    "https://web.gt360.app",
+        "http://192.168.1.182:3000"
     ],
     allow_credentials=True,
     allow_methods=["*"],

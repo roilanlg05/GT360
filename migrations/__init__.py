@@ -1,1 +1,0 @@
-"""PSQLModel migrations directory."""

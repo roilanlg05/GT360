@@ -1,0 +1,1062 @@
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 598fbe8..ce63c86 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -1,4 +1,5 @@
+ version: "3.8"
++
+ services:
+   redis:
+     image: redis:7
+@@ -6,19 +7,47 @@ services:
+     ports:
+       - "6379:6379"
+     restart: unless-stopped
++
+   postgres:
+     image: postgres:18.1
+     container_name: postgres
+     restart: unless-stopped
+     ports:
+       - "5432:5432"
++    env_file:
++      - .env
+     environment:
+-      POSTGRES_USER: gt360
+-      POSTGRES_PASSWORD: Rlg*020305
+-      POSTGRES_DB: gt360
+-      PGDATA: /var/lib/postgresql/18/docker
++      PGDATA: /var/lib/postgresql/data
+     volumes:
+-      - pgdata:/var/lib/postgresql
++      - pgdata:/var/lib/postgresql/data
++
++  app:
++    build:
++      context: .
++      dockerfile: Dockerfile
++    image: gt360:latest
++    container_name: gt360
++    env_file:
++      - .env
++    ports:
++      - "8000:8000"
++    restart: unless-stopped
++    depends_on:
++      - postgres
++      - redis
++
++  streaming:
++    build:
++      context: .
++      dockerfile: services/streaming/Dockerfile
++    image: trip-streaming:latest
++    env_file:
++      - .env
++    restart: unless-stopped
++    depends_on:
++      - redis
++      - postgres
++      - app
+ 
+ volumes:
+   pgdata:
+\ No newline at end of file
+diff --git a/dockerfile b/dockerfile
+deleted file mode 100644
+index d00e7b7..0000000
+--- a/dockerfile
++++ /dev/null
+@@ -1,30 +0,0 @@
+-FROM python:3.14-slim
+-
+-ENV PYTHONDONTWRITEBYTECODE=1
+-ENV PYTHONUNBUFFERED=1
+-
+-WORKDIR /app
+-
+-# system deps for building some Python packages if needed
+-RUN apt-get update \
+-	&& apt-get install -y --no-install-recommends gcc build-essential \
+-	&& rm -rf /var/lib/apt/lists/*
+-
+-# copy requirements and install first (layer caching)
+-COPY requirements.txt /app/requirements.txt
+-
+-RUN python -m pip install --upgrade pip \
+-	&& pip install --no-cache-dir -r /app/requirements.txt
+-
+-# copy app source
+-COPY . /app
+-
+-# create a non-root user and use it
+-RUN useradd -m appuser && chown -R appuser /app
+-USER appuser
+-
+-EXPOSE 8000
+-
+-# default command to run FastAPI with uvicorn
+-
+-CMD ["uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips='127.0.0.1'"]
+diff --git a/features/trips/models/__init__.py b/features/trips/models/__init__.py
+index ee9ea7b..7174c85 100644
+--- a/features/trips/models/__init__.py
++++ b/features/trips/models/__init__.py
+@@ -1 +1,3 @@
+-from .trip_model import *
+\ No newline at end of file
++from .trip_model import *
++from .location_model import *
++from .hotel_model import HotelPointUpdate
+\ No newline at end of file
+diff --git a/features/trips/models/trip_model.py b/features/trips/models/trip_model.py
+index 384cb3d..e293446 100644
+--- a/features/trips/models/trip_model.py
++++ b/features/trips/models/trip_model.py
+@@ -1,6 +1,7 @@
+ from pydantic import BaseModel
+ from datetime import date, time, datetime
+-from typing import Dict, Optional
++from typing import Optional
++from uuid import UUID
+ 
+ 
+ class Trip(BaseModel):
+@@ -10,8 +11,8 @@ class Trip(BaseModel):
+     drop_off_location: str
+     airline: str
+     flight_number: str
+-    riders: Dict[str, int]
+-    location_id: Optional[str] = None
++    riders: dict[str, int]
++    location_id: Optional[UUID] = None
+ 
+ class TripUpdate(BaseModel):
+     pick_up_date: Optional[date] = None
+@@ -20,32 +21,38 @@ class TripUpdate(BaseModel):
+     drop_off_location: Optional[str] = None
+     airline: Optional[str] = None
+     flight_number: Optional[str] = None
+-    riders: Optional[Dict[str, int]] = None
++    riders: Optional[dict[str, int]] = None
+ 
+ class CreateTrip(BaseModel):
+     pick_up_date: date
+     pick_up_time: time
+     pick_up_location: str
+     drop_off_location: str
+-    assigned_driver: str | None = None
++    assigned_driver: Optional[UUID] = None
+     airline: str
+     flight_number: str
+     riders: dict[str, int]
+ 
+ 
+ class TripResponse(BaseModel):
+-    id: str
+-    assigned_driver: Optional[str] = None
+-    location_id: str
++    id: UUID
++    assigned_driver: Optional[UUID] = None
++    location_id: UUID
+     pick_up_date: date
+     pick_up_time: time
+     pick_up_location: str
+     drop_off_location: str
+     airline: str
+     flight_number: str
+-    riders: Optional[Dict[str, int]] = None
++    riders: Optional[dict[str, int]] = None
+     started_at: Optional[datetime] = None
+     picked_up_at: Optional[datetime] = None
+     dropped_off_at: Optional[datetime] = None
+     created_at: datetime
+-    updated_at: datetime
+\ No newline at end of file
++    updated_at: datetime
++
++    # Pydantic v2:
++    model_config = {"from_attributes": True}
++
++class AssignUnassignDriverToTrip(BaseModel):
++    driver_id: UUID
+diff --git a/features/trips/routes/trips_router.py b/features/trips/routes/trips_router.py
+index 7a9b672..a9501f4 100644
+--- a/features/trips/routes/trips_router.py
++++ b/features/trips/routes/trips_router.py
+@@ -2,13 +2,14 @@ from fastapi import APIRouter, UploadFile, File, HTTPException, Query, Depends,
+ from fastapi.responses import JSONResponse
+ from shared.db.db_config import get_db
+ from psqlmodel import Select, Count, Delete, AsyncSession
+-from shared.db.schemas import Trip as TripDB, Location, Airport, Organization
++from shared.db.schemas import Trip as TripDB, Location, Airport, Organization, Hotel
+ from features.trips.utils.trip_importer import load_trips_from_bytes
+-from features.trips.models import TripUpdate, CreateTrip
++from features.trips.models import TripUpdate, CreateTrip, LocationZoneUpdate, HotelPointUpdate
+ from datetime import date, time, timezone
++from zoneinfo import ZoneInfo
+ from typing import Optional
+ from features.auth.utils import verify_role
+-from features.trips.utils import get_locations_by_org_id
++from features.trips.utils import get_locations_by_org_id, tz_from_latlon
+ 
+ 
+ 
+@@ -74,19 +75,22 @@ async def upload_trips(
+         .Where((Location.name == airport) & (Location.organization_id == org_id))
+     ).first()
+ 
++    radio = 0.0
++
+     if not location:
+-        # Crear Location
++        # Crear Location con timezone basado en coordenadas del aeropuerto
+         location = Location(
+             organization_id=organization.id,
+             name=airport,
+-            point=
+-            {
+-            "type": "Point", 
+-            "coordinates": [
+-                airportdb.longitude, 
+-                airportdb.latitude
++            point={
++                "type": "Point",
++                "coordinates": [
++                    airportdb.longitude, 
++                    airportdb.latitude
+                 ]
+-            }
++            },
++            radio_zone = radio,
++            timezone=tz_from_latlon(airportdb.latitude, airportdb.longitude)
+         )
+     
+     session.add(location)
+@@ -98,14 +102,21 @@ async def upload_trips(
+     created = 0
+     trips_to_create = []
+     trips = []
++    hotels = set()
+ 
+     try:
++        # Obtener el timezone de la location para asignar correctamente a los tiempos
++        location_tz = ZoneInfo(location.timezone)
++        
+         # 1. Construir la lista de objetos en memoria (rápido)
+         for t in trips_import:
++            # El pick_up_time del Excel viene como hora local, reemplazar tzinfo con el tz correcto
++            pick_up_time_local = t.pick_up_time.replace(tzinfo=location_tz)
++            
+             db_trip = TripDB(
+                 location_id=location.id,
+                 pick_up_date=t.pick_up_date,
+-                pick_up_time=t.pick_up_time,
++                pick_up_time=pick_up_time_local,
+                 pick_up_location=t.pick_up_location,
+                 drop_off_location=t.drop_off_location,
+                 airline=t.airline,
+@@ -113,6 +124,13 @@ async def upload_trips(
+                 riders=t.riders,
+             )
+             trips_to_create.append(db_trip)
++            
++            # Guardar nombres de hoteles únicos (strings, no objetos)
++            if db_trip.pick_up_location.upper() != location.name.upper():
++                hotels.add(db_trip.pick_up_location.strip())
++            if db_trip.drop_off_location.upper() != location.name.upper():
++                hotels.add(db_trip.drop_off_location.strip())
++
+             created += 1
+ 
+         # 2. Insertar todo el lote de una sola vez (optimizado)
+@@ -135,6 +153,11 @@ async def upload_trips(
+                         .to_dicts()
+                 )
+ 
++            # Convertir nombres de hoteles a objetos Hotel y hacer bulk insert
++            if hotels:
++                hotel_objects = [Hotel(name=name, location_id=location.id) for name in hotels]
++                hotels = await session.BulkInsert(hotel_objects).Returning(Hotel).to_dicts()
++
+             # Confirmar la transacción
+             await session.commit()
+ 
+@@ -150,13 +173,18 @@ async def upload_trips(
+         )
+ 
+ 
+-    return {
+-        "status": "ok",
+-        "uploaded_rows": created,
+-        "location_id": str(location.id),
+-        "airport_code": airport,
+-        "trips": trips
+-    }
++    return JSONResponse(
++            content={
++                "status": "ok",
++                "uploaded_rows": created,
++                "location_id": str(location.id),
++                "airport_code": airport,
++                "trips": trips,
++                "hotels": hotels
++            }, 
++            status_code=201
++    )
++     
+ 
+ @router.post("/v1/locations/{location_id}/trips")
+ async def create_trip(
+@@ -169,10 +197,18 @@ async def create_trip(
+     
+     try:
+         from uuid import UUID
+-        location_id = UUID(location_id)
++        location_uuid = UUID(location_id)
+     except ValueError:
+         raise HTTPException(status_code=400, detail="ID de location inválido")
+     
++    # Obtener la location para acceder a su timezone
++    location = await session.exec(
++        Select(Location).Where(Location.id == location_uuid)
++    ).first()
++    
++    if not location:
++        raise HTTPException(status_code=404, detail="Location no encontrada")
++    
+     try:
+         # preparar payload y convertir strings a date/time si vienen como texto
+         trip_payload = trip_data.model_dump(exclude_unset=True)
+@@ -180,10 +216,12 @@ async def create_trip(
+             trip_payload["pick_up_date"] = date.fromisoformat(trip_payload["pick_up_date"])
+         if "pick_up_time" in trip_payload and isinstance(trip_payload.get("pick_up_time"), str):
+             trip_payload["pick_up_time"] = time.fromisoformat(trip_payload["pick_up_time"])
++        # Asignar el timezone correcto de la location
+         if "pick_up_time" in trip_payload and isinstance(trip_payload.get("pick_up_time"), time) and trip_payload["pick_up_time"].tzinfo is None:
+-            trip_payload["pick_up_time"] = trip_payload["pick_up_time"].replace(tzinfo=timezone.utc)
++            location_tz = ZoneInfo(location.timezone)
++            trip_payload["pick_up_time"] = trip_payload["pick_up_time"].replace(tzinfo=location_tz)
+ 
+-        trip = TripDB(location_id=location_id, **trip_payload)
++        trip = TripDB(location_id=location_uuid, **trip_payload)
+         session.add(trip)
+         # flush para obtener ids y validar DB antes del commit
+         await session.flush()
+@@ -398,11 +436,17 @@ async def edit_trip(
+     except ValueError:
+         raise HTTPException(status_code=400, detail="ID de location inválido")
+ 
+-    # Comprobar existencia del trip
+-    sel_stmt = Select(TripDB).Where((TripDB.id == uuid_id) & (TripDB.location_id == uuid_location_id))
+-    trip = await session.exec(sel_stmt).first()
+-    if not trip:
++    # Comprobar existencia del trip y obtener la location para el timezone
++    sel_stmt = (
++        Select(TripDB, Location)
++        .Join(Location, TripDB.location_id == Location.id)
++        .Where((TripDB.id == uuid_id) & (TripDB.location_id == uuid_location_id))
++    )
++    result = await session.exec(sel_stmt).first()
++    if not result:
+         raise HTTPException(status_code=404, detail="Trip not found")
++    
++    trip, location = result
+ 
+     # Actualizar datos del trip: parsear strings ISO a date/time si es necesario
+     update_data = trip_update.model_dump(exclude_unset=True)
+@@ -410,9 +454,10 @@ async def edit_trip(
+         update_data["pick_up_date"] = date.fromisoformat(update_data["pick_up_date"])
+     if "pick_up_time" in update_data and isinstance(update_data.get("pick_up_time"), str):
+         update_data["pick_up_time"] = time.fromisoformat(update_data["pick_up_time"])
+-    # Ensure timezone-aware time for DB (column is TIME WITH TIME ZONE)
++    # Asignar el timezone correcto de la location
+     if "pick_up_time" in update_data and isinstance(update_data.get("pick_up_time"), time) and update_data["pick_up_time"].tzinfo is None:
+-        update_data["pick_up_time"] = update_data["pick_up_time"].replace(tzinfo=timezone.utc)
++        location_tz = ZoneInfo(location.timezone)
++        update_data["pick_up_time"] = update_data["pick_up_time"].replace(tzinfo=location_tz)
+ 
+     for key, value in update_data.items():
+         setattr(trip, key, value)
+@@ -455,3 +500,61 @@ async def delete_location(
+ 
+     return JSONResponse(status_code=200, content={"data": f"Location {location_id} deleted successfully"})
+ 
++
++@router.patch("/v1/locations/{location_id}")
++async def edit_location(
++    location_id: str,
++    location_data: LocationZoneUpdate,
++    session: AsyncSession = Depends(get_db),
++    _role = Depends(verify_role(["manager", "driver"]))
++    ):
++
++    location = await session.get(Location, location_id)
++
++    if not location:
++        raise HTTPException(status_code=404, detail="Location no encontrada")
++
++    if location_data.point is not None:
++        location.point = location_data.point
++    if location_data.radio_zone is not None:
++        location.radio_zone = location_data.radio_zone
++
++    session.add(location)
++    await session.commit()
++
++    return JSONResponse(content={"status": "ok", "location": location.model_dump(mode="json")})
++
++@router.patch("/v1/hotels/{hotel_id}")
++async def edit_hotel(
++    hotel_id: str,
++    hotel_data: HotelPointUpdate,
++    session: AsyncSession = Depends(get_db),
++    _role=Depends(verify_role(["manager"]))
++):
++    """
++    Actualiza el point y/o radio_zone de un hotel.
++    """
++    from uuid import UUID
++
++    try:
++        uuid_hotel_id = UUID(hotel_id)
++    except ValueError:
++        raise HTTPException(status_code=400, detail="ID de hotel inválido")
++
++    hotel = await session.get(Hotel, uuid_hotel_id)
++
++    if not hotel:
++        raise HTTPException(status_code=404, detail="Hotel no encontrado")
++
++    if hotel_data.point is not None:
++        hotel.point = hotel_data.point
++    if hotel_data.radio_zone is not None:
++        hotel.radio_zone = hotel_data.radio_zone
++
++    session.add(hotel)
++    await session.commit()
++    await session.refresh(hotel)
++
++    return JSONResponse(content={"status": "ok", "hotel": hotel.model_dump(mode="json")})
++
++
+diff --git a/features/trips/utils/utils.py b/features/trips/utils/utils.py
+index f2ef7fb..2e3ff22 100644
+--- a/features/trips/utils/utils.py
++++ b/features/trips/utils/utils.py
+@@ -1,3 +1,9 @@
++from __future__ import annotations
++from dataclasses import dataclass
++from datetime import datetime, timezone, date, time
++from functools import lru_cache
++from zoneinfo import ZoneInfo
++from timezonefinder import TimezoneFinder
+ import json
+ from shared.redis.redis_client import redis_client
+ from psqlmodel import Select
+@@ -31,4 +37,157 @@ async def get_locations_by_org_id(session, org_id):
+         Select(Location)
+         .Where(Location.organization_id == org_id)
+     ).to_dicts()
+-    return locations
+\ No newline at end of file
++    return locations
++
++# ---- Core: timezone lookup (Lat/Lon -> IANA) ----
++
++_tf = TimezoneFinder()
++
++@lru_cache(maxsize=50_000)
++def tz_from_latlon(lat: float, lon: float) -> str:
++    """
++    Returns IANA timezone name for a given lat/lon, e.g. "America/New_York".
++    Cached for speed.
++    """
++    tz = _tf.timezone_at(lat=lat, lng=lon) or _tf.closest_timezone_at(lat=lat, lng=lon)
++    if not tz:
++        raise ValueError(f"Could not determine timezone for lat={lat}, lon={lon}")
++    return tz
++
++
++# ---- Core: UTC timestamps ----
++
++def utc_now() -> datetime:
++    """Current time in UTC (timezone-aware)."""
++    return datetime.now(timezone.utc)
++
++
++def ensure_utc(dt: datetime) -> datetime:
++    """
++    Ensures a datetime is timezone-aware and in UTC.
++    If naive -> raises (avoid guessing).
++    """
++    if dt.tzinfo is None:
++        raise ValueError("Datetime must be timezone-aware (expected UTC or convertible to UTC).")
++    return dt.astimezone(timezone.utc)
++
++
++# ---- Core: conversions ----
++
++def utc_to_local(dt_utc: datetime, tz_name: str) -> datetime:
++    """Convert UTC datetime to local tz (DST-safe)."""
++    dt_utc = ensure_utc(dt_utc)
++    return dt_utc.astimezone(ZoneInfo(tz_name))
++
++
++def local_to_utc(dt_local: datetime, tz_name: str | None = None) -> datetime:
++    """
++    Convert local datetime -> UTC.
++    - If dt_local is naive, you MUST provide tz_name.
++    - If dt_local is aware, tz_name is ignored.
++    """
++    if dt_local.tzinfo is None:
++        if not tz_name:
++            raise ValueError("If dt_local is naive, tz_name is required.")
++        dt_local = dt_local.replace(tzinfo=ZoneInfo(tz_name))
++    return dt_local.astimezone(timezone.utc)
++
++
++def local_date_time_to_utc(d: date, t: time, tz_name: str) -> datetime:
++    """
++    Convert (date + local time + tz) -> UTC datetime.
++    Useful for schedule times like 8:00 AM that must become an instant.
++    """
++    # NOTE: This assumes t is a wall-clock time in tz_name.
++    dt_local = datetime(d.year, d.month, d.day, t.hour, t.minute, t.second, tzinfo=ZoneInfo(tz_name))
++    return dt_local.astimezone(timezone.utc)
++
++
++def utc_to_local_date_time(dt_utc: datetime, tz_name: str) -> tuple[date, time]:
++    """Convert UTC -> (local date, local time)."""
++    local_dt = utc_to_local(dt_utc, tz_name)
++    return local_dt.date(), local_dt.timetz().replace(tzinfo=None)
++
++
++# ---- Formatting helpers for API payloads ----
++
++@dataclass(frozen=True)
++class ZonedTimestamp:
++    utc_iso: str
++    local_iso: str
++    tz_name: str
++    tz_abbrev: str
++    utc_offset: str  # e.g. "-05:00"
++
++
++def build_zoned_timestamp(dt_utc: datetime, tz_name: str) -> ZonedTimestamp:
++    """
++    Build a stable payload for frontend:
++    - utc_iso: ISO in UTC
++    - local_iso: ISO in local tz
++    - tz_abbrev: EST/EDT etc (depends on date)
++    - utc_offset: "-05:00" etc
++    """
++    dt_utc = ensure_utc(dt_utc)
++    local_dt = utc_to_local(dt_utc, tz_name)
++
++    offset = local_dt.utcoffset()
++    offset_str = offset and _format_timedelta_offset(offset) or "+00:00"
++
++    return ZonedTimestamp(
++        utc_iso=dt_utc.isoformat(),
++        local_iso=local_dt.isoformat(),
++        tz_name=tz_name,
++        tz_abbrev=local_dt.tzname() or "",
++        utc_offset=offset_str,
++    )
++
++
++def build_event_timestamp_from_latlon(lat: float, lon: float, dt_utc: datetime | None = None) -> ZonedTimestamp:
++    """
++    Typical usage for "driver pressed complete":
++    - backend sets dt_utc = utc_now()
++    - tz comes from driver's lat/lon at completion
++    """
++    if dt_utc is None:
++        dt_utc = utc_now()
++    tz_name = tz_from_latlon(lat, lon)
++    return build_zoned_timestamp(dt_utc, tz_name)
++
++
++def build_time_label_for_list(d: date, t: time, tz_name: str) -> dict:
++    """
++    For trip list UI, where you have a local wall-clock time (e.g. 08:00)
++    and you want to send timezone + a friendly label + computed UTC instant.
++    """
++    local_dt = datetime(d.year, d.month, d.day, t.hour, t.minute, t.second, tzinfo=ZoneInfo(tz_name))
++    return {
++        "time_local": _format_ampm(local_dt),
++        "tz_name": tz_name,
++        "tz_abbrev": local_dt.tzname() or "",
++        "utc_offset": _format_timedelta_offset(local_dt.utcoffset()) if local_dt.utcoffset() else "+00:00",
++        "at_utc_iso": local_dt.astimezone(timezone.utc).isoformat(),
++        "at_local_iso": local_dt.isoformat(),
++    }
++
++
++# ---- Internal formatting ----
++
++def _format_ampm(dt: datetime) -> str:
++    """
++    '8:00 AM' formatter.
++    Uses a cross-platform approach (avoids %-I issues on Windows).
++    """
++    hour = dt.hour % 12 or 12
++    ampm = "AM" if dt.hour < 12 else "PM"
++    return f"{hour}:{dt.minute:02d} {ampm}"
++
++
++def _format_timedelta_offset(td) -> str:
++    # td is datetime.timedelta
++    total_seconds = int(td.total_seconds())
++    sign = "+" if total_seconds >= 0 else "-"
++    total_seconds = abs(total_seconds)
++    hours = total_seconds // 3600
++    minutes = (total_seconds % 3600) // 60
++    return f"{sign}{hours:02d}:{minutes:02d}"
+\ No newline at end of file
+diff --git a/features/trips/utils/ws_manager.py b/features/trips/utils/ws_manager.py
+index 23ab48c..b7405da 100644
+--- a/features/trips/utils/ws_manager.py
++++ b/features/trips/utils/ws_manager.py
+@@ -95,9 +95,14 @@ class WSManager:
+             return False
+ 
+     async def route_location_event(self, location_id: str, trip_id: Optional[str], payload: dict) -> None:
++        location_id = str(location_id)
++
++        if trip_id is not None:
++            trip_id = str(trip_id)
++
+         async with self._lock:
+             if trip_id:
+-                targets = set(self.trip_subscribers.get(trip_id, set()))
++                targets = set(self.trip_subscribers.get(trip_id, set())) | set(self.rooms.get(location_id, set()))
+             else:
+                 targets = set(self.rooms.get(location_id, set()))
+ 
+diff --git a/features/trips/websockets/trip_websockets.py b/features/trips/websockets/trip_websockets.py
+index 11d6e92..a4a0211 100644
+--- a/features/trips/websockets/trip_websockets.py
++++ b/features/trips/websockets/trip_websockets.py
+@@ -73,29 +73,30 @@ async def ws_location_trips(ws: WebSocket, location_id: str, token: str):
+             trip_ids = set(msg.get("trip_ids", []))
+ 
+             if action == "subscribe":
+-                requested: Set[str] = set()
++                requested_set: Set[str] = set()
+ 
+-                # normalizar ids a str y limpiar vacíos
+                 for tid in trip_ids:
+                     if isinstance(tid, (bytes, bytearray)):
+                         tid = tid.decode("utf-8", errors="ignore")
+                     tid = str(tid).strip()
+                     if tid:
+-                        requested.add(tid)
++                        requested_set.add(tid)
+ 
+-                if not requested:
++                if not requested_set:
+                     await ws.send_json({"type": "subscribed", "trip_ids": [], "trips": []})
+                     continue
+ 
+-                # 1) Redis: un solo MGET
+-                keys = [f"trip:{tid}" for tid in requested]
++                # IMPORTANT: usa lista estable para que mget/zip coincidan
++                requested_list = list(requested_set)
++
++                keys = [f"trip:{tid}" for tid in requested_list]
+                 vals = await redis.mget(keys)
+ 
+                 valid: Set[str] = set()
+                 now: List[dict] = []
+                 missing: List[str] = []
+ 
+-                for tid, raw in zip(requested, vals):
++                for tid, raw in zip(requested_list, vals):
+                     if not raw:
+                         missing.append(tid)
+                         continue
+diff --git a/main.py b/main.py
+index 4b6f91c..3dbaf3a 100644
+--- a/main.py
++++ b/main.py
+@@ -20,9 +20,7 @@ app = FastAPI()
+ async def lifespan(app: FastAPI):
+     await engine.startup_async()
+     yield
+-    # Opcional pero recomendado:
+-    if engine._async_pool:
+-        await engine._async_pool.close()
++    await engine.dispose_async()
+ 
+ app = FastAPI(title="GT360", version="0.1.0", lifespan=lifespan)
+ 
+@@ -35,7 +33,8 @@ app.add_middleware(
+     allow_origins=[
+         "https://www.gt360.com",
+         "https://gt360.com",
+-	    "https://web.gt360.app"
++	    "https://web.gt360.app",
++        "http://192.168.1.182:3000"
+     ],
+     allow_credentials=True,
+     allow_methods=["*"],
+diff --git a/requirements.txt b/requirements.txt
+index 7577a75..176b384 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -29,4 +29,6 @@ redis>=5.0.0
+ openpyxl
+ pandas
+ xlrd
+-orjson 
+\ No newline at end of file
++orjson 
++
++timezonefinder
+\ No newline at end of file
+diff --git a/services/streaming/trip_streaming.py b/services/streaming/trip_streaming.py
+index 446a960..e4acccd 100644
+--- a/services/streaming/trip_streaming.py
++++ b/services/streaming/trip_streaming.py
+@@ -1,178 +1,3 @@
+-'''from shared.db.schemas import Trip
+-from psqlmodel import create_async_engine, Subscribe
+-from shared.settings import settings
+-
+-import httpx, asyncio, uuid, json, time, hmac, hashlib, random
+-
+-SECRET = settings.WEBHOOK_SECRET
+-WEBHOOK_BATCH_URL = f"{settings.BACKEND_URL}/v1/webhooks/trips/batch"
+-
+-def sign_body(secret: str, body: bytes, ts: int) -> str:
+-    msg = f"{ts}.".encode("utf-8") + body
+-    sig = hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+-    return f"t={ts},v1={sig}"
+-
+-def build_event(payload: dict) -> dict | None:
+-    event_type = payload.get("event")
+-    old = payload.get("old") or {}
+-    new = payload.get("new") or {}
+-
+-    trip_id = str((new.get("id") or old.get("id") or "")).strip()
+-    location_id = str((new.get("location_id") or old.get("location_id") or "")).strip()
+-    if not trip_id or not location_id:
+-        return None
+-
+-    return {
+-        "event_id": str(uuid.uuid4()),
+-        "event_type": event_type,
+-        "trip_id": trip_id,
+-        "location_id": location_id,
+-        "trip": old if event_type == "delete" else new,
+-    }
+-
+-async def post_batch_with_retry(client: httpx.AsyncClient, batch: dict, max_retries: int = 8):
+-    body = json.dumps(batch, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+-
+-    for attempt in range(max_retries + 1):
+-        ts = int(time.time())
+-        signature = sign_body(SECRET, body, ts)
+-        headers = {"Content-Type": "application/json", "x-webhook-secret": signature}
+-
+-        try:
+-            resp = await client.post(WEBHOOK_BATCH_URL, content=body, headers=headers)
+-            print("[HTTP]", resp.status_code, "events=", len(batch["events"]))
+-
+-            if 200 <= resp.status_code < 300:
+-                return True
+-
+-            if resp.status_code in (408, 425, 429, 500, 502, 503, 504):
+-                ra = resp.headers.get("retry-after")
+-                if ra:
+-                    try:
+-                        await asyncio.sleep(float(ra))
+-                        continue
+-                    except Exception:
+-                        pass
+-                raise httpx.HTTPStatusError(f"{resp.status_code}: {resp.text}", request=resp.request, response=resp)
+-
+-            print("Batch non-retryable:", resp.status_code, resp.text)
+-            return False
+-
+-        except Exception as e:
+-            print(f"[HTTP] attempt={attempt} error={repr(e)}")
+-            if attempt >= max_retries:
+-                print("Batch failed permanently:", "batch_id=", batch.get("batch_id"))
+-                return False
+-            backoff = min(2 ** attempt, 20) + random.random()
+-            await asyncio.sleep(backoff)
+-
+-async def composer(event_q: asyncio.Queue, batch_q: asyncio.Queue):
+-    """
+-    Lee eventos individuales y arma batches de 100.
+-    FLUSH_INTERVAL asegura que si llegan pocos eventos, igual se manden.
+-    """
+-    MAX_BATCH = 100
+-    FLUSH_INTERVAL = 0.2
+-
+-    buffer: list[dict] = []
+-    last_flush = time.monotonic()
+-
+-    while True:
+-        timeout = max(0.0, FLUSH_INTERVAL - (time.monotonic() - last_flush))
+-
+-        ev = None
+-        try:
+-            ev = await asyncio.wait_for(event_q.get(), timeout=timeout)
+-        except asyncio.TimeoutError:
+-            pass
+-
+-        if ev is not None:
+-            buffer.append(ev)
+-            event_q.task_done()
+-
+-        if buffer and (len(buffer) >= MAX_BATCH or (time.monotonic() - last_flush) >= FLUSH_INTERVAL):
+-            batch = {
+-                "batch_id": str(uuid.uuid4()),
+-                "sent_at": int(time.time()),
+-                "source": "trips-subscriber",
+-                "events": buffer,
+-            }
+-            buffer = []
+-            last_flush = time.monotonic()
+-
+-            # backpressure: si batch_q se llena, composer se pausa aquí
+-            await batch_q.put(batch)
+-            print("[BATCH] queued batch events=", len(batch["events"]))
+-
+-async def sender(batch_q: asyncio.Queue, client: httpx.AsyncClient):
+-    """
+-    Envía batches uno por uno. Solo toma el siguiente cuando termina el anterior.
+-    """
+-    while True:
+-        batch = await batch_q.get()
+-        try:
+-            ok = await post_batch_with_retry(client, batch)
+-            if not ok:
+-                # si quieres, re-enqueue o log; yo lo dejo logeado
+-                pass
+-        finally:
+-            batch_q.task_done()
+-
+-async def main():
+-    if not SECRET:
+-        raise RuntimeError("Invalid WEBHOOK_SECRET.")
+-
+-    # Cola de eventos individuales (rápida)
+-    event_q: asyncio.Queue = asyncio.Queue(maxsize=200_000)
+-
+-    # Cola de batches ya listos (controla memoria y ritmo de envío)
+-    batch_q: asyncio.Queue = asyncio.Queue(maxsize=2_000)  # 2000 * 100 = 200k eventos en el peor caso
+-
+-    limits = httpx.Limits(max_connections=10, max_keepalive_connections=10)
+-    timeout = httpx.Timeout(30.0, connect=5.0)
+-
+-    async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
+-        composer_task = asyncio.create_task(composer(event_q, batch_q))
+-        sender_task = asyncio.create_task(sender(batch_q, client))
+-
+-        async_engine = create_async_engine(
+-            username=settings.POSTGRES_USER,
+-            password=settings.POSTGRES_PASSWORD,
+-            port=settings.POSTGRES_PORT,
+-            host=settings.POSTGRES_SERVER,
+-            database=settings.POSTGRES_DB,
+-            debug=True,
+-            models_path="__main__",
+-        )
+-
+-        async def on_trip_change(payload):
+-            ev = build_event(payload)
+-            if ev:
+-                # rápido. si se llena, aplica backpressure natural
+-                await event_q.put(ev)
+-
+-        sub = Subscribe.engine(async_engine, use_engine_pool=False)
+-
+-        try:
+-            await sub(Trip).OnEvent("change").Exec(on_trip_change).StartAsync()
+-        finally:
+-            try:
+-                await sub.StopAsync()
+-            except Exception:
+-                pass
+-
+-            # drenar colas antes de salir
+-            await event_q.join()
+-            await batch_q.join()
+-
+-            composer_task.cancel()
+-            sender_task.cancel()
+-            await asyncio.gather(composer_task, sender_task, return_exceptions=True)
+-
+-if __name__ == "__main__":
+-    asyncio.run(main())
+-'''
+-
+ from shared.db.schemas import Trip
+ from psqlmodel import create_async_engine, Subscribe
+ from shared.settings import settings
+@@ -371,8 +196,8 @@ async def main():
+ 
+     async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
+         composer_task = asyncio.create_task(composer(event_q, batch_q))
+-        sender_task = [asyncio.create_task(sender(batch_q, client)) for _ in range(3)]
+-        hb_task = asyncio.create_task(heartbeat(event_q, batch_q))  # quítalo si no lo quieres
++        sender_tasks = [asyncio.create_task(sender(batch_q, client)) for _ in range(3)]
++        hb_task = asyncio.create_task(heartbeat(event_q, batch_q))
+ 
+         async_engine = create_async_engine(
+             username=settings.POSTGRES_USER,
+@@ -382,6 +207,7 @@ async def main():
+             database=settings.POSTGRES_DB,
+             debug=True,
+             models_path="__main__",
++            pool_close_timeout=10.0,  # Timeout para cierre del pool
+         )
+ 
+         async def on_trip_change(payload):
+@@ -394,19 +220,28 @@ async def main():
+         try:
+             await sub(Trip).OnEvent("change").Exec(on_trip_change).StartAsync()
+         finally:
++            # 1. Detener suscripción
+             try:
+                 await sub.StopAsync()
+             except Exception:
+                 pass
++            
++            # 2. Cerrar el engine (usa el timeout configurado)
++            try:
++                await async_engine.dispose_async()
++            except Exception:
++                pass
+ 
+-            # drenar colas antes de salir
++            # 3. Drenar colas antes de salir
+             await event_q.join()
+             await batch_q.join()
+ 
+-            for t in (composer_task, sender_task, hb_task):
++            # 4. Cancelar todas las tasks
++            all_tasks = [composer_task, *sender_tasks, hb_task]
++            for t in all_tasks:
+                 t.cancel()
+-            await asyncio.gather(composer_task, sender_task, hb_task, return_exceptions=True)
++            await asyncio.gather(*all_tasks, return_exceptions=True)
+ 
+ if __name__ == "__main__":
+     # Recomendado: ejecuta con `python -u script.py` para prints inmediatos
+-    asyncio.run(main())
++    asyncio.run(main())
+\ No newline at end of file
+diff --git a/shared/db/db_config.py b/shared/db/db_config.py
+index 54df3ca..5905a95 100644
+--- a/shared/db/db_config.py
++++ b/shared/db/db_config.py
+@@ -6,7 +6,8 @@ engine = create_async_engine(
+     username=settings.POSTGRES_USER,
+     password=settings.POSTGRES_PASSWORD,
+     database=settings.POSTGRES_DB,
+-    ensure_database=False,
++    host=settings.POSTGRES_SERVER,
++    ensure_database=True,
+     ensure_tables=False,
+     auto_startup=False,
+     check_schema_drift=False,
+@@ -31,4 +32,4 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
+         The session is automatically closed after the request is processed.
+     """
+     async with AsyncSession(engine) as session:
+-        yield session
+\ No newline at end of file
++        yield session
+diff --git a/shared/db/schemas/__init__.py b/shared/db/schemas/__init__.py
+index dc009c7..557f232 100644
+--- a/shared/db/schemas/__init__.py
++++ b/shared/db/schemas/__init__.py
+@@ -9,5 +9,6 @@ from .entities.supervisors import Supervisor
+ from .entities.organizations import Organization
+ from .entities.locations import Location
+ from .entities.airports import Airport
++from .entities.hotels import Hotel
+ from .trips.trips import Trip
+ from .trips.trips_history import TripHistory
+\ No newline at end of file
+diff --git a/shared/db/schemas/entities/hotels.py b/shared/db/schemas/entities/hotels.py
+index 0873761..d22c460 100644
+--- a/shared/db/schemas/entities/hotels.py
++++ b/shared/db/schemas/entities/hotels.py
+@@ -1 +1,16 @@
+-from psqlmodel import PSQLModel, Column, table
+\ No newline at end of file
++from psqlmodel import PSQLModel, Column, table
++from psqlmodel.orm.types import uuid, timestamptz, jsonb
++from psqlmodel.utils import gen_default_uuid, now
++
++
++@table("hotels", schema="entities", unique_together=['name', 'location_id'])
++class Hotel(PSQLModel):
++    id: uuid = Column(primary_key=True, default=gen_default_uuid)
++    name: str = Column(max_len=250, nullable=False)
++    location_id: uuid = Column(foreign_key='entities.locations.id', nullable=False, on_delete='CASCADE')
++    address: str = Column(max_len=250, nullable=True)
++    point: jsonb = Column(nullable=True)
++    radio_zone: float = Column(default=None, nullable=True)
++    crated_at: timestamptz = Column(default=now)
++    updated_at: timestamptz = Column(default=now)
++
+diff --git a/shared/db/schemas/entities/locations.py b/shared/db/schemas/entities/locations.py
+index fd5c264..5079422 100644
+--- a/shared/db/schemas/entities/locations.py
++++ b/shared/db/schemas/entities/locations.py
+@@ -16,14 +16,15 @@ class Location(PSQLModel):
+         foreign_key="entities.organizations.id", 
+         on_delete="CASCADE",
+         nullable=False,
+-        index=True,
+-        unique=True
++        index=True
+     )
+ 
+     name: str = Column(nullable=False, index=True)
+ 
+-    point: jsonb = Column(
+-        default=None
+-    )
++    point: jsonb = Column(default=None)
++
++    radio_zone: float = Column(default=None)
++
++    created_at: timestamptz = Column(default=now)
+ 
+-    created_at: timestamptz = Column(default=now)
+\ No newline at end of file
++    timezone: str = Column(default="America/New_York")
+\ No newline at end of file
+diff --git a/shared/redis/redis_client.py b/shared/redis/redis_client.py
+index 4b9c7f0..da4a1af 100644
+--- a/shared/redis/redis_client.py
++++ b/shared/redis/redis_client.py
+@@ -1,3 +1,3 @@
+ import redis.asyncio as redis
+ 
+-redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+\ No newline at end of file
++redis_client = redis.Redis(host="redis", port=6379, db=0, decode_responses=True)
+\ No newline at end of file
+diff --git a/shared/settings.py b/shared/settings.py
+index e89e7ce..7114fbd 100644
+--- a/shared/settings.py
++++ b/shared/settings.py
+@@ -8,7 +8,7 @@ load_dotenv()
+ 
+ class BaseAppSettings(BaseSettings):
+     BASE_URL: str = "https://web.gt360.app"
+-    BACKEND_URL: str = "http://127.0.0.1:8000"
++    BACKEND_URL: str = "http://app:8000"
+     POSTGRES_SERVER: str = os.getenv("POSTGRES_SERVER")
+     POSTGRES_PORT: str = os.getenv("POSTGRES_PORT")
+     POSTGRES_DB: str = os.getenv("POSTGRES_DB")

@@ -1,4 +1,5 @@
 version: "3.8"
+
 services:
   redis:
     image: redis:7
@@ -6,19 +7,47 @@ services:
     ports:
       - "6379:6379"
     restart: unless-stopped
+
   postgres:
     image: postgres:18.1
     container_name: postgres
     restart: unless-stopped
     ports:
       - "5432:5432"
+    env_file:
+      - .env
     environment:
-      POSTGRES_USER: gt360
-      POSTGRES_PASSWORD: Rlg*020305
-      POSTGRES_DB: gt360
-      PGDATA: /var/lib/postgresql/18/docker
+      PGDATA: /var/lib/postgresql/data
     volumes:
-      - pgdata:/var/lib/postgresql
+      - pgdata:/var/lib/postgresql/data
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gt360:latest
+    container_name: gt360
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    depends_on:
+      - postgres
+      - redis
+
+  streaming:
+    build:
+      context: .
+      dockerfile: services/streaming/Dockerfile
+    image: trip-streaming:latest
+    env_file:
+      - .env
+    restart: unless-stopped
+    depends_on:
+      - redis
+      - postgres
+      - app
 
 volumes:
   pgdata:
