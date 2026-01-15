@@ -142,6 +142,48 @@ except Exception as e:
 
 **Commit:** `7f5cd69`
 
+### 3. psqlmodel Engine API Incompatibility (HOTFIX 2)
+**Problema:**
+- `'Engine' object has no attribute 'begin'` en endpoint /months
+- Mismo error persistía en batch mode activation después de fix anterior
+
+**Causa Raíz:** psqlmodel usa asyncpg (no SQLAlchemy)
+- asyncpg usa parámetros posicionales `$1, $2` (NO named params `:name`)
+- engine no tiene método `.begin()`, tiene `.execute_raw_async()`
+- `session.exec()` acepta SQL plano pero no `text()` objects
+
+**Soluciones Aplicadas:**
+
+1. **Endpoint /months (línea 1028):**
+```python
+# ANTES (SQLAlchemy style - NO funciona):
+async with engine.begin() as conn:
+    result = await conn.execute(text(query), {"location_id": uuid})
+
+# DESPUÉS (psqlmodel style - FUNCIONA):
+params = [location_uuid]
+if airline:
+    params.append(f"%{airline}%")
+result = await engine.execute_raw_async(query, params)
+rows = result  # Ya es una lista de tuplas
+```
+
+2. **Batch mode (línea 185):**
+```python
+# ANTES (no funcionaba):
+await session.execute(text("SET LOCAL..."))
+
+# DESPUÉS (funciona):
+await session.exec("SET LOCAL app.batch_insert_mode = 'true'")
+# Sin text(), solo string plano
+```
+
+**Estado:** ✅ RESUELTO
+
+**Impacto:** Crítico - Bloqueaba endpoint /months Y wizard upload
+
+**Commit:** `63d8922`
+
 ---
 
 ## 📊 Testing Realizado
@@ -308,7 +350,7 @@ docker logs gt360 --tail 50
 
 ---
 
-**Última actualización:** 2026-01-15 19:00 CET (HOTFIX aplicado)
+**Última actualización:** 2026-01-15 19:41 CET (HOTFIX 2 aplicado - psqlmodel API)
 **Próxima revisión:** Después de implementación frontend
-**Estado general:** ✅ BACKEND COMPLETO - FRONTEND PENDIENTE
-**Commits:** 3 (cde705f, 0899af7, 7f5cd69)
+**Estado general:** ✅ BACKEND COMPLETO Y FUNCIONANDO - FRONTEND PENDIENTE
+**Commits:** 4 (cde705f, 0899af7, 7f5cd69, 63d8922)
