@@ -180,7 +180,12 @@ async def upload_trips(
         # 2. Insertar todo el lote de una sola vez (optimizado)
         if trips_to_create:
             # ACTIVAR BATCH MODE: Los triggers NO enviarán eventos individuales
-            await session.execute(text("SET LOCAL app.batch_insert_mode = 'true'"))
+            # Usar exec() con text() para ejecutar SET LOCAL en la misma sesión
+            try:
+                await session.exec(text("SET LOCAL app.batch_insert_mode = 'true'"))
+            except Exception as e:
+                print(f"[WARNING] Could not set batch_insert_mode: {e}")
+                # Continuar de todas formas, los triggers enviarán eventos individuales
 
             # Procesar en chunks si son miles (ej. 5000) para no saturar la consulta
             chunk_size = 5000
