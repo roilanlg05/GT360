@@ -180,9 +180,9 @@ async def upload_trips(
         # 2. Insertar todo el lote de una sola vez (optimizado)
         if trips_to_create:
             # ACTIVAR BATCH MODE: Los triggers NO enviarán eventos individuales
-            # Usar exec() con text() para ejecutar SET LOCAL en la misma sesión
+            # Ejecutar raw SQL directamente con exec() usando string plano
             try:
-                await session.exec(text("SET LOCAL app.batch_insert_mode = 'true'"))
+                await session.exec("SET LOCAL app.batch_insert_mode = 'true'")
             except Exception as e:
                 print(f"[WARNING] Could not set batch_insert_mode: {e}")
                 # Continuar de todas formas, los triggers enviarán eventos individuales
@@ -1000,32 +1000,33 @@ async def get_available_months(
         raise HTTPException(status_code=404, detail="Location no encontrada")
 
     # Query SQL optimizada con GROUP BY
+    # psqlmodel usa positional params ($1, $2) no named params (:name)
     query = """
         SELECT
             EXTRACT(YEAR FROM pick_up_date)::int AS year,
             EXTRACT(MONTH FROM pick_up_date)::int AS month,
             COUNT(*)::int AS trips_count
         FROM trips.trips
-        WHERE location_id = :location_id
+        WHERE location_id = $1
     """
 
-    params = {"location_id": location_uuid}
+    params = [location_uuid]
 
     if airline:
-        query += " AND airline ILIKE :airline"
-        params["airline"] = f"%{airline}%"
+        query += " AND airline ILIKE $2"
+        params.append(f"%{airline}%")
 
     query += """
         GROUP BY year, month
         ORDER BY year DESC, month DESC
     """
 
-    # Ejecutar query raw SQL usando la engine directamente
+    # Ejecutar query raw SQL usando la engine de psqlmodel directamente
     from shared.db.db_config import engine
 
-    async with engine.begin() as conn:
-        result = await conn.execute(text(query), params)
-        rows = result.fetchall()
+    # psqlmodel engine usa execute_raw_async() con positional params como lista
+    result = await engine.execute_raw_async(query, params)
+    rows = result
 
     months = [
         {
