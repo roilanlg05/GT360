@@ -118,6 +118,30 @@ async with engine.begin() as conn:
 
 **Estado:** ✅ RESUELTO
 
+### 2. session.execute() Error in Batch Mode (HOTFIX)
+**Problema:** `'AsyncSession' object has no attribute 'execute'` al crear locations con upload de trips
+
+**Causa:** `psqlmodel.AsyncSession` no tiene método `execute()`, solo `exec()`
+
+**Ubicación:** `trips_router.py:183` - Activación de batch_insert_mode
+
+**Solución:** Cambiar `session.execute()` a `session.exec()` + try-except para fallback
+
+**Código:**
+```python
+try:
+    await session.exec(text("SET LOCAL app.batch_insert_mode = 'true'"))
+except Exception as e:
+    print(f"[WARNING] Could not set batch_insert_mode: {e}")
+    # Continuar de todas formas
+```
+
+**Estado:** ✅ RESUELTO
+
+**Impacto:** Crítico - Bloqueaba creación de locations en wizard
+
+**Commit:** `7f5cd69`
+
 ---
 
 ## 📊 Testing Realizado
@@ -284,6 +308,7 @@ docker logs gt360 --tail 50
 
 ---
 
-**Última actualización:** 2026-01-15 18:48 CET
+**Última actualización:** 2026-01-15 19:00 CET (HOTFIX aplicado)
 **Próxima revisión:** Después de implementación frontend
 **Estado general:** ✅ BACKEND COMPLETO - FRONTEND PENDIENTE
+**Commits:** 3 (cde705f, 0899af7, 7f5cd69)
