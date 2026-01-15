@@ -10,6 +10,10 @@ class VerifyToken(BaseHTTPMiddleware):
         super().__init__(app)
 
     async def dispatch(self, request: Request, call_next) -> Response | JSONResponse:
+        # Skip for WebSocket - they handle auth in the endpoint
+        if request.scope.get("type") == "websocket":
+            return await call_next(request)
+
         if request.method == "OPTIONS":
             return await call_next(request)
 
@@ -23,7 +27,7 @@ class VerifyToken(BaseHTTPMiddleware):
             request.state.user_data = payload.get("metadata") or {}
             request.state.user_data.update({"id": payload.get("sub")})
             print(request.state.user_data)
-        
+
 
         response = await call_next(request)
         return response

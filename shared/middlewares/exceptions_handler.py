@@ -1,7 +1,9 @@
 from starlette.middleware.base import BaseHTTPMiddleware
-from fastapi import FastAPI, Request, status
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from fastapi import FastAPI, Request, status, HTTPException
 from fastapi.responses import JSONResponse, Response
 import logging
+import traceback
 
 logger = logging.getLogger(__name__)
 
@@ -11,11 +13,26 @@ class HTTPErrorHandler(BaseHTTPMiddleware):
         super().__init__(app)
 
     async def dispatch(self, request: Request, call_next) -> Response | JSONResponse:
+        # Skip middleware for WebSocket connections - BaseHTTPMiddleware doesn't handle them well
+        if request.scope.get("type") == "websocket":
+            return await call_next(request)
+
         try:
             return await call_next(request)
+        except (HTTPException, StarletteHTTPException):
+            # Re-raise HTTPException so FastAPI's default handler processes it
+            raise
         except Exception as e:
-            logger.error(f"Unhandled error: {str(e)}")
+            error_msg = f"{type(e).__name__}: {str(e)}"
+            tb = traceback.format_exc()
+            logger.error(f"Unhandled error on {request.method} {request.url.path}: {error_msg}")
+            logger.error(tb)
+            # Include error details for debugging
             return JSONResponse(
-                content={"detail": "Internal server error"},
+                content={
+                    "detail": "Internal server error",
+                    "error": error_msg,
+                    "traceback": tb.split('\n')[-5:]  # Last 5 lines of traceback
+                },
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )

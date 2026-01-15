@@ -1,9 +1,9 @@
 from fastapi import APIRouter, HTTPException, Depends, Response, Cookie, Request
 from fastapi.responses import JSONResponse
 from psqlmodel import Select, AsyncSession
-from features.auth.models.user_model import CreateCrewMember, UserData, CreateManager
+from features.auth.models.user_model import CreateCrewMember, UserData, CreateManager, CreateDriver
 from features.auth.models.auth_model import EmailPasswordRequestForm, PasswordUpdate, NewPassword
-from shared.db.schemas import User, Crew, Manager, Organization
+from shared.db.schemas import User, Crew, Manager, Driver, Organization
 from shared.db.db_config import get_db
 from shared.settings import settings
 from datetime import timedelta
@@ -151,6 +151,78 @@ async def register_manager(
         await session.rollback()
         raise HTTPException(status_code=400, detail=f"Registration failed: {str(e)}")
 
+@router.post("/register/driver", status_code=201)
+async def register_driver(
+    user_data: CreateDriver,
+    session: AsyncSession = Depends(get_db)
+    ) -> dict:
+
+    try:
+        await verify_if_exist(session, user_data.email)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+    hashed_pass = hash_pwd(user_data.password)
+
+    try:
+        # Verificar que la organización existe
+        org = await session.exec(
+            Select(Organization)
+            .Where(Organization.id == user_data.organization_id)
+        ).first()
+
+        if not org:
+            raise HTTPException(status_code=404, detail="Organization not found")
+
+        user = User(
+            email=user_data.email.lower(),
+            password_hash=hashed_pass,
+            phone=user_data.phone,
+            role="driver"
+        )
+        session.add(user)
+        await session.flush()
+
+        driver = Driver(
+            id=user.id,
+            organization_id=user_data.organization_id
+        )
+        session.add(driver)
+
+        # Rotar nonce
+        user.password_reset_nonce = secrets.token_urlsafe(16)
+        session.add(user)
+
+        await session.commit()
+
+        metadata = {
+            "email": user.email,
+            "purpose" : "email_verification",
+            "nonce": user.password_reset_nonce
+        }
+
+
+        token = encode_token(str(user.id), metadata, expires_in=timedelta(hours=24))
+        confirmation_url = f"{settings.BASE_URL}/auth/verify-email/?token={token['access_token']}"
+        html_content = get_confirmation_email_template(confirmation_url)
+
+        await send_email(
+            user.email,
+            "Confirm Your Api360 Account",
+            html_content,
+            confirmation_url
+        )
+
+        return {"message": "User registred succefull. Check  your email for  confirmation!"}
+    except HTTPException as e:
+        await session.rollback()
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
+    except Exception as e:
+        await session.rollback()
+        raise HTTPException(status_code=400, detail=f"Registration failed: {str(e)}")
+
+
+
 @router.post("/verify-data", status_code=200)
 async def verify_data(
     user_data: UserData, 
@@ -189,14 +261,21 @@ async def sign_in(
         "role": user.role
     }
 
-    if user.role == "manager":
-        org_row = await session.exec(Select(Manager.organization_id).Where(Manager.id == user.id)).first()
-        if org_row[0] and org_row.organization_id:
-            metadata["organization_id"] = str(org_row.organization_id)
-    elif user.role == "crew":
-        airline_row = await session.exec(Select(Crew.airline).Where(Crew.id == user.id)).first()
-        if airline_row[0] and airline_row.airline:
-            metadata["airline"] = airline_row.airline
+
+    match user.role:
+        case "manager":
+            org_row = await session.exec(Select(Manager.organization_id).Where(Manager.id == user.id)).first()
+            if org_row[0] and org_row.organization_id:
+                metadata["organization_id"] = str(org_row.organization_id)
+        case "crew":
+            airline_row = await session.exec(Select(Crew.airline).Where(Crew.id == user.id)).first()
+            if airline_row[0] and airline_row.airline:
+                metadata["airline"] = airline_row.airline
+        case "driver":
+            driver_row = await session.exec(Select(Driver.organization_id, Driver.location_id).Where(Driver.id == user.id)).first()
+            if driver_row[0] and driver_row.organization_id:
+                metadata["organization_id"] = str(driver_row.organization_id)
+                metadata["location_id"] = str(driver_row.location_id)
 
     access_token = encode_token(str(user.id), metadata)
     raw, token_hash, exp = gen_refresh_token()

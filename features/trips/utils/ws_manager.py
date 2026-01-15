@@ -16,7 +16,7 @@ class WSManager:
     Si quieres reenviar como 1 solo mensaje batch al frontend, setea:
       self.SEND_WS_BATCH = True
     """
-    SEND_WS_BATCH = False  # <- ponlo True si quieres mandar 1 msg WS por batch
+    SEND_WS_BATCH = True  # Envía 1 mensaje batch al frontend en vez de N individuales
 
     def __init__(self) -> None:
         self.rooms: Dict[str, Set[WebSocket]] = {}
@@ -116,8 +116,10 @@ class WSManager:
 
     async def _location_listener(self, location_id: str) -> None:
         """
-        Batch-only listener:
-          {"type":"trips_batch","location_id":"<loc>","events":[...]}
+        Listener for location-level events:
+          - {"type":"trips_batch","location_id":"<loc>","events":[...]}
+          - {"type":"location_delete_started",...}
+          - {"type":"location_deleted",...}
         """
         channel = f"loc:{location_id}"
         pubsub = redis.pubsub()
@@ -132,7 +134,15 @@ class WSManager:
                 if not ev:
                     continue
 
-                if ev.get("type") != "trips_batch":
+                event_type = ev.get("type")
+
+                # Handle location deletion events - forward directly to all clients
+                if event_type in ("location_delete_started", "location_deleted"):
+                    await self.route_location_event(location_id, ev)
+                    continue
+
+                # Handle trips_batch events
+                if event_type != "trips_batch":
                     continue
 
                 msg_loc = ev.get("location_id")

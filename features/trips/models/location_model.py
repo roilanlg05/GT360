@@ -5,3 +5,5 @@ from typing import Optional
 class LocationZoneUpdate(BaseModel):
     point: Optional[dict] = None
     radio_zone: Optional[float] = None
+    address: Optional[str] = None
+    validation_status: Optional[str] = None

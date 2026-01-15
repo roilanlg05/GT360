@@ -6,7 +6,8 @@ from psqlmodel.orm.types import timestamptz, uuid
 class User(PSQLModel):
 
     id: uuid = Column(default=gen_default_uuid, primary_key=True)
-    full_name: str = Column(nullable=True, index=True)
+    first_name: str = Column(nullable=True, index=True)
+    last_name: str = Column(nullable=True, index=True)
     email: str = Column(nullable=False, unique=True, index=True)
     password_hash: str = Column(nullable=False)
     phone: str = Column(default=None, unique=True)

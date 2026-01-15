@@ -8,6 +8,10 @@ logger = logging.getLogger(__name__)
 
 class RequestLoggerMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
+        # Skip for WebSocket connections
+        if request.scope.get("type") == "websocket":
+            return await call_next(request)
+
         client_ip = request.client.host if request.client else "unknown"
         method = request.method
         url = request.url.path
@@ -25,8 +29,21 @@ class RequestLoggerMiddleware(BaseHTTPMiddleware):
         - Referer: {referer}
         - Time: {datetime.now(timezone.utc)}
         """)
+
+        print(f"""
+        📥 Incoming Request:
+        - IP: {client_ip}
+        - Method: {method}
+        - Path: {url}
+        - User-Agent: {user_agent}
+        - Origin: {origin}
+        - Referer: {referer}
+        - Time: {datetime.now(timezone.utc)}
+        """)
         
         response = await call_next(request)
+
+        print(f"📤 Response Status: {response.status_code}")
         
         logger.info(f"📤 Response Status: {response.status_code}")
         

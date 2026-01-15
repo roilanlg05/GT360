@@ -47,11 +47,26 @@ class CreateManager(UserBase):
 
 
 class CreateCrewMember(UserBase):
-    airline: str | None = None 
-    
+    airline: str | None = None
+
+
+class CreateDriver(UserBase):
+    first_name: str
+    last_name: str
+    phone: str 
+    organization_id: str
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, v):
+        if v is not None:
+            return validators.validate_us_phone(v)
+        return v
+
 
 class UpdateUser(BaseModel):
-    full_name: str | None = None
+    first_name: str | None = None
+    last_name: str | None = None
     email: EmailStr | None = None
     password: str | None = None
     phone: str | None = None
@@ -59,7 +74,8 @@ class UpdateUser(BaseModel):
 
 class ManagerResponse(BaseModel):
     id: str
-    full_name: str | None = None
+    first_name: str | None = None
+    last_name: str | None = None
     email: EmailStr
     phone: str
     profile_pic: str | None = None

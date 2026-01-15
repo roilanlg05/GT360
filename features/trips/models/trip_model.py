@@ -12,9 +12,11 @@ class Trip(BaseModel):
     airline: str
     flight_number: str
     riders: dict[str, int]
+    trip_type: Optional[str] = None
     location_id: Optional[UUID] = None
 
 class TripUpdate(BaseModel):
+    assigned_driver: Optional[UUID] = None
     pick_up_date: Optional[date] = None
     pick_up_time: Optional[time] = None
     pick_up_location: Optional[str] = None
@@ -22,6 +24,10 @@ class TripUpdate(BaseModel):
     airline: Optional[str] = None
     flight_number: Optional[str] = None
     riders: Optional[dict[str, int]] = None
+    trip_type: Optional[str] = None
+    started_at: Optional[datetime] = None
+    picked_up_at: Optional[datetime] = None
+    dropped_off_at: Optional[datetime] = None
 
 class CreateTrip(BaseModel):
     pick_up_date: date
@@ -32,6 +38,7 @@ class CreateTrip(BaseModel):
     airline: str
     flight_number: str
     riders: dict[str, int]
+    trip_type: Optional[str] = None
 
 
 class TripResponse(BaseModel):
@@ -45,6 +52,7 @@ class TripResponse(BaseModel):
     airline: str
     flight_number: str
     riders: Optional[dict[str, int]] = None
+    trip_type: Optional[str] = None
     started_at: Optional[datetime] = None
     picked_up_at: Optional[datetime] = None
     dropped_off_at: Optional[datetime] = None

@@ -1,21 +1,50 @@
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from shared.redis.redis_client import redis_client as redis
 from features.trips.utils.ws_manager import manager
-import json
 from shared.db.db_config import engine, AsyncSession
+from shared.db.schemas import Trip as TripDB, Location
 from features.auth.utils import user_can_access_location, decode_token
+from psqlmodel import Select
+from uuid import UUID
+import json
 
 router = APIRouter()
 
-async def send_snapshot(ws: WebSocket, location_id: str) -> None:
-    idx_key = f"loc:{location_id}:trips"
-    trip_ids = await redis.smembers(idx_key)
+# Consistent with trip_webhooks.py
+TRIP_TTL_SECONDS = 300
 
-    if not trip_ids:
-        await ws.send_json({"type": "snapshot", "location_id": location_id, "trips": []})
-        return
 
-    # smembers puede devolver bytes; normalizamos a str
+async def _get_location_info(location_id: str) -> dict | None:
+    """
+    Get location metadata for Timeline ordering.
+
+    Returns:
+        dict with: id, name (airport code), timezone
+        Used by frontend to:
+        - Determine inbound/outbound (compare with pick_up_location/drop_off_location)
+        - Group trips by day using the correct timezone
+    """
+    try:
+        location_uuid = UUID(location_id)
+    except ValueError:
+        return None
+
+    async with AsyncSession(engine) as session:
+        location = await session.exec(
+            Select(Location).Where(Location.id == location_uuid)
+        ).first()
+
+        if not location:
+            return None
+
+        return {
+            "id": str(location.id),
+            "name": location.name,  # Airport code (e.g., "SDF")
+            "timezone": location.timezone,  # e.g., "America/New_York"
+        }
+
+async def _get_trips_from_redis(trip_ids: set) -> list:
+    """Get trips from Redis cache."""
     norm_ids = []
     for tid in trip_ids:
         if isinstance(tid, (bytes, bytearray)):
@@ -35,8 +64,87 @@ async def send_snapshot(ws: WebSocket, location_id: str) -> None:
             trips.append(json.loads(v))
         except Exception:
             continue
+    return trips
 
-    await ws.send_json({"type": "snapshot", "location_id": location_id, "trips": trips})
+
+async def _get_trips_from_db(location_id: str) -> list:
+    """Fallback: get trips from PostgreSQL when Redis cache is empty."""
+    try:
+        location_uuid = UUID(location_id)
+    except ValueError:
+        return []
+
+    async with AsyncSession(engine) as session:
+        stmt = (
+            Select(TripDB)
+            .Where(TripDB.location_id == location_uuid)
+            .OrderBy(TripDB.pick_up_date.Asc(), TripDB.pick_up_time.Asc())
+        )
+        trips = await session.exec(stmt).all()
+        return [t.model_dump(mode="json") for t in trips]
+
+
+async def _populate_redis_cache(location_id: str, trips: list) -> None:
+    """Repopulate Redis cache with trips from DB (self-healing cache)."""
+    if not trips:
+        return
+
+    idx_key = f"loc:{location_id}:trips"
+    pipe = redis.pipeline()
+
+    for trip in trips:
+        trip_id = trip.get("id")
+        if trip_id:
+            trip_key = f"trip:{trip_id}"
+            pipe.set(trip_key, json.dumps(trip), ex=TRIP_TTL_SECONDS)
+            pipe.sadd(idx_key, trip_id)
+
+    pipe.expire(idx_key, TRIP_TTL_SECONDS)
+    await pipe.execute()
+
+
+async def send_snapshot(ws: WebSocket, location_id: str) -> None:
+    """
+    Send snapshot of all trips for a location.
+
+    Strategy:
+    1. Get location info (timezone, name) for Timeline support
+    2. Try Redis cache first (fast path)
+    3. If empty, fallback to PostgreSQL (reliable path)
+    4. Repopulate cache if DB has data (self-healing)
+    """
+    # 0. Get location metadata for Timeline (timezone, airport code)
+    location_info = await _get_location_info(location_id)
+
+    idx_key = f"loc:{location_id}:trips"
+    trip_ids = await redis.smembers(idx_key)
+
+    # 1. If Redis has data, use it (fast path)
+    if trip_ids:
+        trips = await _get_trips_from_redis(trip_ids)
+        if trips:
+            await ws.send_json({
+                "type": "snapshot",
+                "location_id": location_id,
+                "location_info": location_info,
+                "trips": trips
+            })
+            return
+
+    # 2. Fallback to PostgreSQL if Redis is empty
+    trips = await _get_trips_from_db(location_id)
+
+    # 3. Repopulate cache if DB has data (self-healing)
+    if trips:
+        await _populate_redis_cache(location_id, trips)
+
+    # 4. Send snapshot (may be empty if no trips in DB - that's legitimate)
+    await ws.send_json({
+        "type": "snapshot",
+        "location_id": location_id,
+        "location_info": location_info,
+        "trips": trips
+    })
 
 
 @router.websocket("/ws/trips")

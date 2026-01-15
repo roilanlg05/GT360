@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 from features.trips.models import Trip
+from features.trips.utils.trip_classifier import classify_trip_type_sync
 from datetime import datetime, date, timedelta, timezone
 from typing import Any, BinaryIO, List, Optional, Tuple
 
@@ -164,7 +165,8 @@ def _parse_department_riders(value: Any) -> dict:
     if not text:
         return {"fligth": pilots, "in_fligth": fly_att}
 
-    m_f = re.search(r"Flight\s*\(\s*(\d+)\s*\)", text, re.I)
+    # Usar negative lookbehind (?<!In) para que "Flight" no matchee dentro de "InFlight"
+    m_f = re.search(r"(?<!In)Flight\s*\(\s*(\d+)\s*\)", text, re.I)
     m_if = re.search(r"InFlight\s*\(\s*(\d+)\s*\)", text, re.I)
 
     if m_f:
@@ -302,9 +304,20 @@ def _process_excel_sync(
     ws = wb[sheet_name]
 
     city_code = _find_city_code(ws)
-    
+
+    # Validar que se encontró el código de ciudad en el Excel
+    if not city_code:
+        raise ValueError(
+            f"No se encontró el código de aeropuerto en el archivo Excel. "
+            f"Por favor verifica que el archivo contenga 'CITY:' seguido del código del aeropuerto."
+        )
+
+    # Validar que el código de ciudad coincida con el seleccionado
     if city_code.upper() != location.upper():
-        raise ValueError("Invalid Schedule") 
+        raise ValueError(
+            f"El código de aeropuerto en el Excel ({city_code}) no coincide con el seleccionado ({location}). "
+            f"Por favor verifica que el archivo Excel sea del aeropuerto correcto."
+        ) 
 
     header_row_index, header_row, subheader_row = _find_header_and_subheader(ws)
     cols = _determine_columns(header_row, subheader_row)
@@ -428,6 +441,13 @@ def _process_excel_sync(
 
                 drop_off_location = airport_code or "AIRPORT"
 
+            # Classify trip type
+            trip_type = classify_trip_type_sync(
+                pick_up_location=pick_up_location,
+                drop_off_location=drop_off_location,
+                location_airport_code=location  # location es el código del aeropuerto
+            )
+
             trips.append(
                 Trip(
                     pick_up_date=pick_up_date,
@@ -436,7 +456,8 @@ def _process_excel_sync(
                     drop_off_location=drop_off_location,
                     airline=airline,
                     flight_number=flight_number,
-                    riders=riders
+                    riders=riders,
+                    trip_type=trip_type
                 )
             )
 

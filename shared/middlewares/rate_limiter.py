@@ -13,9 +13,9 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     """
     
     def __init__(
-        self, 
-        app, 
-        default_limit: int = 100, 
+        self,
+        app,
+        default_limit: int = 1000,  # Aumentado de 100 a 1000 requests por hora
         default_window: int = 3600
     ):
         super().__init__(app)
@@ -62,9 +62,13 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         return request.client.host if request.client else "unknown"
     
     async def dispatch(self, request: Request, call_next):
+        # Skip rate limiting for WebSocket connections
+        if request.scope.get("type") == "websocket":
+            return await call_next(request)
+
         if request.method == "OPTIONS":
             return await call_next(request)
-        
+
         client_ip = self._get_client_ip(request)
         path = request.url.path
         method = request.method

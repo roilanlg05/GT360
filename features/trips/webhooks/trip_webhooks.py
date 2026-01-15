@@ -8,7 +8,24 @@ from collections import defaultdict
 WEBHOOK_SECRET = settings.WEBHOOK_SECRET
 TRIP_TTL_SECONDS = 300
 
+# Deduplicación de eventos
+PROCESSED_EVENTS_KEY = "processed_events"
+PROCESSED_EVENTS_TTL = 60  # 1 minuto de deduplicación
+
 webhook = APIRouter()
+
+
+async def _is_duplicate_event(event_id: str) -> bool:
+    """
+    Verifica si el evento ya fue procesado usando Redis SETNX.
+    Returns True si es duplicado (ya existe), False si es nuevo.
+    """
+    if not event_id:
+        return False
+    key = f"{PROCESSED_EVENTS_KEY}:{event_id}"
+    # SETNX: retorna True si la key fue creada (nuevo), None si ya existía (duplicado)
+    result = await redis.set(key, "1", ex=PROCESSED_EVENTS_TTL, nx=True)
+    return result is None  # None = ya existía = duplicado
 
 def _safe_str(x) -> str:
     return str(x or "").strip()
@@ -42,6 +59,7 @@ def _process_event_into_pipe(event: dict, pipe):
             "location_id": location_id,
             "trip_id": trip_id,
             "event_type": "delete",
+            "trip": trip,  # Incluir datos del trip para notificaciones (pick_up_location, airline, etc.)
         }
         return location_id, pub_event
 
@@ -87,10 +105,17 @@ async def trips_webhook_batch(
 
     accepted = 0
     skipped = 0
+    duplicates = 0
 
     for ev in events:
         if not isinstance(ev, dict):
             skipped += 1
+            continue
+
+        # Deduplicación por event_id (previene eventos procesados dos veces)
+        event_id = ev.get("event_id")
+        if event_id and await _is_duplicate_event(event_id):
+            duplicates += 1
             continue
 
         out = _process_event_into_pipe(ev, pipe)
@@ -112,4 +137,4 @@ async def trips_webhook_batch(
         msg = {"type": "trips_batch", "location_id": location_id, "events": items}
         await redis.publish(f"loc:{location_id}", json.dumps(msg))
 
-    return {"ok": True, "received": len(events), "accepted": accepted, "skipped": skipped}
+    return {"ok": True, "received": len(events), "accepted": accepted, "skipped": skipped, "duplicates": duplicates}

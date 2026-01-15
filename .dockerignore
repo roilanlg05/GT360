@@ -16,4 +16,4 @@ dockerfile
 .vscode/
 __pycache__
 .env
-
+.geofencing/
