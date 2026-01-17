@@ -21,8 +21,8 @@ class BaseAppSettings(BaseSettings):
     PEPPER: Optional[str] = os.getenv("PEPPER")
     WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET")
     PUBLIC_PATHS: list[str] = [
-        "/v1/auth/register",
-        "/v1/auth/sign-in", 
+        #"/v1/auth/register",
+        "/v1/auth/sign-in",
         "/v1/auth/refresh",
         "/v1/auth/verify-email",
         "/v1/auth/forgot-password",
@@ -35,7 +35,8 @@ class BaseAppSettings(BaseSettings):
         "/health",
         "/ready",
         "/v1/auth/verify-data",
-        "/v1/webhooks/trips"
+        "/v1/webhooks/trips",
+        "/v1/flights/",
     ]
 
     class Config:

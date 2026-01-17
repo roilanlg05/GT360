@@ -2,7 +2,6 @@ from fastapi import APIRouter, UploadFile, File, HTTPException, Query, Depends, 
 from fastapi.responses import JSONResponse
 from shared.db.db_config import get_db
 from psqlmodel import Select, Count, Delete, AsyncSession
-from sqlalchemy import func, text
 from shared.db.schemas import Trip as TripDB, Location, Airport, Organization, Hotel
 from features.trips.utils.trip_importer import load_trips_from_bytes
 from features.trips.models import TripUpdate, CreateTrip, LocationZoneUpdate, HotelPointUpdate
@@ -13,7 +12,7 @@ from features.trips.models.filter_models import (
     FilterRevertResult,
 )
 from features.trips.services.trip_filter_service import TripFilterService
-from datetime import date, time, timezone
+from datetime import date, time, datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Optional
 from uuid import UUID
@@ -1241,5 +1240,230 @@ async def revert_filters(
     result = await service.revert(location_uuid, airline, batch_uuid)
 
     return result
+
+
+# =============================================================================
+# TRIP DRIVER ASSIGNMENT ENDPOINT
+# =============================================================================
+
+@router.patch("/v1/organizations/{organization_id}/locations/{location_id}/trips/{trip_id}/assign")
+async def assign_driver_to_trip(
+    organization_id: str,
+    location_id: str,
+    trip_id: str,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+    driver_id: Optional[str] = Query(None, description="ID del driver a asignar (requerido para manager)"),
+    _role=Depends(verify_role(["manager", "driver"]))
+):
+    """
+    Asigna un driver a un trip.
+
+    - Manager: Debe pasar driver_id en query param para asignar un driver específico
+    - Driver: Se auto-asigna (driver_id se ignora) y marca started_at
+
+    Ejemplo Manager: PATCH /v1/organizations/{org}/locations/{loc}/trips/{trip}/assign?driver_id=uuid
+    Ejemplo Driver: PATCH /v1/organizations/{org}/locations/{loc}/trips/{trip}/assign
+    """
+    from datetime import datetime
+    from shared.db.schemas import Driver
+
+    # Validar UUIDs
+    try:
+        org_uuid = UUID(organization_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de organización inválido")
+
+    try:
+        location_uuid = UUID(location_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de location inválido")
+
+    try:
+        trip_uuid = UUID(trip_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de trip inválido")
+
+    # Obtener datos del usuario autenticado
+    user_data = request.state.user_data
+    user_id = user_data.get("id")
+    user_role = user_data.get("role")
+    user_org_id = user_data.get("organization_id")
+
+    # Verificar que el usuario pertenece a la organización
+    if str(user_org_id) != organization_id:
+        raise HTTPException(status_code=403, detail="No tiene acceso a esta organización")
+
+    # Validar existencia de location y que pertenece a la organización
+    location = await session.exec(
+        Select(Location).Where(
+            (Location.id == location_uuid) &
+            (Location.organization_id == org_uuid)
+        )
+    ).first()
+
+    if not location:
+        raise HTTPException(status_code=404, detail="Location no encontrada en esta organización")
+
+    # Buscar el trip
+    trip = await session.exec(
+        Select(TripDB).Where(
+            (TripDB.id == trip_uuid) &
+            (TripDB.location_id == location_uuid)
+        )
+    ).first()
+
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip no encontrado")
+
+    # Lógica según rol
+    if user_role == "driver":
+        # Driver se auto-asigna
+        target_driver_id = UUID(user_id)
+
+        # Verificar que el driver existe y pertenece a la organización
+        driver = await session.exec(
+            Select(Driver).Where(
+                (Driver.id == target_driver_id) &
+                (Driver.organization_id == org_uuid)
+            )
+        ).first()
+
+        if not driver:
+            raise HTTPException(status_code=404, detail="Driver no encontrado en esta organización")
+
+        # Asignar driver y marcar started_at
+        trip.assigned_driver = target_driver_id
+        trip.started_at = datetime.now(timezone.utc)
+        trip.status = TripStatus.EN_ROUTE
+
+    else:
+        # Manager asigna driver específico
+        if not driver_id:
+            raise HTTPException(status_code=400, detail="driver_id es requerido para managers")
+
+        try:
+            target_driver_uuid = UUID(driver_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="ID de driver inválido")
+
+        # Verificar que el driver existe y pertenece a la organización
+        driver = await session.exec(
+            Select(Driver).Where(
+                (Driver.id == target_driver_uuid) &
+                (Driver.organization_id == org_uuid)
+            )
+        ).first()
+
+        if not driver:
+            raise HTTPException(status_code=404, detail="Driver no encontrado en esta organización")
+
+        # Solo asignar driver (no marca started_at)
+        trip.assigned_driver = target_driver_uuid
+
+    session.add(trip)
+    await session.commit()
+    await session.refresh(trip)
+
+    return {
+        "status": "ok",
+        "data": trip.model_dump(mode="json"),
+        "message": "Driver asignado correctamente" if user_role == "manager" else "Trip iniciado correctamente"
+    }
+
+
+# =============================================================================
+# TRIP SEARCH ENDPOINT
+# =============================================================================
+
+@router.get("/v1/organizations/{organization_id}/locations/{location_id}/trips/search")
+async def search_trips(
+    organization_id: str,
+    location_id: str,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+    airline: str = Query(..., description="Código de aerolínea (ej: WN, AA)"),
+    date: str = Query(..., description="Fecha de pick up (YYYY-MM-DD)"),
+    flight: str = Query(..., description="Número de vuelo"),
+    type: str = Query(..., description="Tipo de viaje: inbound o outbound"),
+    _role=Depends(verify_role(["manager", "driver", "crew"]))
+):
+    """
+    Busca un viaje específico por aerolínea, fecha, número de vuelo y tipo.
+
+    Ejemplo: /v1/organizations/{org_id}/locations/{loc_id}/trips/search?airline=wn&date=2026-01-01&flight=5468&type=inbound
+    """
+    from functools import reduce
+
+    # Validar organization_id
+    try:
+        org_uuid = UUID(organization_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de organización inválido")
+
+    # Validar location_id
+    try:
+        location_uuid = UUID(location_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de location inválido")
+
+    # Verificar que el usuario pertenece a la organización
+    user_data = request.state.user_data
+    user_org_id = user_data.get("organization_id")
+
+    if str(user_org_id) != organization_id:
+        raise HTTPException(status_code=403, detail="No tiene acceso a esta organización")
+
+    # Validar existencia de location y que pertenece a la organización
+    location = await session.exec(
+        Select(Location).Where(
+            (Location.id == location_uuid) &
+            (Location.organization_id == org_uuid)
+        )
+    ).first()
+
+    if not location:
+        raise HTTPException(status_code=404, detail="Location no encontrada en esta organización")
+
+    # Validar tipo de viaje
+    if type.lower() not in [TripType.INBOUND, TripType.OUTBOUND, TripType.GROUND]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Tipo de viaje inválido. Valores permitidos: {TripType.INBOUND}, {TripType.OUTBOUND}, {TripType.GROUND}"
+        )
+
+    # Convertir fecha
+    try:
+        from datetime import date as date_type
+        pick_up_date_obj = date_type.fromisoformat(date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Formato de fecha inválido. Use YYYY-MM-DD")
+
+    # Construir filtros
+    filters = [
+        TripDB.location_id == location_uuid,
+        TripDB.airline.ilike(airline.strip()),
+        TripDB.pick_up_date == pick_up_date_obj,
+        TripDB.flight_number == flight.strip(),
+        TripDB.trip_type == type.lower()
+    ]
+
+    combined_filter = reduce(lambda a, b: a & b, filters)
+
+    # Buscar el viaje
+    trip = await session.exec(
+        Select(TripDB).Where(combined_filter)
+    ).first()
+
+    if not trip:
+        raise HTTPException(status_code=404, detail="Viaje no encontrado")
+
+    return {
+        "data": trip.model_dump(mode="json"),
+        "location": {
+            "id": str(location.id),
+            "name": location.name
+        }
+    }
 
 

@@ -6,6 +6,7 @@ from features.trips.routes.trips_router import router as trips_router
 from features.trips.websockets.trip_websockets import router as trip_websockets_router
 from features.trips.websockets.org_websockets import router as org_websockets_router
 from features.trips.webhooks.trip_webhooks import webhook as trip_webhooks_router
+from features.flights.routes.flights_router import router as flights_router
 """from features.geofencing.routes.validation_router import router as validation_router
 from features.geofencing.routes.geofence_router import router as geofence_router
 from features.geofencing.jobs import dwell_checker
@@ -59,5 +60,6 @@ app.include_router(trips_router)
 app.include_router(trip_websockets_router)
 app.include_router(org_websockets_router)
 app.include_router(trip_webhooks_router)
+app.include_router(flights_router)
 #app.include_router(validation_router)
 #app.include_router(geofence_router)
