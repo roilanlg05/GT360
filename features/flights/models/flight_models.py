@@ -32,17 +32,12 @@ class FlightSnapshot(BaseModel):
     minutes_to_arrival: Optional[int] = None
     duration_seconds: Optional[int] = None
 
-    # Position is optional (depends on provider availability / subscription / coverage)
     position: Optional[Dict[str, Any]] = None
-
-    # Legs derived from multiple returned items for same flight_number/date
     legs: List[Leg] = Field(default_factory=list)
 
     provider_last_updated_utc: Optional[str] = None
     cached_at_utc: str
     cache_ttl_seconds: int
-
-    # Recommended WebSocket polling interval (adaptive based on status/proximity)
     ws_interval_seconds: float = 1.0
 
 
@@ -60,7 +55,7 @@ class EtaOnly(BaseModel):
 
 class BatchFlightRequest(BaseModel):
     """Request for batch flight tracking."""
-    flights: List[dict]  # [{"flight_number": "WN1234", "date_local": "2026-01-16"}, ...]
+    flights: List[dict]
 
 
 class BatchFlightResponse(BaseModel):

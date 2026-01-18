@@ -2,9 +2,14 @@
 Trip Filter Service
 
 Implements the filtering logic for Outbound trips with status SCHEDULED:
-- Reduce: Subtract fixed minutes from pickup_time
-- Combine: Move pairs of trips to their midpoint
-- Expand: Separate pairs of trips while respecting No-Collision Rule
+- Reduce (Priority 0): Subtract fixed minutes from ORIGINAL pickup_time
+- Combine (Priority 1): Move pairs of trips to their midpoint
+- Expand (Priority 1): Separate pairs of trips while respecting No-Collision Rule
+
+Filter Priority:
+- Reduce has Priority 0 and ALWAYS operates on original_pick_up_time
+- When Reduce changes, Combine/Expand automatically re-apply on the new reduced times
+- Reduce is NOT subject to Rule A (doesn't block Combine/Expand)
 
 Eligibility criteria:
 - trip_type = OUTBOUND only
@@ -12,21 +17,21 @@ Eligibility criteria:
 - Filtered by location_id and airline
 
 Rules:
-- Rule A: A modified trip cannot be modified again in the same run
+- Rule A: A trip modified by Combine/Expand cannot be modified again by Combine/Expand
 - Rule B: No-Collision Rule - Expand must not create gaps that fall into Combine range
-- All results are rounded to multiples of 5 minutes
+- Rounding: Configurable (multiple_of_5 or odd_minutes)
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import time, datetime
+from datetime import time, datetime, date
 from typing import Optional
 from uuid import UUID, uuid4
 
 from psqlmodel import AsyncSession, Select
 
-from shared.db.schemas import Trip, TripType, TripStatus, FilterType
+from shared.db.schemas import Trip, TripType, TripStatus, FilterType, FilterBatch
 from features.trips.models.filter_models import (
     FilterRequest,
     ReduceFilterConfig,
@@ -38,7 +43,10 @@ from features.trips.models.filter_models import (
     FilterPreviewResult,
     FilterApplyResult,
     FilterRevertResult,
+    FilterRevertPartialResult,
+    RoundingMode,
 )
+from shared.utils.time_formatter import format_time
 
 logger = logging.getLogger(__name__)
 
@@ -55,25 +63,29 @@ class TripFilterService:
     Responsibilities:
     - Get eligible trips (outbound + scheduled)
     - Apply pre-selection filters (hotel, time_range)
-    - Execute filters in order: Reduce → Combine → Expand
-    - Respect Rule A: a modified trip is not modified again
+    - Execute filters in order: Reduce (Priority 0) → Combine (Priority 1) → Expand (Priority 1)
+    - Reduce: Always operates on original_pick_up_time, not subject to Rule A
+    - Combine/Expand: Operate on effective times (after Reduce), subject to Rule A
+    - Respect Rule A: trips modified by Combine/Expand cannot be modified again by Combine/Expand
     - Respect Rule B: No-Collision Rule for Expand
-    - Round results to multiples of 5 minutes
+    - Round results based on configured rounding mode (multiple_of_5 or odd_minutes)
     - Generate detailed logs
     """
 
     def __init__(self, session: AsyncSession):
         self.session = session
-        self.modified_trip_ids: set[UUID] = set()  # Rule A tracking
+        self.modified_by_combine_expand: set[UUID] = set()  # Rule A tracking (only for Combine/Expand)
         self.changes: list[TripChange] = []
         self.exclusions: list[FilterExclusion] = []
         self.log: list[dict] = []
+        self.rounding_mode: RoundingMode = RoundingMode.MULTIPLE_OF_5  # Default rounding mode
 
     async def preview(
         self,
         location_id: UUID,
         airline: str,
         config: FilterRequest,
+        time_format: str = "24h",
     ) -> FilterPreviewResult:
         """
         Simulate filters without applying changes.
@@ -87,8 +99,15 @@ class TripFilterService:
         # Reset state
         self._reset_state()
 
+        # Set rounding mode from config
+        self.rounding_mode = config.rounding_mode
+
+        # Parse date filters
+        date_from = date.fromisoformat(config.pick_up_date_from) if config.pick_up_date_from else None
+        date_to = date.fromisoformat(config.pick_up_date_to) if config.pick_up_date_to else None
+
         # Get eligible trips
-        trips = await self._get_eligible_trips(location_id, airline)
+        trips = await self._get_eligible_trips(location_id, airline, date_from, date_to)
         total_evaluated = len(trips)
 
         logger.info(f"[FILTER] Eligible trips found: {total_evaluated} for location={location_id}, airline={airline}")
@@ -125,10 +144,13 @@ class TripFilterService:
         # Build summary
         summary = self._build_summary()
 
+        # Format time fields according to user preference
+        formatted_changes = self._format_changes(self.changes, time_format)
+
         return FilterPreviewResult(
             location_id=location_id,
             airline=airline,
-            changes=self.changes,
+            changes=formatted_changes,
             exclusions=self.exclusions,
             summary=summary,
             total_trips_evaluated=total_evaluated,
@@ -140,6 +162,7 @@ class TripFilterService:
         location_id: UUID,
         airline: str,
         config: FilterRequest,
+        time_format: str = "24h",
     ) -> FilterApplyResult:
         """
         Apply filters and persist changes to database.
@@ -153,8 +176,15 @@ class TripFilterService:
         self._reset_state()
         batch_id = uuid4()
 
+        # Set rounding mode from config
+        self.rounding_mode = config.rounding_mode
+
+        # Parse date filters
+        date_from = date.fromisoformat(config.pick_up_date_from) if config.pick_up_date_from else None
+        date_to = date.fromisoformat(config.pick_up_date_to) if config.pick_up_date_to else None
+
         # Get eligible trips
-        trips = await self._get_eligible_trips(location_id, airline)
+        trips = await self._get_eligible_trips(location_id, airline, date_from, date_to)
 
         if not trips:
             return FilterApplyResult(
@@ -199,6 +229,9 @@ class TripFilterService:
                 trip.filtered_at = now
                 trip.updated_at = now
 
+                # Add trip to session to ensure changes are tracked
+                self.session.add(trip)
+
                 self.log.append({
                     "trip_id": str(trip.id),
                     "action": "modified",
@@ -208,6 +241,25 @@ class TripFilterService:
                     "hotel": change.hotel_name,
                     "airline": trip.airline,
                 })
+
+        # Create FilterBatch record for tracking and partial revert
+        filters_applied = []
+        if config.reduce and config.reduce.enabled:
+            filters_applied.append("reduce")
+        if config.combine and config.combine.enabled:
+            filters_applied.append("combine")
+        if config.expand and config.expand.enabled:
+            filters_applied.append("expand")
+
+        filter_batch = FilterBatch(
+            id=batch_id,
+            location_id=location_id,
+            airline=airline,
+            config=config.model_dump(mode="json"),  # Store full config as JSON
+            filters_applied=filters_applied,
+            trips_affected=len(self.changes),
+        )
+        self.session.add(filter_batch)
 
         # Commit changes
         await self.session.commit()
@@ -266,6 +318,10 @@ class TripFilterService:
                 trip.filter_batch_id = None
                 trip.filtered_at = None
                 trip.updated_at = datetime.utcnow()
+
+                # Add trip to session to ensure changes are tracked
+                self.session.add(trip)
+
                 reverted_count += 1
 
         await self.session.commit()
@@ -275,13 +331,164 @@ class TripFilterService:
             batch_ids_reverted=list(batch_ids_reverted),
         )
 
+    async def revert_partial(
+        self,
+        batch_id: UUID,
+        filter_type: str,
+    ) -> FilterRevertPartialResult:
+        """
+        Revert a specific filter type from a batch while keeping other filters applied.
+
+        This method:
+        1. Fetches the original batch configuration
+        2. Reverts all trips in that batch to original_pick_up_time
+        3. Re-applies remaining filters (excluding the one being reverted)
+        4. Updates the FilterBatch revert_history
+
+        Args:
+            batch_id: UUID of the filter batch
+            filter_type: Which filter to revert ("reduce", "combine", or "expand")
+
+        Returns:
+            FilterRevertPartialResult with details of the operation
+
+        Raises:
+            ValueError: If batch not found or filter was not applied in this batch
+        """
+        # Validate filter_type
+        valid_filters = {"reduce", "combine", "expand"}
+        if filter_type not in valid_filters:
+            raise ValueError(f"filter_type must be one of {valid_filters}, got: {filter_type}")
+
+        # Fetch FilterBatch record
+        batch_query = Select(FilterBatch).Where(FilterBatch.id == batch_id)
+        filter_batch = await self.session.exec(batch_query).first()
+
+        if not filter_batch:
+            raise ValueError(f"FilterBatch with id {batch_id} not found")
+
+        # Check if this filter was actually applied
+        if filter_type not in filter_batch.filters_applied:
+            raise ValueError(
+                f"Filter '{filter_type}' was not applied in batch {batch_id}. "
+                f"Applied filters were: {filter_batch.filters_applied}"
+            )
+
+        # Get all trips affected by this batch
+        trips_query = (
+            Select(Trip)
+            .Where(Trip.filter_batch_id == batch_id)
+            .Where(Trip.original_pick_up_time != None)
+        )
+        trips = await self.session.exec(trips_query).all()
+
+        if not trips:
+            raise ValueError(f"No trips found for batch {batch_id}")
+
+        # Step 1: Revert all trips to original_pick_up_time
+        for trip in trips:
+            if trip.original_pick_up_time:
+                trip.pick_up_time = trip.original_pick_up_time
+                trip.original_pick_up_time = None
+                trip.filter_applied = None
+                trip.filter_batch_id = None
+                trip.filtered_at = None
+                trip.updated_at = datetime.utcnow()
+                self.session.add(trip)
+
+        await self.session.commit()
+
+        # Step 2: Reconstruct config without the filter being reverted
+        original_config = FilterRequest(**filter_batch.config)
+        modified_config = original_config.model_copy(deep=True)
+
+        # Disable the filter being reverted
+        if filter_type == "reduce" and modified_config.reduce:
+            modified_config.reduce.enabled = False
+        elif filter_type == "combine" and modified_config.combine:
+            modified_config.combine.enabled = False
+        elif filter_type == "expand" and modified_config.expand:
+            modified_config.expand.enabled = False
+
+        # Determine which filters remain enabled
+        remaining_filters = []
+        if modified_config.reduce and modified_config.reduce.enabled:
+            remaining_filters.append("reduce")
+        if modified_config.combine and modified_config.combine.enabled:
+            remaining_filters.append("combine")
+        if modified_config.expand and modified_config.expand.enabled:
+            remaining_filters.append("expand")
+
+        # Step 3: Re-apply remaining filters if any
+        changes_applied = 0
+        summary = {"reduce": 0, "combine": 0, "expand": 0, "excluded": 0}
+
+        if remaining_filters:
+            # Re-apply using the existing apply logic
+            result = await self.apply(
+                location_id=filter_batch.location_id,
+                airline=filter_batch.airline,
+                config=modified_config,
+            )
+            changes_applied = result.changes_applied
+            summary = result.summary
+
+            # Delete the new batch created by apply() since we're reusing the old batch_id
+            # The trips now have a new batch_id from the apply() call
+            new_batch_id = result.batch_id
+
+            # Fetch and delete the new batch
+            new_batch_query = Select(FilterBatch).Where(FilterBatch.id == new_batch_id)
+            new_batch = await self.session.exec(new_batch_query).first()
+            if new_batch:
+                self.session.delete(new_batch)
+
+            # Update trips to reference the original batch_id
+            updated_trips_query = (
+                Select(Trip)
+                .Where(Trip.filter_batch_id == new_batch_id)
+            )
+            updated_trips = await self.session.exec(updated_trips_query).all()
+            for trip in updated_trips:
+                trip.filter_batch_id = batch_id
+                self.session.add(trip)
+
+            await self.session.commit()
+
+        # Step 4: Update FilterBatch with new config and revert history
+        filter_batch.config = modified_config.model_dump(mode="json")
+        filter_batch.filters_applied = remaining_filters
+        filter_batch.trips_affected = changes_applied
+
+        # Track revert in history
+        if filter_batch.revert_history is None:
+            filter_batch.revert_history = {}
+
+        filter_batch.revert_history[filter_type] = {
+            "reverted_at": datetime.utcnow().isoformat(),
+            "trips_affected": len(trips),
+            "filters_reapplied": remaining_filters,
+        }
+
+        self.session.add(filter_batch)
+        await self.session.commit()
+
+        return FilterRevertPartialResult(
+            batch_id=batch_id,
+            filter_reverted=filter_type,
+            trips_affected=len(trips),
+            filters_reapplied=remaining_filters,
+            changes_applied=changes_applied,
+            summary=summary,
+        )
+
     # =========================================================================
     # Private Methods
     # =========================================================================
 
     def _reset_state(self):
         """Reset internal state for new operation."""
-        self.modified_trip_ids.clear()
+        self.modified_by_combine_expand.clear()
         self.changes.clear()
         self.exclusions.clear()
         self.log.clear()
@@ -290,6 +497,8 @@ class TripFilterService:
         self,
         location_id: UUID,
         airline: str,
+        date_from: Optional[date] = None,
+        date_to: Optional[date] = None,
     ) -> list[Trip]:
         """
         Get trips eligible for filtering.
@@ -298,6 +507,7 @@ class TripFilterService:
         - trip_type = OUTBOUND only
         - status = SCHEDULED only
         - Matches location_id and airline
+        - Optionally filters by pick_up_date range
         """
         query = (
             Select(Trip)
@@ -306,6 +516,12 @@ class TripFilterService:
             .Where(Trip.trip_type == TripType.OUTBOUND)
             .Where(Trip.status == TripStatus.SCHEDULED)
         )
+
+        # Apply date filters if provided
+        if date_from:
+            query = query.Where(Trip.pick_up_date >= date_from)
+        if date_to:
+            query = query.Where(Trip.pick_up_date <= date_to)
 
         return await self.session.exec(query).all()
 
@@ -353,51 +569,77 @@ class TripFilterService:
 
     def _apply_reduce(self, trips: list[Trip], config: ReduceFilterConfig):
         """
-        Apply Reduce filter: subtract fixed minutes from pickup_time.
+        Apply Reduce filter: subtract fixed minutes from ORIGINAL pickup_time.
+
+        Priority 0: Always operates on original_pick_up_time, not modified times.
+        Does NOT block Combine/Expand (not subject to Rule A).
+
+        When Reduce changes configuration, Combine/Expand will automatically
+        re-apply on the new reduced times.
         """
         for trip in trips:
-            if trip.id in self.modified_trip_ids:
-                continue
+            # Use original_pick_up_time if it exists, otherwise use current pick_up_time
+            base_time = trip.original_pick_up_time if trip.original_pick_up_time else trip.pick_up_time
 
-            original_time = trip.pick_up_time
-            new_time = self._subtract_minutes(original_time, config.minutes_to_reduce)
-            new_time = self._round_to_5_minutes(new_time)
+            new_time = self._subtract_minutes(base_time, config.minutes_to_reduce)
+            new_time = self._round_time(new_time)  # Use configurable rounding
 
-            self._record_change(trip, original_time, new_time, FilterType.REDUCE)
-            self.modified_trip_ids.add(trip.id)
+            # Record using base_time as original (the true original)
+            self._record_change(trip, base_time, new_time, FilterType.REDUCE)
+
+            # NOTE: Do NOT add to modified_by_combine_expand
+            # Reduce does not block Combine/Expand from modifying the same trip
 
     def _apply_combine(self, trips: list[Trip], config: CombineFilterConfig):
         """
         Apply Combine filter: move pairs to their midpoint.
+        Only combines trips on the same pick_up_date.
+
+        Priority 1: Operates AFTER Reduce (uses effective times with Reduce applied).
+        Subject to Rule A: A trip modified by Combine cannot be modified again by Combine/Expand.
         """
-        # Sort by pickup time
-        sorted_trips = sorted(trips, key=lambda t: self._time_to_minutes(t.pick_up_time))
+        # Group trips by pick_up_date
+        from collections import defaultdict
+        trips_by_date = defaultdict(list)
+        for trip in trips:
+            if trip.pick_up_date:
+                trips_by_date[trip.pick_up_date].append(trip)
 
-        i = 0
-        while i < len(sorted_trips) - 1:
-            trip_a = sorted_trips[i]
-            trip_b = sorted_trips[i + 1]
+        # Process each date separately
+        for pick_up_date, day_trips in trips_by_date.items():
+            # Sort by effective pickup time (with Reduce applied if exists)
+            sorted_trips = sorted(day_trips, key=lambda t: self._time_to_minutes(self._get_effective_time(t)))
 
-            # Skip if either already modified (Rule A)
-            if trip_a.id in self.modified_trip_ids or trip_b.id in self.modified_trip_ids:
-                i += 1
-                continue
+            i = 0
+            while i < len(sorted_trips) - 1:
+                trip_a = sorted_trips[i]
+                trip_b = sorted_trips[i + 1]
 
-            gap = self._minutes_between(trip_a.pick_up_time, trip_b.pick_up_time)
+                # Skip if either already modified by Combine/Expand (Rule A)
+                if trip_a.id in self.modified_by_combine_expand or trip_b.id in self.modified_by_combine_expand:
+                    i += 1
+                    continue
 
-            if config.min_gap <= gap <= config.max_gap:
-                midpoint = self._calculate_midpoint(trip_a.pick_up_time, trip_b.pick_up_time)
-                midpoint = self._round_to_5_minutes(midpoint)
+                # Get effective times (with Reduce applied if exists)
+                time_a = self._get_effective_time(trip_a)
+                time_b = self._get_effective_time(trip_b)
 
-                self._record_change(trip_a, trip_a.pick_up_time, midpoint, FilterType.COMBINE)
-                self._record_change(trip_b, trip_b.pick_up_time, midpoint, FilterType.COMBINE)
+                gap = self._minutes_between(time_a, time_b)
 
-                self.modified_trip_ids.add(trip_a.id)
-                self.modified_trip_ids.add(trip_b.id)
+                if config.min_gap <= gap <= config.max_gap:
+                    midpoint = self._calculate_midpoint(time_a, time_b)
+                    midpoint = self._round_time(midpoint)  # Use configurable rounding
 
-                i += 2  # Skip both
-            else:
-                i += 1
+                    # Record using effective times as original
+                    self._record_change(trip_a, time_a, midpoint, FilterType.COMBINE)
+                    self._record_change(trip_b, time_b, midpoint, FilterType.COMBINE)
+
+                    self.modified_by_combine_expand.add(trip_a.id)
+                    self.modified_by_combine_expand.add(trip_b.id)
+
+                    i += 2  # Skip both
+                else:
+                    i += 1
 
     def _apply_expand(
         self,
@@ -407,83 +649,106 @@ class TripFilterService:
     ):
         """
         Apply Expand filter: separate pairs while respecting No-Collision Rule.
+        Only expands trips on the same pick_up_date.
+
+        Priority 1: Operates AFTER Reduce (uses effective times with Reduce applied).
+        Subject to Rule A: A trip modified by Expand cannot be modified again by Combine/Expand.
+        Subject to Rule B: No-Collision Rule with Combine.
         """
-        # Sort by pickup time
-        sorted_trips = sorted(trips, key=lambda t: self._time_to_minutes(t.pick_up_time))
+        # Group trips by pick_up_date
+        from collections import defaultdict
+        trips_by_date = defaultdict(list)
+        for trip in trips:
+            if trip.pick_up_date:
+                trips_by_date[trip.pick_up_date].append(trip)
 
-        for i in range(len(sorted_trips) - 1):
-            trip_a = sorted_trips[i]
-            trip_b = sorted_trips[i + 1]
+        # Process each date separately
+        for pick_up_date, day_trips in trips_by_date.items():
+            # Sort by effective pickup time (with Reduce applied if exists)
+            sorted_trips = sorted(day_trips, key=lambda t: self._time_to_minutes(self._get_effective_time(t)))
 
-            # Skip if either already modified (Rule A)
-            if trip_a.id in self.modified_trip_ids or trip_b.id in self.modified_trip_ids:
-                continue
+            for i in range(len(sorted_trips) - 1):
+                trip_a = sorted_trips[i]
+                trip_b = sorted_trips[i + 1]
 
-            gap = self._minutes_between(trip_a.pick_up_time, trip_b.pick_up_time)
+                # Skip if either already modified by Combine/Expand (Rule A)
+                if trip_a.id in self.modified_by_combine_expand or trip_b.id in self.modified_by_combine_expand:
+                    continue
 
-            if config.min_gap <= gap <= config.max_gap:
-                # Simulate expansion
-                new_time_a, new_time_b = self._simulate_expand(
-                    trip_a.pick_up_time,
-                    trip_b.pick_up_time,
-                    config.max_shift,
-                )
+                # Get effective times (with Reduce applied if exists)
+                time_a = self._get_effective_time(trip_a)
+                time_b = self._get_effective_time(trip_b)
 
-                # No-Collision Rule (Rule B)
-                if combine_config and combine_config.enabled:
-                    collision = False
+                gap = self._minutes_between(time_a, time_b)
 
-                    # Check gap with previous neighbor (i-1)
-                    if i > 0:
-                        prev_trip = sorted_trips[i - 1]
-                        # Use the potentially modified time if it was changed
-                        prev_time = self._get_effective_time(prev_trip)
-                        gap_with_prev = self._minutes_between(prev_time, new_time_a)
+                if config.min_gap <= gap <= config.max_gap:
+                    # Simulate expansion on effective times
+                    new_time_a, new_time_b = self._simulate_expand(
+                        time_a,
+                        time_b,
+                        config.max_shift,
+                    )
 
-                        if combine_config.min_gap <= gap_with_prev <= combine_config.max_gap:
-                            self._record_exclusion(
-                                f"expand({trip_a.id}, {trip_b.id})",
-                                [trip_a.id, trip_b.id],
-                                f"Collision: gap with previous trip would enter Combine range ({gap_with_prev} min)",
-                                gap,
-                                gap_with_prev,
-                            )
-                            collision = True
+                    # No-Collision Rule (Rule B)
+                    if combine_config and combine_config.enabled:
+                        collision = False
 
-                    # Check gap with next neighbor (i+2)
-                    if not collision and i + 2 < len(sorted_trips):
-                        next_trip = sorted_trips[i + 2]
-                        next_time = self._get_effective_time(next_trip)
-                        gap_with_next = self._minutes_between(new_time_b, next_time)
+                        # Check gap with previous neighbor (i-1) within same date
+                        if i > 0:
+                            prev_trip = sorted_trips[i - 1]
+                            prev_time = self._get_effective_time(prev_trip)
+                            gap_with_prev = self._minutes_between(prev_time, new_time_a)
 
-                        if combine_config.min_gap <= gap_with_next <= combine_config.max_gap:
-                            self._record_exclusion(
-                                f"expand({trip_a.id}, {trip_b.id})",
-                                [trip_a.id, trip_b.id],
-                                f"Collision: gap with next trip would enter Combine range ({gap_with_next} min)",
-                                gap,
-                                gap_with_next,
-                            )
-                            collision = True
+                            if combine_config.min_gap <= gap_with_prev <= combine_config.max_gap:
+                                self._record_exclusion(
+                                    f"expand({trip_a.id}, {trip_b.id})",
+                                    [trip_a.id, trip_b.id],
+                                    f"Collision: gap with previous trip would enter Combine range ({gap_with_prev} min)",
+                                    gap,
+                                    gap_with_prev,
+                                )
+                                collision = True
 
-                    if collision:
-                        continue
+                        # Check gap with next neighbor (i+2) within same date
+                        if not collision and i + 2 < len(sorted_trips):
+                            next_trip = sorted_trips[i + 2]
+                            next_time = self._get_effective_time(next_trip)
+                            gap_with_next = self._minutes_between(new_time_b, next_time)
 
-                # Apply expansion
-                self._record_change(trip_a, trip_a.pick_up_time, new_time_a, FilterType.EXPAND)
-                self._record_change(trip_b, trip_b.pick_up_time, new_time_b, FilterType.EXPAND)
+                            if combine_config.min_gap <= gap_with_next <= combine_config.max_gap:
+                                self._record_exclusion(
+                                    f"expand({trip_a.id}, {trip_b.id})",
+                                    [trip_a.id, trip_b.id],
+                                    f"Collision: gap with next trip would enter Combine range ({gap_with_next} min)",
+                                    gap,
+                                    gap_with_next,
+                                )
+                                collision = True
 
-                self.modified_trip_ids.add(trip_a.id)
-                self.modified_trip_ids.add(trip_b.id)
+                        if collision:
+                            continue
+
+                    # Apply expansion using effective times as original
+                    self._record_change(trip_a, time_a, new_time_a, FilterType.EXPAND)
+                    self._record_change(trip_b, time_b, new_time_b, FilterType.EXPAND)
+
+                    self.modified_by_combine_expand.add(trip_a.id)
+                    self.modified_by_combine_expand.add(trip_b.id)
 
     def _get_effective_time(self, trip: Trip) -> time:
         """
         Get the effective pickup time for a trip.
-        If it was modified in this run, return the new time.
+
+        Priority: Most recent change > original pick_up_time
+
+        This ensures Combine/Expand operate on times AFTER Reduce has been applied.
+        When multiple filters modify the same trip, the last change is used.
         """
-        for change in self.changes:
+        # Look for the most recent change (iterate backwards)
+        for change in reversed(self.changes):
             if change.trip_id == trip.id:
                 return change.new_time
+
         return trip.pick_up_time
 
     def _simulate_expand(
@@ -502,7 +767,7 @@ class TripFilterService:
         new_time_a = self._subtract_minutes(time_a, shift_a)
         new_time_b = self._add_minutes(time_b, shift_b)
 
-        return self._round_to_5_minutes(new_time_a), self._round_to_5_minutes(new_time_b)
+        return self._round_time(new_time_a), self._round_time(new_time_b)
 
     def _record_change(
         self,
@@ -562,6 +827,32 @@ class TripFilterService:
 
         return summary
 
+    def _format_changes(self, changes: list[TripChange], time_format: str) -> list[TripChange]:
+        """
+        Format time fields in TripChange objects according to user preference.
+
+        Args:
+            changes: List of TripChange objects with time objects
+            time_format: "24h" or "12h"
+
+        Returns:
+            List of TripChange objects with formatted time strings
+        """
+        formatted_changes = []
+        for change in changes:
+            # Create a new TripChange with formatted times
+            formatted_change = TripChange(
+                trip_id=change.trip_id,
+                original_time=format_time(change.original_time, time_format),
+                new_time=format_time(change.new_time, time_format),
+                filter_applied=change.filter_applied,
+                hotel_name=change.hotel_name,
+                pick_up_date=change.pick_up_date,
+                airline=change.airline,
+            )
+            formatted_changes.append(formatted_change)
+        return formatted_changes
+
     # =========================================================================
     # Time Utility Methods
     # =========================================================================
@@ -581,6 +872,23 @@ class TripFilterService:
         m1 = self._time_to_minutes(t1)
         m2 = self._time_to_minutes(t2)
         return abs(m2 - m1)
+
+    def _round_time(self, t: time) -> time:
+        """
+        Round time based on configured rounding mode.
+
+        Modes:
+        - MULTIPLE_OF_5: Round to nearest 5-minute multiple (10:15, 1:25)
+        - ODD_MINUTES: Keep odd minutes, no rounding (2:11, 5:27)
+        """
+        if self.rounding_mode == RoundingMode.MULTIPLE_OF_5:
+            return self._round_to_5_minutes(t)
+        elif self.rounding_mode == RoundingMode.ODD_MINUTES:
+            # No rounding, return as-is
+            return t
+        else:
+            # Default to multiple of 5 for backwards compatibility
+            return self._round_to_5_minutes(t)
 
     def _round_to_5_minutes(self, t: time) -> time:
         """Round time to nearest 5-minute multiple."""

@@ -2,6 +2,13 @@ from pydantic import BaseModel, Field, field_validator
 from datetime import time, datetime
 from typing import Optional
 from uuid import UUID
+from enum import Enum
+
+
+class RoundingMode(str, Enum):
+    """Rounding mode for time calculations."""
+    MULTIPLE_OF_5 = "multiple_of_5"  # Round to 5-minute multiples: 10:15, 1:25 (default)
+    ODD_MINUTES = "odd_minutes"      # Keep odd minutes, no rounding: 2:11, 5:27
 
 
 class TimeRange(BaseModel):
@@ -62,6 +69,9 @@ class ExpandFilterConfig(BaseModel):
 
 class FilterRequest(BaseModel):
     """Request model for applying filters."""
+    pick_up_date_from: Optional[str] = None  # "YYYY-MM-DD" - filters trips >= this date
+    pick_up_date_to: Optional[str] = None    # "YYYY-MM-DD" - filters trips <= this date
+    rounding_mode: RoundingMode = RoundingMode.MULTIPLE_OF_5  # Time rounding mode
     reduce: Optional[ReduceFilterConfig] = None
     combine: Optional[CombineFilterConfig] = None
     expand: Optional[ExpandFilterConfig] = None
@@ -115,3 +125,13 @@ class FilterRevertResult(BaseModel):
     """Result of reverting filters."""
     trips_reverted: int
     batch_ids_reverted: list[UUID]
+
+
+class FilterRevertPartialResult(BaseModel):
+    """Result of partial filter revert (reverting specific filter types)."""
+    batch_id: UUID
+    filter_reverted: str  # "reduce", "combine", or "expand"
+    trips_affected: int
+    filters_reapplied: list[str]  # Remaining filters that were re-applied
+    changes_applied: int  # Number of changes after re-application
+    summary: dict  # Summary of changes after re-application

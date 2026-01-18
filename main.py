@@ -6,7 +6,12 @@ from features.trips.routes.trips_router import router as trips_router
 from features.trips.websockets.trip_websockets import router as trip_websockets_router
 from features.trips.websockets.org_websockets import router as org_websockets_router
 from features.trips.webhooks.trip_webhooks import webhook as trip_webhooks_router
-from features.flights.routes.flights_router import router as flights_router
+from features.flights.routes.tracking_router import router as tracking_router
+from features.flights.websockets.push_websocket import router as flight_push_ws_router
+from features.flights.websockets.tracking_websocket import router as flight_tracking_ws_router
+from features.flights.push.webhook_handler import router as flight_webhook_router
+from features.profile.routes.profile_router import router as profile_router
+from features.profile.websockets.profile_websocket import router as profile_ws_router
 """from features.geofencing.routes.validation_router import router as validation_router
 from features.geofencing.routes.geofence_router import router as geofence_router
 from features.geofencing.jobs import dwell_checker
@@ -41,8 +46,6 @@ app.add_middleware(
         "https://www.gt360.com",
         "https://gt360.com",
 	    "https://web.gt360.app",
-        "http://192.168.1.182:3000",
-        "http://172.20.10.7:3000",
         "https://charmaine-leadless-ryleigh.ngrok-free.dev"
     ],
     allow_credentials=True,
@@ -60,6 +63,11 @@ app.include_router(trips_router)
 app.include_router(trip_websockets_router)
 app.include_router(org_websockets_router)
 app.include_router(trip_webhooks_router)
-app.include_router(flights_router)
+app.include_router(tracking_router)
+app.include_router(flight_push_ws_router)
+app.include_router(flight_tracking_ws_router)
+app.include_router(flight_webhook_router)
+app.include_router(profile_router)
+app.include_router(profile_ws_router)
 #app.include_router(validation_router)
 #app.include_router(geofence_router)

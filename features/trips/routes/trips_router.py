@@ -5,11 +5,14 @@ from psqlmodel import Select, Count, Delete, AsyncSession
 from shared.db.schemas import Trip as TripDB, Location, Airport, Organization, Hotel
 from features.trips.utils.trip_importer import load_trips_from_bytes
 from features.trips.models import TripUpdate, CreateTrip, LocationZoneUpdate, HotelPointUpdate
+from shared.middlewares.user_context import get_user_time_format
+from shared.utils.serialization import model_dump_with_time_format
 from features.trips.models.filter_models import (
     FilterRequest,
     FilterPreviewResult,
     FilterApplyResult,
     FilterRevertResult,
+    FilterRevertPartialResult,
 )
 from features.trips.services.trip_filter_service import TripFilterService
 from datetime import date, time, datetime, timezone
@@ -206,8 +209,9 @@ async def upload_trips(
                 .Limit(50)
             )
             trips_objs = await session.exec(trips_stmt).all()
-            # Serializar trips a JSON (convierte UUIDs a strings)
-            trips = [t.model_dump(mode="json") for t in trips_objs]
+            # Serializar trips a JSON (convierte UUIDs a strings) con formato de hora
+            time_format = await get_user_time_format(request, session)
+            trips = [model_dump_with_time_format(t, time_format) for t in trips_objs]
 
             # Convertir nombres de hoteles a objetos Hotel y hacer bulk insert
             if hotels_set:
@@ -316,6 +320,7 @@ async def upload_trips(
 @router.post("/v1/locations/{location_id}/trips")
 async def create_trip(
     location_id: str,
+    request: Request,
     trip_data: CreateTrip,
     session: AsyncSession = Depends(get_db),
     _role=Depends(verify_role(["manager"]))
@@ -365,7 +370,8 @@ async def create_trip(
         await session.commit()
         await session.refresh(trip)
 
-        trip_json = trip.model_dump(mode="json")
+        time_format = await get_user_time_format(request, session)
+        trip_json = model_dump_with_time_format(trip, time_format)
         return JSONResponse(status_code=200, content={"data": trip_json})
 
     except Exception as e:
@@ -379,6 +385,7 @@ async def create_trip(
 @router.get("/v1/locations/{location_id}/trips")
 async def get_trips(
     location_id: str,
+    request: Request,
     session: AsyncSession = Depends(get_db),
     pick_up_date: Optional[str] = None,
     pick_up_date_from: Optional[str] = None,
@@ -500,9 +507,10 @@ async def get_trips(
         }
 
     trips = []
+    time_format = await get_user_time_format(request, session)
 
     for row in rows:
-        trips.append(row[0].model_dump(mode="json"))
+        trips.append(model_dump_with_time_format(row[0], time_format))
 
     total = rows[0][1] if rows else 0
 
@@ -604,6 +612,7 @@ async def delete_trips(
 @router.patch("/v1/locations/{location_id}/trips/{trip_id}")
 async def edit_trip(
     location_id: str,
+    request: Request,
     trip_id: str,
     trip_update: TripUpdate,
     session: AsyncSession = Depends(get_db),
@@ -666,10 +675,12 @@ async def edit_trip(
 
     await session.commit()
     await session.refresh(trip)  # Asegurar datos actualizados (updated_at, etc.)
-    trip = trip.model_dump(mode="json")
+
+    time_format = await get_user_time_format(request, session)
+    trip = model_dump_with_time_format(trip, time_format)
 
     print("TRIP UPDATED: ", trip)
-    
+
     return JSONResponse(content={"status": "ok", "trip": trip})
 
 
@@ -1098,6 +1109,7 @@ async def preview_filters(
     location_id: str,
     airline: str,
     filters: FilterRequest,
+    request: Request,
     session: AsyncSession = Depends(get_db),
     _role=Depends(verify_role(["manager"]))
 ) -> FilterPreviewResult:
@@ -1115,6 +1127,7 @@ async def preview_filters(
     - expand: Separa pares de trips respetando No-Collision Rule
 
     Todos los resultados se redondean a múltiplos de 5 minutos.
+    Los horarios se formatean según la preferencia del usuario (24h o 12h AM/PM).
     """
     try:
         location_uuid = UUID(location_id)
@@ -1134,8 +1147,11 @@ async def preview_filters(
     if not location:
         raise HTTPException(status_code=404, detail="Location no encontrada")
 
+    # Obtener formato de hora del usuario
+    time_format = await get_user_time_format(request, session)
+
     service = TripFilterService(session)
-    result = await service.preview(location_uuid, airline, filters)
+    result = await service.preview(location_uuid, airline, filters, time_format)
 
     return result
 
@@ -1145,6 +1161,7 @@ async def apply_filters(
     location_id: str,
     airline: str,
     filters: FilterRequest,
+    request: Request,
     session: AsyncSession = Depends(get_db),
     _role=Depends(verify_role(["manager"]))
 ) -> FilterApplyResult:
@@ -1163,6 +1180,7 @@ async def apply_filters(
     - Regla A: Un trip modificado no se vuelve a modificar en la misma corrida
     - Regla B: No-Collision Rule - Expand no crea gaps que caigan en rango de Combine
     - Todos los resultados se redondean a múltiplos de 5 minutos
+    - Los horarios en la respuesta se formatean según preferencia del usuario (24h o 12h AM/PM)
 
     Returns:
         FilterApplyResult con batch_id para revertir, conteo de cambios y log detallado
@@ -1185,8 +1203,11 @@ async def apply_filters(
     if not location:
         raise HTTPException(status_code=404, detail="Location no encontrada")
 
+    # Obtener formato de hora del usuario
+    time_format = await get_user_time_format(request, session)
+
     service = TripFilterService(session)
-    result = await service.apply(location_uuid, airline, filters)
+    result = await service.apply(location_uuid, airline, filters, time_format)
 
     return result
 
@@ -1240,6 +1261,83 @@ async def revert_filters(
     result = await service.revert(location_uuid, airline, batch_uuid)
 
     return result
+
+
+@router.post("/v1/locations/{location_id}/airlines/{airline}/trips/filters/revert-partial")
+async def revert_partial_filter(
+    location_id: str,
+    airline: str,
+    batch_id: str = Query(..., description="ID del batch a revertir parcialmente"),
+    filter_type: str = Query(..., description="Tipo de filtro a revertir: 'reduce', 'combine', o 'expand'"),
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["manager"]))
+) -> FilterRevertPartialResult:
+    """
+    Revierte un filtro específico de un batch mientras mantiene los otros filtros aplicados.
+
+    Esta operación:
+    1. Revierte todos los trips del batch a su pickup_time original
+    2. Re-aplica los filtros restantes (excluyendo el que se revirtió)
+    3. Mantiene el mismo batch_id para trazabilidad
+
+    Args:
+        location_id: ID de la location
+        airline: Código de aerolínea (ej: WN, AA)
+        batch_id: ID del batch que contiene el filtro a revertir
+        filter_type: Tipo de filtro a revertir ("reduce", "combine", o "expand")
+
+    Returns:
+        FilterRevertPartialResult con detalles de la operación
+
+    Ejemplo:
+        POST /v1/locations/{location_id}/airlines/WN/trips/filters/revert-partial?batch_id={uuid}&filter_type=reduce
+
+    Casos de uso:
+        - Usuario aplicó Reduce + Combine pero quiere quitar solo Reduce
+        - Usuario aplicó los 3 filtros pero quiere quitar solo Expand
+        - Permite ajustar filtros sin perder toda la configuración
+    """
+    try:
+        location_uuid = UUID(location_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de location inválido")
+
+    # Validar airline
+    airline = airline.strip().upper()
+    if not airline or len(airline) < 2:
+        raise HTTPException(status_code=400, detail="Airline inválido")
+
+    # Validar batch_id
+    try:
+        batch_uuid = UUID(batch_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de batch inválido")
+
+    # Validar filter_type
+    valid_filters = {"reduce", "combine", "expand"}
+    if filter_type.lower() not in valid_filters:
+        raise HTTPException(
+            status_code=400,
+            detail=f"filter_type debe ser uno de: {', '.join(valid_filters)}"
+        )
+
+    # Validar existencia de location
+    location = await session.exec(
+        Select(Location).Where(Location.id == location_uuid)
+    ).first()
+
+    if not location:
+        raise HTTPException(status_code=404, detail="Location no encontrada")
+
+    service = TripFilterService(session)
+
+    try:
+        result = await service.revert_partial(batch_uuid, filter_type.lower())
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al revertir filtro parcial: {str(e)}")
 
 
 # =============================================================================
@@ -1365,9 +1463,11 @@ async def assign_driver_to_trip(
     await session.commit()
     await session.refresh(trip)
 
+    time_format = await get_user_time_format(request, session)
+
     return {
         "status": "ok",
-        "data": trip.model_dump(mode="json"),
+        "data": model_dump_with_time_format(trip, time_format),
         "message": "Driver asignado correctamente" if user_role == "manager" else "Trip iniciado correctamente"
     }
 
@@ -1458,8 +1558,10 @@ async def search_trips(
     if not trip:
         raise HTTPException(status_code=404, detail="Viaje no encontrado")
 
+    time_format = await get_user_time_format(request, session)
+
     return {
-        "data": trip.model_dump(mode="json"),
+        "data": model_dump_with_time_format(trip, time_format),
         "location": {
             "id": str(location.id),
             "name": location.name
