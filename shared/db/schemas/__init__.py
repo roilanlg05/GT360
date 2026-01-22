@@ -11,9 +11,11 @@ from .entities.organizations import Organization
 from .entities.locations import Location
 from .entities.airports import Airport
 from .entities.hotels import Hotel, ValidationStatus
+from .entities.qr_codes import QRCode, QRCodeStatus
 from .trips.trips import Trip, TripType, TripStatus, FilterType
 from .trips.trips_history import TripHistory
 from .trips.filter_batches import FilterBatch
+from .trips.filter_previews import FilterPreview
 from .geofencing.geofence_events import GeofenceEvent, EventType, ActorType, TargetType
 from .geofencing.geofence_state import GeofenceState
 from .geofencing.geofence_settings import GeofenceSettings

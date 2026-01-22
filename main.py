@@ -1,4 +1,5 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 from shared.db.db_config import engine
 from features.auth.routes.auth_router import router as auth_router
@@ -57,6 +58,39 @@ app.add_middleware(HTTPErrorHandler)  # Maneja errores 500 con headers CORS
 app.add_middleware(RateLimitMiddleware)
 app.add_middleware(VerifyToken)
 app.add_middleware(RequestLoggerMiddleware)
+
+
+# Exception handler para asegurar CORS en todos los errores HTTP
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """
+    Maneja HTTPException y asegura que CORS headers estén presentes.
+    Esto es necesario porque errores lanzados desde dependencies pueden
+    no pasar por el CORSMiddleware correctamente.
+    """
+    origin = request.headers.get("origin")
+
+    # Lista de orígenes permitidos (debe coincidir con CORSMiddleware)
+    allowed_origins = [
+        "https://www.gt360.com",
+        "https://gt360.com",
+        "https://web.gt360.app",
+        "https://charmaine-leadless-ryleigh.ngrok-free.dev"
+    ]
+
+    # Crear respuesta con el detalle del error
+    response = JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail}
+    )
+
+    # Agregar headers CORS si el origin está permitido
+    if origin in allowed_origins:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+
+    return response
+
 
 app.include_router(auth_router)
 app.include_router(trips_router)

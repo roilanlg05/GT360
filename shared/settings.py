@@ -36,6 +36,7 @@ class BaseAppSettings(BaseSettings):
         "/ready",
         "/v1/auth/verify-data",
         "/v1/webhooks/trips",
+        "/v1/webhooks/flights",  # AeroDataBox push notifications
         "/v1/flights/",
     ]
 

@@ -8,14 +8,19 @@ Authentication: JWT token as query parameter (same as trips WS).
 """
 
 import asyncio
-from typing import Optional, Dict, Set
+import logging
+from typing import Optional, Dict
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
+from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 from features.auth.utils import decode_token
 from features.flights.utils.ws_manager import manager
 from features.flights.services.tracking_cache import get_tracking_cache
 from features.flights.models.tracking_models import FlightTrackingState, TrackingInterval
+
+logger = logging.getLogger(__name__)
 
 
 router = APIRouter(tags=["Flight WebSockets"])
@@ -237,9 +242,11 @@ async def ws_flight_tracking(ws: WebSocket, token: str):
             })
 
     except WebSocketDisconnect:
-        pass
-    except Exception:
-        pass
+        logger.debug("WebSocket disconnected normally")
+    except (ConnectionClosedError, ConnectionClosedOK):
+        logger.debug("WebSocket connection closed")
+    except Exception as e:
+        logger.warning(f"WebSocket error: {e}")
     finally:
         # Cleanup: cancel all tracking tasks
         if ws in _tracking_tasks:
@@ -248,7 +255,10 @@ async def ws_flight_tracking(ws: WebSocket, token: str):
             del _tracking_tasks[ws]
 
         await manager.disconnect(ws)
-        try:
-            await ws.close(code=1011)
-        except Exception:
-            pass
+
+        # Only close if connection is still open
+        if ws.client_state == WebSocketState.CONNECTED:
+            try:
+                await ws.close(code=1000)
+            except Exception:
+                pass

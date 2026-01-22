@@ -22,7 +22,22 @@ class VerifyToken(BaseHTTPMiddleware):
                 token = get_token(request)
                 payload = decode_token(token)
             except ValueError as e:
-                return JSONResponse(status_code=401, content={"detail":str(e)})
+                # Crear respuesta 401 con headers CORS
+                response = JSONResponse(status_code=401, content={"detail":str(e)})
+
+                # Agregar headers CORS si el origin está permitido
+                origin = request.headers.get("origin")
+                allowed_origins = [
+                    "https://www.gt360.com",
+                    "https://gt360.com",
+                    "https://web.gt360.app",
+                    "https://charmaine-leadless-ryleigh.ngrok-free.dev"
+                ]
+                if origin in allowed_origins:
+                    response.headers["Access-Control-Allow-Origin"] = origin
+                    response.headers["Access-Control-Allow-Credentials"] = "true"
+
+                return response
 
             request.state.user_data = payload.get("metadata") or {}
             request.state.user_data.update({"id": payload.get("sub")})

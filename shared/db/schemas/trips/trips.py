@@ -13,6 +13,7 @@ class TripStatus:
     SCHEDULED = "scheduled"
     CANCELED = "canceled"
     EN_ROUTE = "en_route"
+    COMPLETED = "completed"
 
 
 class FilterType:
@@ -108,11 +109,32 @@ class Trip(PSQLModel):
         index=True
     )
 
-    # Which filter was applied: "reduce", "combine", "expand" (NULL if not filtered)
+    # DEPRECATED: Use reduce_applied, combine_applied, expand_applied instead
+    # Kept for backwards compatibility - will be removed in future version
     filter_applied: str = Column(
         max_len=20,
         default=None,
         nullable=True,
+        index=True
+    )
+
+    # === Independent filter tracking (V4) ===
+    # Each filter can be applied independently
+    reduce_applied: bool = Column(
+        default=False,
+        nullable=False,
+        index=True
+    )
+
+    combine_applied: bool = Column(
+        default=False,
+        nullable=False,
+        index=True
+    )
+
+    expand_applied: bool = Column(
+        default=False,
+        nullable=False,
         index=True
     )
 

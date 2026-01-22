@@ -7,6 +7,28 @@ El sistema de tracking de vuelos en tiempo real tiene dos componentes principale
 1. **Push Notifications** - Notificaciones de cambios de estado del vuelo (AeroDataBox)
 2. **Real-Time Tracking** - Posición del avión en tiempo real (ADSB.lol)
 
+### Arquitectura
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           ARQUITECTURA DEL SISTEMA                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌──────────────┐         ┌──────────────┐         ┌──────────────┐        │
+│  │   Frontend   │◄───────►│   Backend    │◄───────►│    Redis     │        │
+│  │   (React)    │   WS    │   (FastAPI)  │  Cache  │   Pub/Sub    │        │
+│  └──────────────┘         └──────────────┘         └──────────────┘        │
+│                                  │                                          │
+│                    ┌─────────────┼─────────────┐                           │
+│                    ▼             ▼             ▼                           │
+│           ┌──────────────┐ ┌──────────┐ ┌──────────────┐                   │
+│           │ AeroDataBox  │ │ ADSB.lol │ │   Webhook    │                   │
+│           │ (Push API)   │ │ (Pos API)│ │   Handler    │                   │
+│           └──────────────┘ └──────────┘ └──────────────┘                   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
 ### Flujo General
 
 ```
@@ -73,6 +95,10 @@ Content-Type: application/json
 }
 ```
 
+**Límites:**
+- Máximo 50 vuelos por request
+- La lista no puede estar vacía
+
 **Response (200 OK):**
 ```json
 {
@@ -100,7 +126,7 @@ Content-Type: application/json
 }
 ```
 
-**TypeScript Interface:**
+**TypeScript Interfaces:**
 ```typescript
 interface FlightToSubscribe {
   flight_number: string;
@@ -117,7 +143,7 @@ interface FlightSubscription {
   trip_id: string;
   date_local: string;
   subscription_id: string | null;
-  status: string;
+  status: "pending" | "active" | "expired" | "error";
   created_at: string;
   expires_at: string | null;
 }
@@ -176,6 +202,11 @@ Authorization: Bearer {jwt_token}
 }
 ```
 
+**Response (null si no existe):**
+```json
+null
+```
+
 ---
 
 ### 4. Obtener Estado de Tracking
@@ -196,20 +227,35 @@ Authorization: Bearer {jwt_token}
   "status": "EnRoute",
   "is_tracking_active": true,
   "last_position": {
+    "flight_number": "WN1234",
+    "trip_id": "uuid-del-trip",
     "lat": 38.5421,
     "lon": -89.1234,
     "altitude": 35000,
     "ground_speed": 450,
-    "heading": 270
+    "heading": 270,
+    "vertical_rate": -500,
+    "origin_icao": "KORD",
+    "origin_iata": "ORD",
+    "destination_icao": "KSDF",
+    "destination_iata": "SDF",
+    "distance_to_destination_nm": 185.4,
+    "eta_utc": "2026-01-18T14:30:00Z",
+    "minutes_to_arrival": 25,
+    "tracking_interval": "close",
+    "interval_seconds": 150,
+    "position_time": "2026-01-18T14:05:00Z",
+    "cached_at": "2026-01-18T14:05:01Z",
+    "cache_ttl_seconds": 2
   },
-  "current_interval": "medium",
-  "interval_seconds": 300,
+  "current_interval": "close",
+  "interval_seconds": 150,
   "subscription_id": "adb-sub-123",
   "subscription_status": "active"
 }
 ```
 
-**TypeScript Interface:**
+**TypeScript Interfaces:**
 ```typescript
 type FlightStatus =
   | "Scheduled"
@@ -247,7 +293,7 @@ interface FlightTrackingState {
 
 ### 5. Obtener Posición Actual
 
-Obtiene la posición actual del avión. Usa cache de 2 segundos.
+Obtiene la posición actual del avión. Usa cache de 2 segundos con patrón singleflight.
 
 ```http
 GET /v1/flights/tracking/position/{flight_number}?trip_id={trip_id}&destination_icao={icao}
@@ -469,6 +515,7 @@ wss://api.gt360.app/ws/flights/push?trip_id={trip_id}&token={jwt_token}
   "token": "jwt_token_actualizado"
 }
 ```
+> ⚠️ El token es **requerido** en el ping. Si no se envía, se cerrará la conexión.
 
 **2. Suscribirse a otro trip:**
 ```json
@@ -486,6 +533,21 @@ wss://api.gt360.app/ws/flights/push?trip_id={trip_id}&token={jwt_token}
 }
 ```
 
+### Estados que Activan/Desactivan Tracking
+
+El backend activa automáticamente el tracking de posición cuando recibe estos estados:
+- `Departed`
+- `EnRoute`
+- `InFlight`
+- `Airborne`
+- `TakingOff` / `Taking_Off`
+
+El backend desactiva automáticamente el tracking cuando recibe:
+- `Landed`
+- `Arrived`
+- `Canceled` / `Cancelled`
+- `Diverted`
+
 ### Ejemplo de Implementación (React)
 
 ```typescript
@@ -493,10 +555,18 @@ import { useEffect, useRef, useCallback } from 'react';
 
 interface PushNotification {
   flight_number: string;
-  status: string;
+  flight_iata: string | null;
+  flight_icao: string | null;
+  status: string | null;
+  departure_airport: string | null;
+  departure_scheduled: string | null;
+  departure_estimated: string | null;
   departure_actual: string | null;
+  arrival_airport: string | null;
+  arrival_scheduled: string | null;
   arrival_estimated: string | null;
-  // ... otros campos
+  arrival_actual: string | null;
+  received_at: string;
 }
 
 interface UsePushNotificationsOptions {
@@ -504,6 +574,7 @@ interface UsePushNotificationsOptions {
   token: string;
   onNotification: (notification: PushNotification) => void;
   onStatusChange?: (flightNumber: string, status: string) => void;
+  onError?: (error: { code?: number; detail: string }) => void;
 }
 
 export function usePushNotifications({
@@ -511,11 +582,18 @@ export function usePushNotifications({
   token,
   onNotification,
   onStatusChange,
+  onError,
 }: UsePushNotificationsOptions) {
   const wsRef = useRef<WebSocket | null>(null);
   const pingIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const connect = useCallback(() => {
+    // Clear any existing reconnect timeout
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+    }
+
     const ws = new WebSocket(
       `wss://api.gt360.app/ws/flights/push?trip_id=${tripId}&token=${token}`
     );
@@ -523,7 +601,7 @@ export function usePushNotifications({
     ws.onopen = () => {
       console.log('Push WS connected');
 
-      // Ping cada 30 segundos
+      // Ping cada 30 segundos con token actualizado
       pingIntervalRef.current = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ action: 'ping', token }));
@@ -535,17 +613,30 @@ export function usePushNotifications({
       const data = JSON.parse(event.data);
 
       switch (data.type) {
+        case 'connected':
+          console.log(`Connected to push notifications for trip: ${data.trip_id}`);
+          break;
+
         case 'push_notification':
           onNotification(data.notification);
 
-          // Detectar cuando el vuelo despega para activar tracking
-          if (data.notification.status === 'Departed' && onStatusChange) {
-            onStatusChange(data.notification.flight_number, 'Departed');
+          // Detectar cambios de estado para activar/desactivar tracking
+          if (data.notification.status && onStatusChange) {
+            onStatusChange(data.notification.flight_number, data.notification.status);
           }
+          break;
+
+        case 'subscribed':
+          console.log(`Subscribed to trip: ${data.trip_id}`);
+          break;
+
+        case 'unsubscribed':
+          console.log(`Unsubscribed from trip: ${data.trip_id}`);
           break;
 
         case 'error':
           console.error('Push WS error:', data.detail);
+          onError?.({ code: data.code, detail: data.detail });
           if (data.code === 401) {
             ws.close();
           }
@@ -553,18 +644,44 @@ export function usePushNotifications({
       }
     };
 
-    ws.onclose = () => {
-      console.log('Push WS disconnected');
+    ws.onclose = (event) => {
+      console.log('Push WS disconnected', event.code);
       if (pingIntervalRef.current) {
         clearInterval(pingIntervalRef.current);
       }
 
-      // Reconectar después de 3 segundos
-      setTimeout(connect, 3000);
+      // Reconectar después de 3 segundos (excepto si fue cerrado intencionalmente)
+      if (event.code !== 1000) {
+        reconnectTimeoutRef.current = setTimeout(connect, 3000);
+      }
+    };
+
+    ws.onerror = (error) => {
+      console.error('Push WS error:', error);
     };
 
     wsRef.current = ws;
-  }, [tripId, token, onNotification, onStatusChange]);
+  }, [tripId, token, onNotification, onStatusChange, onError]);
+
+  // Función para suscribirse a un trip adicional
+  const subscribeToTrip = useCallback((additionalTripId: string) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        action: 'subscribe',
+        trip_id: additionalTripId,
+      }));
+    }
+  }, []);
+
+  // Función para desuscribirse de un trip
+  const unsubscribeFromTrip = useCallback((tripIdToUnsub: string) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        action: 'unsubscribe',
+        trip_id: tripIdToUnsub,
+      }));
+    }
+  }, []);
 
   useEffect(() => {
     connect();
@@ -573,11 +690,18 @@ export function usePushNotifications({
       if (pingIntervalRef.current) {
         clearInterval(pingIntervalRef.current);
       }
-      wsRef.current?.close();
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+      }
+      wsRef.current?.close(1000);
     };
   }, [connect]);
 
-  return wsRef;
+  return {
+    ws: wsRef,
+    subscribeToTrip,
+    unsubscribeFromTrip,
+  };
 }
 ```
 
@@ -629,12 +753,18 @@ wss://api.gt360.app/ws/flights/tracking?token={jwt_token}
     "ground_speed": 450.5,
     "heading": 270.3,
     "vertical_rate": -500,
+    "origin_icao": "KORD",
+    "origin_iata": "ORD",
+    "destination_icao": "KSDF",
+    "destination_iata": "SDF",
     "distance_to_destination_nm": 185.4,
     "eta_utc": "2026-01-18T14:30:00Z",
     "minutes_to_arrival": 25,
     "tracking_interval": "close",
     "interval_seconds": 150,
-    "position_time": "2026-01-18T14:05:00Z"
+    "position_time": "2026-01-18T14:05:00Z",
+    "cached_at": "2026-01-18T14:05:01Z",
+    "cache_ttl_seconds": 2
   }
 }
 ```
@@ -675,6 +805,7 @@ wss://api.gt360.app/ws/flights/tracking?token={jwt_token}
   "destination_icao": "KSDF"
 }
 ```
+> Los campos `origin_icao` y `destination_icao` son opcionales pero recomendados para cálculo de ETA.
 
 **2. Detener tracking:**
 ```json
@@ -692,6 +823,7 @@ wss://api.gt360.app/ws/flights/tracking?token={jwt_token}
   "token": "jwt_token_actualizado"
 }
 ```
+> ⚠️ El token es **requerido** en el ping. Si no se envía, se cerrará la conexión.
 
 ### Ejemplo de Implementación (React)
 
@@ -706,9 +838,19 @@ interface FlightPosition {
   altitude: number | null;
   ground_speed: number | null;
   heading: number | null;
+  vertical_rate: number | null;
+  origin_icao: string | null;
+  origin_iata: string | null;
+  destination_icao: string | null;
+  destination_iata: string | null;
+  distance_to_destination_nm: number | null;
+  eta_utc: string | null;
   minutes_to_arrival: number | null;
   tracking_interval: string;
   interval_seconds: number;
+  position_time: string;
+  cached_at: string;
+  cache_ttl_seconds: number;
 }
 
 interface FlightToTrack {
@@ -721,18 +863,29 @@ interface FlightToTrack {
 interface UseFlightTrackingOptions {
   token: string;
   onPositionUpdate: (position: FlightPosition) => void;
+  onTrackingStarted?: (flightNumber: string, tripId: string) => void;
+  onTrackingStopped?: (flightNumber: string, tripId: string) => void;
+  onError?: (error: string) => void;
 }
 
 export function useFlightTracking({
   token,
   onPositionUpdate,
+  onTrackingStarted,
+  onTrackingStopped,
+  onError,
 }: UseFlightTrackingOptions) {
   const wsRef = useRef<WebSocket | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [trackedFlights, setTrackedFlights] = useState<Set<string>>(new Set());
   const pingIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const connect = useCallback(() => {
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+    }
+
     const ws = new WebSocket(
       `wss://api.gt360.app/ws/flights/tracking?token=${token}`
     );
@@ -741,7 +894,7 @@ export function useFlightTracking({
       console.log('Tracking WS connected');
       setIsConnected(true);
 
-      // Ping cada 30 segundos
+      // Ping cada 30 segundos con token
       pingIntervalRef.current = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ action: 'ping', token }));
@@ -753,6 +906,10 @@ export function useFlightTracking({
       const data = JSON.parse(event.data);
 
       switch (data.type) {
+        case 'connected':
+          console.log('Tracking WS ready');
+          break;
+
         case 'position_update':
           onPositionUpdate(data.position);
           break;
@@ -761,6 +918,7 @@ export function useFlightTracking({
           setTrackedFlights(prev =>
             new Set([...prev, `${data.flight_number}:${data.trip_id}`])
           );
+          onTrackingStarted?.(data.flight_number, data.trip_id);
           break;
 
         case 'tracking_stopped':
@@ -769,16 +927,21 @@ export function useFlightTracking({
             next.delete(`${data.flight_number}:${data.trip_id}`);
             return next;
           });
+          onTrackingStopped?.(data.flight_number, data.trip_id);
           break;
 
         case 'error':
           console.error('Tracking WS error:', data.detail);
+          onError?.(data.detail);
+          if (data.code === 401) {
+            ws.close();
+          }
           break;
       }
     };
 
-    ws.onclose = () => {
-      console.log('Tracking WS disconnected');
+    ws.onclose = (event) => {
+      console.log('Tracking WS disconnected', event.code);
       setIsConnected(false);
 
       if (pingIntervalRef.current) {
@@ -786,11 +949,17 @@ export function useFlightTracking({
       }
 
       // Reconectar después de 3 segundos
-      setTimeout(connect, 3000);
+      if (event.code !== 1000) {
+        reconnectTimeoutRef.current = setTimeout(connect, 3000);
+      }
+    };
+
+    ws.onerror = (error) => {
+      console.error('Tracking WS error:', error);
     };
 
     wsRef.current = ws;
-  }, [token, onPositionUpdate]);
+  }, [token, onPositionUpdate, onTrackingStarted, onTrackingStopped, onError]);
 
   const startTracking = useCallback((flight: FlightToTrack) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -821,7 +990,10 @@ export function useFlightTracking({
       if (pingIntervalRef.current) {
         clearInterval(pingIntervalRef.current);
       }
-      wsRef.current?.close();
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+      }
+      wsRef.current?.close(1000);
     };
   }, [connect]);
 
@@ -853,7 +1025,7 @@ const flightsToSubscribe = trips
     date_local: trip.pick_up_date,
   }));
 
-// 3. Suscribir a push notifications
+// 3. Suscribir a push notifications (máximo 50 por request)
 const response = await fetch('/v1/flights/tracking/subscribe', {
   method: 'POST',
   headers: {
@@ -863,42 +1035,36 @@ const response = await fetch('/v1/flights/tracking/subscribe', {
   body: JSON.stringify({ flights: flightsToSubscribe }),
 });
 
-// 4. Conectar al WebSocket de push
-const pushWs = new WebSocket(
-  `wss://api.gt360.app/ws/flights/push?trip_id=${tripId}&token=${token}`
-);
+const result = await response.json();
+console.log(`Subscribed: ${result.success_count}/${result.total}`);
+
+// 4. Conectar al WebSocket de push para cada trip
+// O usar un solo WS y suscribirse a múltiples trips
 ```
 
 ### 2. Cuando un vuelo despega (recibido via push)
 
 ```typescript
-pushWs.onmessage = (event) => {
-  const data = JSON.parse(event.data);
+// En el handler de push notifications
+const handlePushNotification = (notification: PushNotification) => {
+  const { flight_number, status, trip_id } = notification;
 
-  if (data.type === 'push_notification') {
-    const { flight_number, status, trip_id } = data.notification;
+  // Actualizar UI con nuevo estado
+  updateFlightStatus(flight_number, status);
 
-    // Actualizar UI con nuevo estado
-    updateFlightStatus(flight_number, status);
+  // Si el vuelo despegó, iniciar tracking en tiempo real
+  if (['Departed', 'EnRoute', 'InFlight', 'Airborne'].includes(status)) {
+    trackingWs.startTracking({
+      flight_number,
+      trip_id,
+      origin_icao: getOriginIcao(trip_id),
+      destination_icao: getDestinationIcao(trip_id),
+    });
+  }
 
-    // Si el vuelo despegó, iniciar tracking en tiempo real
-    if (status === 'Departed') {
-      trackingWs.send(JSON.stringify({
-        action: 'track',
-        flight_number,
-        trip_id,
-        destination_icao: 'KSDF', // Aeropuerto destino
-      }));
-    }
-
-    // Si el vuelo aterrizó, detener tracking
-    if (status === 'Landed' || status === 'Arrived') {
-      trackingWs.send(JSON.stringify({
-        action: 'stop',
-        flight_number,
-        trip_id,
-      }));
-    }
+  // Si el vuelo aterrizó, detener tracking
+  if (['Landed', 'Arrived', 'Canceled', 'Diverted'].includes(status)) {
+    trackingWs.stopTracking(flight_number, trip_id);
   }
 };
 ```
@@ -906,34 +1072,45 @@ pushWs.onmessage = (event) => {
 ### 3. Mostrar posición en el mapa
 
 ```typescript
-trackingWs.onmessage = (event) => {
-  const data = JSON.parse(event.data);
+// En el handler de position updates
+const handlePositionUpdate = (position: FlightPosition) => {
+  // Actualizar marcador en el mapa
+  updateAircraftMarker({
+    id: `${position.flight_number}:${position.trip_id}`,
+    lat: position.lat,
+    lon: position.lon,
+    heading: position.heading,
+    altitude: position.altitude,
+    speed: position.ground_speed,
+  });
 
-  if (data.type === 'position_update') {
-    const pos = data.position;
+  // Mostrar información de vuelo
+  updateFlightInfo({
+    flightNumber: position.flight_number,
+    altitude: position.altitude ? `${position.altitude.toLocaleString()} ft` : 'N/A',
+    speed: position.ground_speed ? `${Math.round(position.ground_speed)} kts` : 'N/A',
+    heading: position.heading ? `${Math.round(position.heading)}°` : 'N/A',
+    verticalRate: position.vertical_rate
+      ? `${position.vertical_rate > 0 ? '+' : ''}${position.vertical_rate} ft/min`
+      : 'N/A',
+  });
 
-    // Actualizar marcador en el mapa
-    updateAircraftMarker({
-      id: `${pos.flight_number}:${pos.trip_id}`,
-      lat: pos.lat,
-      lon: pos.lon,
-      heading: pos.heading,
-      altitude: pos.altitude,
-      speed: pos.ground_speed,
-    });
-
-    // Mostrar ETA
-    if (pos.minutes_to_arrival !== null) {
-      updateETA(pos.flight_number, pos.minutes_to_arrival);
-    }
-
-    // Log del intervalo actual
-    console.log(
-      `Tracking ${pos.flight_number}: ` +
-      `${pos.minutes_to_arrival} min to arrival, ` +
-      `interval: ${pos.tracking_interval} (${pos.interval_seconds}s)`
+  // Mostrar ETA
+  if (position.minutes_to_arrival !== null) {
+    const hours = Math.floor(position.minutes_to_arrival / 60);
+    const mins = position.minutes_to_arrival % 60;
+    updateETA(
+      position.flight_number,
+      hours > 0 ? `${hours}h ${mins}m` : `${mins}m`
     );
   }
+
+  // Log del intervalo actual (para debugging)
+  console.log(
+    `Tracking ${position.flight_number}: ` +
+    `${position.minutes_to_arrival ?? '?'} min to arrival, ` +
+    `interval: ${position.tracking_interval} (${position.interval_seconds}s)`
+  );
 };
 ```
 
@@ -953,22 +1130,154 @@ trackingWs.onmessage = (event) => {
 
 ## Códigos de Error
 
+### HTTP Errors
+
 | Code | Descripción | Acción |
 |------|-------------|--------|
-| 400 | Bad Request | Verificar payload |
-| 401 | Token inválido | Renovar token y reconectar |
+| 400 | Bad Request - payload inválido o lista vacía | Verificar payload |
+| 400 | Maximum 50 flights per request | Dividir en múltiples requests |
+| 401 | Token inválido o expirado | Renovar token |
 | 404 | Vuelo no encontrado | Verificar flight_number y date |
-| 429 | Rate limit | Esperar y reintentar |
+| 429 | Rate limit | Esperar y reintentar con backoff |
+
+### WebSocket Errors
+
+| Code | Descripción | Acción |
+|------|-------------|--------|
+| 401 | Token inválido en ping | Reconectar con token válido |
 | 1008 | WS Auth failed | Token inválido, cerrar y reconectar |
 | 1011 | WS Error interno | Reconectar después de delay |
 
+### Error Response Format
+
+```json
+{
+  "type": "error",
+  "code": 401,
+  "detail": "Invalid or expired token"
+}
+```
+
 ---
 
-## Variables de Entorno Requeridas (Backend)
+## Mejores Prácticas
+
+### 1. Manejo de Reconexión
+
+```typescript
+const RECONNECT_DELAYS = [1000, 2000, 5000, 10000, 30000]; // Backoff exponencial
+
+let reconnectAttempt = 0;
+
+ws.onclose = (event) => {
+  if (event.code !== 1000) { // No fue cierre intencional
+    const delay = RECONNECT_DELAYS[Math.min(reconnectAttempt, RECONNECT_DELAYS.length - 1)];
+    reconnectAttempt++;
+    setTimeout(connect, delay);
+  }
+};
+
+ws.onopen = () => {
+  reconnectAttempt = 0; // Reset on successful connection
+};
+```
+
+### 2. Actualización de Token
+
+```typescript
+// Cuando el token se renueva, actualizar la referencia
+const tokenRef = useRef(token);
+
+useEffect(() => {
+  tokenRef.current = token;
+}, [token]);
+
+// En el ping, siempre usar el token más reciente
+pingIntervalRef.current = setInterval(() => {
+  ws.send(JSON.stringify({ action: 'ping', token: tokenRef.current }));
+}, 30000);
+```
+
+### 3. Limpieza de Recursos
+
+```typescript
+useEffect(() => {
+  return () => {
+    // Detener todos los trackings antes de desconectar
+    trackedFlights.forEach(key => {
+      const [flightNumber, tripId] = key.split(':');
+      stopTracking(flightNumber, tripId);
+    });
+
+    // Cerrar conexiones
+    wsRef.current?.close(1000);
+  };
+}, []);
+```
+
+### 4. Optimización de Renders
+
+```typescript
+// Usar useCallback para callbacks estables
+const handlePositionUpdate = useCallback((position: FlightPosition) => {
+  // Actualizar solo si la posición cambió significativamente
+  setPositions(prev => {
+    const key = `${position.flight_number}:${position.trip_id}`;
+    const existing = prev.get(key);
+
+    if (existing &&
+        Math.abs(existing.lat - position.lat) < 0.0001 &&
+        Math.abs(existing.lon - position.lon) < 0.0001) {
+      return prev; // No actualizar si el cambio es mínimo
+    }
+
+    return new Map(prev).set(key, position);
+  });
+}, []);
+```
+
+---
+
+## Variables de Entorno (Backend)
 
 ```env
+# AeroDataBox Push API
 AERODATABOX_RAPIDAPI_KEY=tu_api_key
 AERODATABOX_RAPIDAPI_HOST=aerodatabox.p.rapidapi.com
+
+# Webhook configuration
 FLIGHT_WEBHOOK_URL=https://api.gt360.app/v1/webhooks/flights/push
 FLIGHT_SUBSCRIPTION_HOURS=24
+
+# Redis (para pub/sub y cache)
+REDIS_URL=redis://localhost:6379
+```
+
+---
+
+## Webhook Endpoint (Para Referencia)
+
+El backend expone un webhook para recibir notificaciones de AeroDataBox:
+
+```
+POST /v1/webhooks/flights/push?trip_id={trip_id}&date={date}
+```
+
+Este endpoint:
+1. Parsea la notificación de AeroDataBox
+2. Publica a Redis para WebSocket clients
+3. Activa/desactiva tracking según el estado del vuelo
+4. Actualiza el estado en cache
+
+**Health Check:**
+```
+GET /v1/webhooks/flights/push/health
+```
+
+Response:
+```json
+{
+  "status": "ok",
+  "timestamp": "2026-01-18T14:30:00Z"
+}
 ```

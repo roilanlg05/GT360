@@ -7,12 +7,17 @@ to connected clients in real-time.
 Authentication: JWT token as query parameter (same as trips WS).
 """
 
+import logging
+
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
+from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 from features.auth.utils import decode_token
 from features.flights.utils.ws_manager import manager
 from features.flights.services.tracking_cache import get_tracking_cache
 
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Flight WebSockets"])
 
@@ -122,10 +127,17 @@ async def ws_flight_push(ws: WebSocket, trip_id: str, token: str):
             })
 
     except WebSocketDisconnect:
+        logger.debug("Push WebSocket disconnected normally")
+    except (ConnectionClosedError, ConnectionClosedOK):
+        logger.debug("Push WebSocket connection closed")
+    except Exception as e:
+        logger.warning(f"Push WebSocket error: {e}")
+    finally:
         await manager.disconnect(ws)
-    except Exception:
-        await manager.disconnect(ws)
-        try:
-            await ws.close(code=1011)
-        except Exception:
-            pass
+
+        # Only close if connection is still open
+        if ws.client_state == WebSocketState.CONNECTED:
+            try:
+                await ws.close(code=1000)
+            except Exception:
+                pass

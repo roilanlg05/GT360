@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from fastapi import APIRouter, UploadFile, File, HTTPException, Query, Depends, Request, Response
 from fastapi.responses import JSONResponse
 from shared.db.db_config import get_db
@@ -5,14 +7,21 @@ from psqlmodel import Select, Count, Delete, AsyncSession
 from shared.db.schemas import Trip as TripDB, Location, Airport, Organization, Hotel
 from features.trips.utils.trip_importer import load_trips_from_bytes
 from features.trips.models import TripUpdate, CreateTrip, LocationZoneUpdate, HotelPointUpdate
+from features.trips.models.qr_models import CreateQRCode, UpdateQRCode, QRCodeResponse
 from shared.middlewares.user_context import get_user_time_format
 from shared.utils.serialization import model_dump_with_time_format
 from features.trips.models.filter_models import (
     FilterRequest,
     FilterPreviewResult,
+    FilterPreviewSaved,
     FilterApplyResult,
     FilterRevertResult,
     FilterRevertPartialResult,
+    FilterCurrentResponse,
+    FilterHistoryResponse,
+    FilterHistoryItem,
+    TripChange,
+    FilterExclusion,
 )
 from features.trips.services.trip_filter_service import TripFilterService
 from datetime import date, time, datetime, timezone
@@ -399,7 +408,7 @@ async def get_trips(
     flight_number: Optional[str] = None,
     trip_type: Optional[str] = None,
     skip: int = Query(0, ge=0),
-    limit: int = Query(20, ge=1, le=50),
+    limit: int = Query(100, ge=1, le=200),  # Optimizado para infinite scroll
     _role=Depends(verify_role(["manager", "driver", "crew"]))
 ):
 
@@ -1055,6 +1064,500 @@ async def get_available_months(
         "total_months": len(months)
     }
 
+
+# =============================================================================
+# TIMELINE ENDPOINTS (Live/History with Anchor and Cursor Pagination)
+# =============================================================================
+
+@router.get("/v1/locations/{location_id}/days")
+async def get_available_days(
+    location_id: str,
+    year: int = Query(..., description="Year (e.g., 2026)"),
+    month: int = Query(..., ge=0, le=11, description="Month (0-11 JavaScript format)"),
+    airline: Optional[str] = None,
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["manager", "driver"]))
+):
+    """
+    Returns available days for a specific month with live/history trip counts.
+
+    The month parameter uses JavaScript format (0-11) for frontend consistency.
+    Returns current_day based on the location's timezone.
+    """
+    from features.trips.utils import (
+        get_current_date_in_timezone,
+        get_current_time_in_timezone
+    )
+    from shared.db.db_config import engine
+
+    try:
+        location_uuid = UUID(location_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid location ID")
+
+    # Validate location exists
+    location = await session.exec(
+        Select(Location).Where(Location.id == location_uuid)
+    ).first()
+
+    if not location:
+        raise HTTPException(status_code=404, detail="Location not found")
+
+    # Convert JavaScript month (0-11) to SQL month (1-12)
+    sql_month = month + 1
+
+    # Get current date/time in location timezone
+    current_date = get_current_date_in_timezone(location.timezone)
+    current_time = get_current_time_in_timezone(location.timezone)
+
+    # Build SQL query for day counts with live/history breakdown
+    query = """
+        SELECT
+            EXTRACT(DAY FROM pick_up_date)::int AS day,
+            COUNT(*) AS total_count,
+            COUNT(*) FILTER (WHERE
+                status = 'en_route'
+                OR (
+                    status = 'scheduled'
+                    AND (
+                        pick_up_date > $4::date
+                        OR (pick_up_date = $4::date AND pick_up_time > $5::time)
+                    )
+                )
+            ) AS live_count
+        FROM trips.trips
+        WHERE location_id = $1
+          AND EXTRACT(YEAR FROM pick_up_date) = $2
+          AND EXTRACT(MONTH FROM pick_up_date) = $3
+    """
+
+    params = [location_uuid, year, sql_month, current_date, current_time]
+
+    if airline:
+        query += " AND airline ILIKE $6"
+        params.append(f"%{airline}%")
+
+    query += """
+        GROUP BY day
+        ORDER BY day ASC
+    """
+
+    result = await engine.execute_raw_async(query, params)
+
+    days = [
+        {
+            "day": row[0],
+            "count": row[1],
+            "live_count": row[2],
+            "history_count": row[1] - row[2]
+        }
+        for row in result
+    ]
+
+    # Determine current_day only if viewing current month
+    current_day = None
+    if current_date.year == year and current_date.month == sql_month:
+        current_day = current_date.day
+
+    return {
+        "location_id": location_id,
+        "year": year,
+        "month": month,
+        "timezone": location.timezone,
+        "current_day": current_day,
+        "days": days
+    }
+
+
+@router.get("/v1/locations/{location_id}/timeline/anchor")
+async def get_timeline_anchor(
+    location_id: str,
+    airline: Optional[str] = None,
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["manager", "driver"]))
+):
+    """
+    Get anchor information for the timeline to "jump to now".
+
+    Returns:
+    - Current date/time in location timezone
+    - First live trip (if any) with cursor for pagination
+    - Summary of today's trips (live vs history counts)
+
+    This allows the frontend to anchor the scroll position directly
+    at the current point in time without loading the entire month.
+    """
+    from features.trips.utils import (
+        get_current_datetime_in_timezone,
+        get_current_date_in_timezone,
+        get_current_time_in_timezone,
+        build_cursor
+    )
+    from shared.db.db_config import engine
+
+    try:
+        location_uuid = UUID(location_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid location ID")
+
+    # Validate location exists
+    location = await session.exec(
+        Select(Location).Where(Location.id == location_uuid)
+    ).first()
+
+    if not location:
+        raise HTTPException(status_code=404, detail="Location not found")
+
+    # Get current datetime in location timezone
+    current_dt = get_current_datetime_in_timezone(location.timezone)
+    current_date = current_dt.date()
+    current_time = current_dt.time()
+
+    # Find first LIVE trip (en_route or scheduled with future pickup)
+    first_live_query = """
+        SELECT id, pick_up_date, pick_up_time
+        FROM trips.trips
+        WHERE location_id = $1
+          AND (
+            status = 'en_route'
+            OR (
+              status = 'scheduled'
+              AND (
+                pick_up_date > $2::date
+                OR (pick_up_date = $2::date AND pick_up_time > $3::time)
+              )
+            )
+          )
+    """
+
+    params = [location_uuid, current_date, current_time]
+
+    if airline:
+        first_live_query += " AND airline ILIKE $4"
+        params.append(f"%{airline}%")
+
+    first_live_query += """
+        ORDER BY pick_up_date ASC, pick_up_time ASC
+        LIMIT 1
+    """
+
+    first_live_result = await engine.execute_raw_async(first_live_query, params)
+    first_live_trip = None
+
+    if first_live_result:
+        row = first_live_result[0]
+        trip_id = str(row[0])
+        trip_date = row[1]
+        trip_time = row[2]
+        first_live_trip = {
+            "id": trip_id,
+            "pick_up_date": trip_date.isoformat(),
+            "pick_up_time": trip_time.isoformat(),
+            "cursor": build_cursor(trip_date, trip_time, trip_id)
+        }
+
+    # Get summary for today
+    summary_query = """
+        SELECT
+            COUNT(*) AS total,
+            COUNT(*) FILTER (WHERE
+                status = 'en_route'
+                OR (
+                    status = 'scheduled'
+                    AND (
+                        pick_up_date > $2::date
+                        OR (pick_up_date = $2::date AND pick_up_time > $3::time)
+                    )
+                )
+            ) AS live_count,
+            COUNT(*) FILTER (WHERE status = 'scheduled') AS scheduled_count,
+            COUNT(*) FILTER (WHERE status = 'en_route') AS en_route_count,
+            COUNT(*) FILTER (WHERE status = 'completed') AS completed_count,
+            COUNT(*) FILTER (WHERE status = 'canceled') AS canceled_count
+        FROM trips.trips
+        WHERE location_id = $1
+          AND pick_up_date = $2::date
+    """
+
+    summary_params = [location_uuid, current_date, current_time]
+
+    if airline:
+        summary_query += " AND airline ILIKE $4"
+        summary_params.append(f"%{airline}%")
+
+    summary_result = await engine.execute_raw_async(summary_query, summary_params)
+
+    today_summary = {
+        "total": 0,
+        "live": 0,
+        "history": 0,
+        "by_status": {
+            "scheduled": 0,
+            "en_route": 0,
+            "completed": 0,
+            "canceled": 0
+        }
+    }
+
+    if summary_result:
+        row = summary_result[0]
+        total = row[0] or 0
+        live = row[1] or 0
+        today_summary = {
+            "total": total,
+            "live": live,
+            "history": total - live,
+            "by_status": {
+                "scheduled": row[2] or 0,
+                "en_route": row[3] or 0,
+                "completed": row[4] or 0,
+                "canceled": row[5] or 0
+            }
+        }
+
+    return {
+        "location_id": location_id,
+        "timezone": location.timezone,
+        "current_datetime": current_dt.isoformat(),
+        "current_date": current_date.isoformat(),
+        "current_year": current_date.year,
+        "current_month": current_date.month - 1,  # JavaScript format (0-11)
+        "current_day": current_date.day,
+        "first_live_trip": first_live_trip,
+        "today_summary": today_summary
+    }
+
+
+@router.get("/v1/locations/{location_id}/timeline")
+async def get_timeline(
+    location_id: str,
+    request: Request,
+    airline: Optional[str] = None,
+    cursor: Optional[str] = None,
+    direction: str = Query("forward", pattern="^(forward|backward)$"),
+    date: Optional[str] = None,
+    category: str = Query("all", pattern="^(all|live|history)$"),
+    status: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=100),
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["manager", "driver"]))
+):
+    """
+    Get trips organized as a timeline with bidirectional cursor pagination.
+
+    Parameters:
+    - cursor: Pagination cursor (format: "date_time_tripId")
+    - direction: "forward" (future/later) or "backward" (past/earlier)
+    - date: Specific date to load (alternative to cursor)
+    - category: Filter by "all", "live", or "history"
+    - status: Filter by specific status (scheduled, en_route, completed, canceled)
+    - limit: Number of trips to return (max 100)
+
+    The response includes:
+    - Trips with computed is_live field
+    - Pagination cursors for forward/backward navigation
+    - Summary with live/history counts
+    """
+    from features.trips.utils import (
+        get_current_datetime_in_timezone,
+        compute_is_live,
+        build_cursor,
+        parse_cursor,
+        format_time_for_display
+    )
+
+    try:
+        location_uuid = UUID(location_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid location ID")
+
+    # Validate location exists
+    location = await session.exec(
+        Select(Location).Where(Location.id == location_uuid)
+    ).first()
+
+    if not location:
+        raise HTTPException(status_code=404, detail="Location not found")
+
+    # Get current datetime in location timezone
+    current_dt = get_current_datetime_in_timezone(location.timezone)
+    current_date = current_dt.date()
+    current_time = current_dt.time()
+
+    # Get user's time format preference
+    time_format = await get_user_time_format(request, session)
+    use_24h = time_format == "24h"
+
+    # Build base filters
+    filters = [TripDB.location_id == location_uuid]
+
+    if airline:
+        filters.append(TripDB.airline.ilike(f"%{airline}%"))
+
+    if status:
+        filters.append(TripDB.status == status)
+
+    # Handle date filter (if provided instead of cursor)
+    if date and not cursor:
+        try:
+            target_date = datetime.fromisoformat(date).date()
+            filters.append(TripDB.pick_up_date == target_date)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+
+    # Handle category filter (live vs history)
+    if category == "live":
+        # LIVE: en_route OR (scheduled AND future pickup time)
+        filters.append(
+            (TripDB.status == TripStatus.EN_ROUTE) |
+            (
+                (TripDB.status == TripStatus.SCHEDULED) &
+                (
+                    (TripDB.pick_up_date > current_date) |
+                    ((TripDB.pick_up_date == current_date) & (TripDB.pick_up_time > current_time))
+                )
+            )
+        )
+    elif category == "history":
+        # HISTORY: completed, canceled, OR (scheduled with past pickup time)
+        filters.append(
+            (TripDB.status == TripStatus.COMPLETED) |
+            (TripDB.status == TripStatus.CANCELED) |
+            (
+                (TripDB.status == TripStatus.SCHEDULED) &
+                (
+                    (TripDB.pick_up_date < current_date) |
+                    ((TripDB.pick_up_date == current_date) & (TripDB.pick_up_time <= current_time))
+                )
+            )
+        )
+
+    # Handle cursor-based pagination
+    if cursor:
+        try:
+            cursor_date, cursor_time, cursor_id = parse_cursor(cursor)
+            cursor_uuid = UUID(cursor_id)
+
+            if direction == "forward":
+                # Get trips AFTER the cursor (future/later)
+                filters.append(
+                    (TripDB.pick_up_date > cursor_date) |
+                    ((TripDB.pick_up_date == cursor_date) & (TripDB.pick_up_time > cursor_time)) |
+                    ((TripDB.pick_up_date == cursor_date) & (TripDB.pick_up_time == cursor_time) & (TripDB.id > cursor_uuid))
+                )
+            else:
+                # Get trips BEFORE the cursor (past/earlier)
+                filters.append(
+                    (TripDB.pick_up_date < cursor_date) |
+                    ((TripDB.pick_up_date == cursor_date) & (TripDB.pick_up_time < cursor_time)) |
+                    ((TripDB.pick_up_date == cursor_date) & (TripDB.pick_up_time == cursor_time) & (TripDB.id < cursor_uuid))
+                )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid cursor format: {str(e)}")
+
+    # Combine filters
+    from functools import reduce
+    combined_filter = reduce(lambda a, b: a & b, filters)
+
+    # Build query with ordering
+    if direction == "backward":
+        query = (
+            Select(TripDB)
+            .Where(combined_filter)
+            .OrderBy(
+                TripDB.pick_up_date.Desc(),
+                TripDB.pick_up_time.Desc(),
+                TripDB.id.Desc()
+            )
+            .Limit(limit + 1)  # Fetch one extra to check if there's more
+        )
+    else:
+        query = (
+            Select(TripDB)
+            .Where(combined_filter)
+            .OrderBy(
+                TripDB.pick_up_date.Asc(),
+                TripDB.pick_up_time.Asc(),
+                TripDB.id.Asc()
+            )
+            .Limit(limit + 1)
+        )
+
+    trips = await session.exec(query).all()
+
+    # Check if there are more results
+    has_more = len(trips) > limit
+    if has_more:
+        trips = trips[:limit]
+
+    # Reverse backward results to maintain chronological order
+    if direction == "backward":
+        trips = list(reversed(trips))
+
+    # Build response data with is_live computation
+    data = []
+    for trip in trips:
+        trip_dict = model_dump_with_time_format(trip, time_format)
+        trip_dict["is_live"] = compute_is_live(
+            trip.status,
+            trip.pick_up_date,
+            trip.pick_up_time,
+            location.timezone
+        )
+        trip_dict["pick_up_time_formatted"] = format_time_for_display(
+            trip.pick_up_time,
+            use_24h
+        )
+        data.append(trip_dict)
+
+    # Build pagination info
+    pagination = {
+        "has_more_forward": has_more if direction == "forward" else True,
+        "has_more_backward": has_more if direction == "backward" else True,
+        "next_cursor": None,
+        "prev_cursor": None
+    }
+
+    if data:
+        # Next cursor is from the last item (for forward pagination)
+        last_trip = trips[-1]
+        pagination["next_cursor"] = build_cursor(
+            last_trip.pick_up_date,
+            last_trip.pick_up_time,
+            str(last_trip.id)
+        )
+
+        # Prev cursor is from the first item (for backward pagination)
+        first_trip = trips[0]
+        pagination["prev_cursor"] = build_cursor(
+            first_trip.pick_up_date,
+            first_trip.pick_up_time,
+            str(first_trip.id)
+        )
+
+    # Build summary (count live vs history in returned data)
+    live_count = sum(1 for d in data if d.get("is_live"))
+    history_count = len(data) - live_count
+
+    status_counts = {}
+    for d in data:
+        s = d.get("status", "unknown")
+        status_counts[s] = status_counts.get(s, 0) + 1
+
+    return {
+        "location_id": location_id,
+        "timezone": location.timezone,
+        "current_datetime": current_dt.isoformat(),
+        "data": data,
+        "pagination": pagination,
+        "summary": {
+            "live": live_count,
+            "history": history_count,
+            "by_status": status_counts
+        }
+    }
+
+
 @router.patch("/v1/locations/{location_id}/hotels/{hotel_id}")
 async def edit_hotel(
     hotel_id: str,
@@ -1147,13 +1650,237 @@ async def preview_filters(
     if not location:
         raise HTTPException(status_code=404, detail="Location no encontrada")
 
-    # Obtener formato de hora del usuario
-    time_format = await get_user_time_format(request, session)
+    # Usar time_format del request body si está presente, sino obtener del usuario
+    time_format = filters.time_format or await get_user_time_format(request, session)
 
     service = TripFilterService(session)
     result = await service.preview(location_uuid, airline, filters, time_format)
 
+    # Save preview to database (replace existing if any)
+    # This allows Device B to see the preview created on Device A
+    await save_filter_preview(session, location_uuid, airline, filters, result)
+
     return result
+
+
+@router.get("/v1/locations/{location_id}/airlines/{airline}/trips/filters/preview/last")
+async def get_last_preview(
+    location_id: str,
+    airline: str,
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["manager"]))
+) -> Optional[FilterPreviewSaved]:
+    """
+    Retrieve the last saved preview for this location+airline.
+
+    Returns None if no preview has been saved yet.
+    This allows Device B to see the preview created on Device A.
+
+    Use cases:
+    - User creates preview on Device A
+    - User switches to Device B → calls this endpoint → sees same preview
+    - After filters are applied, this returns None (preview is cleared)
+    """
+    try:
+        location_uuid = UUID(location_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid location ID")
+
+    airline = airline.strip().upper()
+    if not airline or len(airline) < 2:
+        raise HTTPException(status_code=400, detail="Invalid airline")
+
+    from shared.db.schemas import FilterPreview
+    from psqlmodel import Select
+
+    preview = await session.exec(
+        Select(FilterPreview).Where(
+            (FilterPreview.location_id == location_uuid) &
+            (FilterPreview.airline == airline)
+        )
+    ).first()
+
+    if not preview:
+        return None
+
+    # Reconstruct FilterPreviewResult from saved data
+    result_data = preview.result
+    preview_result = FilterPreviewResult(
+        location_id=location_uuid,
+        airline=airline,
+        changes=[TripChange(**change) for change in result_data["changes"]],
+        exclusions=[FilterExclusion(**excl) for excl in result_data["exclusions"]],
+        summary=result_data["summary"],
+        total_trips_evaluated=result_data["total_trips_evaluated"],
+        eligible_trips=result_data["eligible_trips"]
+    )
+
+    return FilterPreviewSaved(
+        preview_id=preview.id,
+        location_id=preview.location_id,
+        airline=preview.airline,
+        config=preview.config,
+        result=preview_result,
+        created_at=preview.created_at
+    )
+
+
+@router.get("/v1/locations/{location_id}/airlines/{airline}/trips/filters/eligibility")
+async def check_filter_eligibility(
+    location_id: str,
+    airline: str,
+    pick_up_date_from: Optional[str] = None,
+    pick_up_date_to: Optional[str] = None,
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["manager"]))
+):
+    """
+    Diagnóstico de elegibilidad de trips para Ground Filters.
+
+    Retorna un desglose detallado de por qué ciertos trips NO son elegibles
+    para aplicar filtros ground (reduce/combine/expand).
+
+    Ground Filters SOLO aplican a trips con:
+    - trip_type = 'outbound' (Hotel → Airport)
+    - status = 'scheduled'
+    - filter_applied IS NULL (sin filtros previos)
+
+    NO aplica a:
+    - trip_type = 'inbound' (Airport → Hotel)
+    - trip_type = 'ground' (Hotel → Hotel)
+    - status = 'completed', 'cancelled', 'en_route'
+    - Trips con filtros ya aplicados
+
+    Ejemplo de uso:
+    ```
+    GET /v1/locations/{id}/airlines/WN/trips/filters/eligibility?pick_up_date_from=2025-12-01&pick_up_date_to=2025-12-31
+    ```
+
+    Response:
+    ```json
+    {
+        "total_trips": 674,
+        "eligible_trips": 0,
+        "by_trip_type": {
+            "outbound": 0,
+            "inbound": 337,
+            "ground": 337
+        },
+        "by_status": {
+            "scheduled": 674,
+            "completed": 0,
+            "cancelled": 0
+        },
+        "eligible_breakdown": {
+            "outbound_scheduled_no_filter": 0,
+            "outbound_scheduled_with_filter": 0,
+            "outbound_other_status": 0
+        },
+        "reason": "No trips with trip_type='outbound' found in date range"
+    }
+    ```
+    """
+    from datetime import date
+
+    try:
+        location_uuid = UUID(location_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de location inválido")
+
+    airline = airline.strip().upper()
+    if not airline or len(airline) < 2:
+        raise HTTPException(status_code=400, detail="Airline inválido")
+
+    # Parse date filters
+    date_from = date.fromisoformat(pick_up_date_from) if pick_up_date_from else None
+    date_to = date.fromisoformat(pick_up_date_to) if pick_up_date_to else None
+
+    # Build base filter
+    base_filters = [
+        TripDB.location_id == location_uuid,
+        TripDB.airline == airline
+    ]
+
+    if date_from:
+        base_filters.append(TripDB.pick_up_date >= date_from)
+    if date_to:
+        base_filters.append(TripDB.pick_up_date <= date_to)
+
+    from functools import reduce as reduce_fn
+    combined_base_filter = reduce_fn(lambda a, b: a & b, base_filters)
+
+    # 1. Total trips in date range
+    total_trips_query = Select(TripDB).Where(combined_base_filter)
+    total_trips = await session.exec(total_trips_query).all()
+    total_count = len(total_trips)
+
+    # 2. Breakdown by trip_type
+    by_trip_type = {}
+    for trip in total_trips:
+        trip_type = trip.trip_type or "unknown"
+        by_trip_type[trip_type] = by_trip_type.get(trip_type, 0) + 1
+
+    # 3. Breakdown by status
+    by_status = {}
+    for trip in total_trips:
+        status = trip.status or "unknown"
+        by_status[status] = by_status.get(status, 0) + 1
+
+    # 4. Eligible trips breakdown (only outbound)
+    outbound_trips = [t for t in total_trips if t.trip_type == TripType.OUTBOUND]
+
+    outbound_scheduled_no_filter = len([
+        t for t in outbound_trips
+        if t.status == TripStatus.SCHEDULED and t.filter_applied is None
+    ])
+
+    outbound_scheduled_with_filter = len([
+        t for t in outbound_trips
+        if t.status == TripStatus.SCHEDULED and t.filter_applied is not None
+    ])
+
+    outbound_other_status = len([
+        t for t in outbound_trips
+        if t.status != TripStatus.SCHEDULED
+    ])
+
+    # 5. Determine reason for 0 eligible trips
+    reason = None
+    if outbound_scheduled_no_filter == 0:
+        if len(outbound_trips) == 0:
+            reason = f"No trips with trip_type='outbound' found. All {total_count} trips are type: {', '.join(by_trip_type.keys())}"
+        elif outbound_scheduled_with_filter > 0:
+            reason = f"All {len(outbound_trips)} outbound trips already have filters applied. Use /revert to clear filters first."
+        elif outbound_other_status > 0:
+            reason = f"All {len(outbound_trips)} outbound trips have status other than 'scheduled': {', '.join(by_status.keys())}"
+        else:
+            reason = "Unknown reason - check database integrity"
+
+    return {
+        "total_trips": total_count,
+        "eligible_trips": outbound_scheduled_no_filter,
+        "by_trip_type": by_trip_type,
+        "by_status": by_status,
+        "eligible_breakdown": {
+            "outbound_scheduled_no_filter": outbound_scheduled_no_filter,
+            "outbound_scheduled_with_filter": outbound_scheduled_with_filter,
+            "outbound_other_status": outbound_other_status
+        },
+        "reason": reason,
+        "criteria": {
+            "info": "Ground Filters only apply to trips matching ALL criteria below",
+            "required": {
+                "trip_type": "outbound",
+                "status": "scheduled",
+                "filter_applied": None
+            },
+            "excluded": {
+                "trip_types": ["inbound", "ground"],
+                "statuses": ["completed", "cancelled", "en_route"],
+                "with_filters": ["reduce", "combine", "expand"]
+            }
+        }
+    }
 
 
 @router.post("/v1/locations/{location_id}/airlines/{airline}/trips/filters/apply")
@@ -1203,11 +1930,21 @@ async def apply_filters(
     if not location:
         raise HTTPException(status_code=404, detail="Location no encontrada")
 
-    # Obtener formato de hora del usuario
-    time_format = await get_user_time_format(request, session)
+    # Usar time_format del request body si está presente, sino obtener del usuario
+    time_format = filters.time_format or await get_user_time_format(request, session)
 
+    # ========================================================================
+    # V4: Independent filters - no auto-revert needed
+    # Each filter can be applied independently using boolean fields
+    # ========================================================================
+
+    # Apply filters directly (no auto-revert needed with independent fields)
     service = TripFilterService(session)
     result = await service.apply(location_uuid, airline, filters, time_format)
+
+    # Clear saved preview since it's now applied
+    # This ensures Device B won't see stale preview data
+    await clear_filter_preview(session, location_uuid, airline)
 
     return result
 
@@ -1338,6 +2075,267 @@ async def revert_partial_filter(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al revertir filtro parcial: {str(e)}")
+
+
+@router.get("/v1/locations/{location_id}/airlines/{airline}/trips/filters/current")
+async def get_current_filters(
+    location_id: str,
+    airline: str,
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["manager"]))
+) -> FilterCurrentResponse:
+    """
+    Obtiene la configuración activa de filtros para una location y airline específica.
+
+    Este endpoint permite a los managers ver la configuración actual de filtros
+    desde cualquier dispositivo, proporcionando:
+    - Estado de filtros activos (reduce, combine, expand)
+    - Configuración completa aplicada
+    - Número de trips afectados
+    - Fecha de aplicación
+
+    Solo managers pueden acceder a este endpoint.
+
+    Args:
+        location_id: ID de la location
+        airline: Código de aerolínea (ej: WN, AA)
+
+    Returns:
+        FilterCurrentResponse con configuración activa o indicación de que no hay filtros activos
+    """
+    from shared.db.schemas.trips.filter_batches import FilterBatch
+
+    try:
+        location_uuid = UUID(location_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de location inválido")
+
+    # Validar airline
+    airline = airline.strip().upper()
+    if not airline or len(airline) < 2:
+        raise HTTPException(status_code=400, detail="Airline inválido")
+
+    # Validar existencia de location
+    location = await session.exec(
+        Select(Location).Where(Location.id == location_uuid)
+    ).first()
+
+    if not location:
+        raise HTTPException(status_code=404, detail="Location no encontrada")
+
+    # ========================================================================
+    # V5: Use independent boolean fields instead of filter_applied
+    # This ensures /filters/current returns the ACTUAL current state
+    # ========================================================================
+
+    # Count trips with each filter type active (V5 boolean fields)
+    reduced_count_result = await session.exec(
+        Select(Count(TripDB.id))
+        .From(TripDB)
+        .Where(
+            (TripDB.location_id == location_uuid) &
+            (TripDB.airline == airline) &
+            (TripDB.reduce_applied == True)
+        )
+    ).first()
+    reduced_count = reduced_count_result[0] if reduced_count_result else 0
+
+    combined_count_result = await session.exec(
+        Select(Count(TripDB.id))
+        .From(TripDB)
+        .Where(
+            (TripDB.location_id == location_uuid) &
+            (TripDB.airline == airline) &
+            (TripDB.combine_applied == True)
+        )
+    ).first()
+    combined_count = combined_count_result[0] if combined_count_result else 0
+
+    expanded_count_result = await session.exec(
+        Select(Count(TripDB.id))
+        .From(TripDB)
+        .Where(
+            (TripDB.location_id == location_uuid) &
+            (TripDB.airline == airline) &
+            (TripDB.expand_applied == True)
+        )
+    ).first()
+    expanded_count = expanded_count_result[0] if expanded_count_result else 0
+
+    # Calculate total UNIQUE trips with any filter applied
+    # Note: A trip can have multiple filters, so we can't just sum the counts
+    trips_affected_result = await session.exec(
+        Select(Count(TripDB.id))
+        .From(TripDB)
+        .Where(
+            (TripDB.location_id == location_uuid) &
+            (TripDB.airline == airline) &
+            (
+                (TripDB.reduce_applied == True) |
+                (TripDB.combine_applied == True) |
+                (TripDB.expand_applied == True)
+            )
+        )
+    ).first()
+    trips_affected = trips_affected_result[0] if trips_affected_result else 0
+
+    # Determine which filters are currently active
+    filters_active = []
+    if reduced_count > 0:
+        filters_active.append("reduce")
+    if combined_count > 0:
+        filters_active.append("combine")
+    if expanded_count > 0:
+        filters_active.append("expand")
+
+    # If no filters are active, return empty state
+    if not filters_active:
+        return FilterCurrentResponse(
+            has_active_filters=False,
+            batch_id=None,
+            applied_at=None,
+            filters_active=[],
+            config=None,
+            trips_affected=0,
+            summary=None
+        )
+
+    # Get latest batch for metadata (batch_id, applied_at, config)
+    latest_batch_result = await session.exec(
+        Select(FilterBatch)
+        .Where(
+            (FilterBatch.location_id == location_uuid) &
+            (FilterBatch.airline == airline)
+        )
+        .OrderBy(FilterBatch.created_at.Desc())
+        .Limit(1)
+    ).first()
+    latest_batch = latest_batch_result
+
+    # Build summary
+    summary = {
+        "reduced": reduced_count,
+        "combined": combined_count,
+        "expanded": expanded_count
+    }
+
+    # Return current filter state (V5: based on boolean fields, not batch)
+    return FilterCurrentResponse(
+        has_active_filters=True,
+        batch_id=latest_batch.id if latest_batch else None,
+        applied_at=latest_batch.created_at if latest_batch else None,
+        filters_active=filters_active,  # V5: Based on actual boolean fields
+        config=latest_batch.config if latest_batch else None,
+        trips_affected=trips_affected,
+        summary=summary
+    )
+
+
+@router.get("/v1/locations/{location_id}/airlines/{airline}/trips/filters/history")
+async def get_filters_history(
+    location_id: str,
+    airline: str,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(10, ge=1, le=100),
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["manager"]))
+) -> FilterHistoryResponse:
+    """
+    Obtiene el historial de aplicaciones de filtros para una location y airline específica.
+
+    Este endpoint proporciona auditoría completa de todas las veces que se aplicaron
+    filtros, incluyendo:
+    - Batches aplicados en orden cronológico inverso
+    - Estado de cada batch (activo o revertido)
+    - Filtros que fueron parcialmente revertidos
+    - Número de trips afectados por cada aplicación
+
+    Paginación incluida para manejar historiales largos.
+    Solo managers pueden acceder a este endpoint.
+
+    Args:
+        location_id: ID de la location
+        airline: Código de aerolínea (ej: WN, AA)
+        skip: Número de registros a saltar (para paginación)
+        limit: Máximo de registros a retornar (1-100)
+
+    Returns:
+        FilterHistoryResponse con lista paginada de batches históricos
+    """
+    from shared.db.schemas.trips.filter_batches import FilterBatch
+
+    try:
+        location_uuid = UUID(location_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de location inválido")
+
+    # Validar airline
+    airline = airline.strip().upper()
+    if not airline or len(airline) < 2:
+        raise HTTPException(status_code=400, detail="Airline inválido")
+
+    # Validar existencia de location
+    location = await session.exec(
+        Select(Location).Where(Location.id == location_uuid)
+    ).first()
+
+    if not location:
+        raise HTTPException(status_code=404, detail="Location no encontrada")
+
+    # Contar total de batches para esta location + airline
+    total_count_result = await session.exec(
+        Select(Count(FilterBatch.id))
+        .From(FilterBatch)
+        .Where(
+            (FilterBatch.location_id == location_uuid) &
+            (FilterBatch.airline == airline)
+        )
+    ).first()
+    total = total_count_result[0] if total_count_result else 0
+
+    # Obtener batches paginados
+    batches = await session.exec(
+        Select(FilterBatch)
+        .Where(
+            (FilterBatch.location_id == location_uuid) &
+            (FilterBatch.airline == airline)
+        )
+        .OrderBy(FilterBatch.created_at.Desc())
+        .Offset(skip)
+        .Limit(limit)
+    ).all()
+
+    # Para cada batch, verificar si está activo (si hay trips con ese batch_id)
+    history_items = []
+    for batch in batches:
+        trips_count_result = await session.exec(
+            Select(Count(TripDB.id))
+            .From(TripDB)
+            .Where(TripDB.filter_batch_id == batch.id)
+        ).first()
+        active_trips = trips_count_result[0] if trips_count_result else 0
+        is_active = active_trips > 0
+
+        # Determinar filtros que fueron revertidos parcialmente
+        reverted_filters = []
+        if batch.revert_history:
+            reverted_filters = list(batch.revert_history.keys())
+
+        history_items.append(FilterHistoryItem(
+            batch_id=batch.id,
+            applied_at=batch.created_at,
+            filters_applied=batch.filters_applied,
+            trips_affected=batch.trips_affected,
+            is_active=is_active,
+            reverted_filters=reverted_filters
+        ))
+
+    return FilterHistoryResponse(
+        data=history_items,
+        total=total,
+        skip=skip,
+        limit=limit
+    )
 
 
 # =============================================================================
@@ -1566,6 +2564,593 @@ async def search_trips(
             "id": str(location.id),
             "name": location.name
         }
+    }
+
+
+# ============================================================================
+# Filter Preview Persistence Helper Functions
+# ============================================================================
+
+async def save_filter_preview(
+    session: AsyncSession,
+    location_id: UUID,
+    airline: str,
+    filters: FilterRequest,
+    result: FilterPreviewResult
+):
+    """
+    Save or replace the preview for this location+airline.
+
+    This allows preview data to be shared across devices for the same account.
+    The preview is replaced (UPSERT behavior) when a new preview is requested.
+    """
+    from shared.db.schemas import FilterPreview
+    from psqlmodel import Select
+
+    # Delete existing preview for this location+airline (UPSERT pattern)
+    existing = await session.exec(
+        Select(FilterPreview).Where(
+            (FilterPreview.location_id == location_id) &
+            (FilterPreview.airline == airline)
+        )
+    )
+    for preview in existing:
+        await session.delete(preview)
+
+    # Create new preview record
+    preview = FilterPreview(
+        location_id=location_id,
+        airline=airline,
+        config=filters.model_dump(mode="json"),
+        result={
+            "changes": [change.model_dump(mode="json") for change in result.changes],
+            "exclusions": [excl.model_dump(mode="json") for excl in result.exclusions],
+            "summary": result.summary,
+            "total_trips_evaluated": result.total_trips_evaluated,
+            "eligible_trips": result.eligible_trips
+        }
+    )
+
+    session.add(preview)
+    await session.commit()
+
+
+async def clear_filter_preview(
+    session: AsyncSession,
+    location_id: UUID,
+    airline: str
+):
+    """
+    Delete saved preview when filters are applied.
+
+    This ensures stale previews are not shown after the filters become reality.
+    """
+    from shared.db.schemas import FilterPreview
+    from psqlmodel import Select
+
+    existing = await session.exec(
+        Select(FilterPreview).Where(
+            (FilterPreview.location_id == location_id) &
+            (FilterPreview.airline == airline)
+        )
+    )
+    for preview in existing:
+        await session.delete(preview)
+
+    await session.commit()
+
+
+# ============================================================================
+# QR CODE ENDPOINTS (Public - No authentication required)
+# ============================================================================
+
+@router.get("/v1/crew-lookup/health")
+async def qr_health_check(
+    session: AsyncSession = Depends(get_db)
+):
+    """
+    Health check for QR code system.
+    Returns table status and count of QR codes.
+    Public endpoint for debugging.
+    """
+    from shared.db.schemas import QRCode
+
+    try:
+        # Try to count QR codes to verify table exists and is accessible
+        qr_codes = await session.exec(Select(QRCode))
+
+        # Convert to list if it's not already
+        if not isinstance(qr_codes, list):
+            qr_codes = list(qr_codes) if qr_codes else []
+
+        return {
+            "status": "healthy",
+            "table_exists": True,
+            "qr_codes_count": len(qr_codes),
+            "qr_codes": [
+                {
+                    "id": str(qr.id),
+                    "name": qr.name,
+                    "status": qr.status,
+                    "location_id": str(qr.location_id)
+                }
+                for qr in qr_codes[:10]  # Limit to 10 for safety
+            ]
+        }
+    except Exception as e:
+        import traceback
+        return {
+            "status": "error",
+            "table_exists": False,
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "hint": "The entities.qr_codes table may not exist. Run migrations or create table manually."
+        }
+
+
+@router.get("/v1/crew-lookup/config")
+async def get_qr_config(
+    qr_id: str = Query(..., description="QR code ID"),
+    session: AsyncSession = Depends(get_db)
+):
+    """
+    Get configuration for QR code crew lookup.
+
+    Public endpoint (no authentication required).
+    Returns the airlines, location info, and settings for the given QR code.
+
+    Example: /v1/crew-lookup/config?qr_id=123e4567-e89b-12d3-a456-426614174000
+    """
+    from shared.db.schemas import QRCode, QRCodeStatus
+
+    # Validate QR ID format
+    try:
+        qr_uuid = UUID(qr_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid QR code ID format")
+
+    # Log the request for debugging
+    print(f"[QR-LOOKUP] Searching for QR code: {qr_id}")
+
+    # Get QR code from database
+    qr_code = await session.exec(
+        Select(QRCode).Where(QRCode.id == qr_uuid)
+    ).first()
+
+    if not qr_code:
+        # Log for debugging
+        print(f"[QR-LOOKUP] QR code NOT FOUND: {qr_id}")
+
+        # Try to get count of all QR codes for debugging
+        try:
+            all_qrs = await session.exec(Select(QRCode))
+            qr_list = all_qrs.all()
+            print(f"[QR-LOOKUP] Total QR codes in database: {len(qr_list)}")
+            if qr_list:
+                print(f"[QR-LOOKUP] Available QR IDs: {[str(qr.id) for qr in qr_list[:5]]}")
+        except Exception as e:
+            print(f"[QR-LOOKUP] Error counting QR codes: {e}")
+
+        raise HTTPException(
+            status_code=404,
+            detail="QR code not found. The QR needs to be activated by a manager opening the dashboard first."
+        )
+
+    print(f"[QR-LOOKUP] QR code FOUND: {qr_id}, location: {qr_code.location_id}")
+
+    # Check if QR code is disabled
+    if qr_code.status == QRCodeStatus.DISABLED:
+        raise HTTPException(status_code=403, detail="QR code is disabled")
+
+    # Get location information
+    location = await session.exec(
+        Select(Location).Where(Location.id == qr_code.location_id)
+    ).first()
+
+    if not location:
+        raise HTTPException(status_code=404, detail="Location not found")
+
+    # Get airlines from QR code or derive from location's trips
+    airlines = qr_code.airlines
+    if not airlines:
+        # If QR doesn't have specific airlines, get all airlines from trips at this location
+        airlines_stmt = (
+            Select(TripDB.airline)
+            .Where(TripDB.location_id == qr_code.location_id)
+            .Distinct()
+        )
+        rows = await session.exec(airlines_stmt).all()
+
+        # Extract airline strings from rows (psqlmodel returns Row objects)
+        airlines = []
+        for row in rows:
+            if row is None:
+                continue
+            # If row is a string, use directly
+            if isinstance(row, str):
+                airlines.append(row)
+            # If row is tuple or has index, extract first element
+            elif hasattr(row, '__getitem__'):
+                val = row[0] if len(row) > 0 else None
+                if val and isinstance(val, str):
+                    airlines.append(val)
+            # If row has airline attribute
+            elif hasattr(row, 'airline'):
+                if row.airline:
+                    airlines.append(str(row.airline))
+
+    # Update scan count and last scanned time (fire and forget)
+    try:
+        qr_code.scan_count += 1
+        qr_code.last_scanned_at = datetime.now(timezone.utc)
+        session.add(qr_code)
+        await session.commit()
+    except Exception as e:
+        # Don't fail the request if analytics update fails
+        print(f"Failed to update QR scan analytics: {e}")
+        await session.rollback()
+
+    return {
+        "qr_id": str(qr_code.id),
+        "organization_id": str(qr_code.organization_id),
+        "location_id": str(qr_code.location_id),
+        "location_name": location.name,
+        "airlines": airlines or [],
+        "default_trip_type": "outbound",
+        "timezone": location.timezone,
+        "status": qr_code.status
+    }
+
+
+@router.get("/v1/trips/search/qr")
+async def search_trip_qr(
+    qr_id: str = Query(..., description="QR code ID"),
+    airline: str = Query(..., description="Airline code (e.g., WN, AA)"),
+    date: str = Query(..., description="Pickup date (YYYY-MM-DD) in location's timezone"),
+    flight: str = Query(..., description="Flight number"),
+    type: Optional[str] = Query(None, description="Trip type: inbound, outbound, or ground (optional filter)"),
+    session: AsyncSession = Depends(get_db)
+):
+    """
+    Search for a trip using QR code authentication.
+
+    Public endpoint (no authentication required).
+    Validates the QR code and searches for the trip within its scope.
+
+    REQUIRED INPUTS (minimum to find a trip):
+    - qr_id: The QR code UUID
+    - airline: Airline code (WN, AA, DL, etc.)
+    - date: Pickup date in YYYY-MM-DD format (interpreted in location's timezone)
+    - flight: Flight number
+
+    OPTIONAL:
+    - type: Filter by trip type (inbound/outbound/ground)
+
+    BEHAVIOR:
+    - If exactly 1 trip matches → returns trip data
+    - If multiple trips match → returns list for user to select
+    - If no trips match → returns 404
+
+    Example: /v1/trips/search/qr?qr_id=123&airline=WN&date=2026-01-15&flight=5468
+    """
+    from shared.db.schemas import QRCode, QRCodeStatus
+
+    # Validate QR ID format
+    try:
+        qr_uuid = UUID(qr_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid QR code ID format")
+
+    # Get and validate QR code
+    qr_code = await session.exec(
+        Select(QRCode).Where(QRCode.id == qr_uuid)
+    ).first()
+
+    if not qr_code:
+        raise HTTPException(status_code=404, detail="QR code not found")
+
+    if qr_code.status == QRCodeStatus.DISABLED:
+        raise HTTPException(status_code=403, detail="QR code is disabled")
+
+    # Validate that airline is allowed for this QR code
+    if qr_code.airlines and airline.upper() not in [a.upper() for a in qr_code.airlines]:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Airline {airline} is not allowed for this QR code"
+        )
+
+    # Validate trip type if provided
+    if type and type.lower() not in [TripType.INBOUND, TripType.OUTBOUND, TripType.GROUND]:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid trip type. Must be inbound, outbound, or ground"
+        )
+
+    # Validate date format
+    try:
+        pickup_date = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid date format. Use YYYY-MM-DD"
+        )
+
+    # Normalize airline and flight number
+    airline_normalized = airline.strip().upper()
+    flight_normalized = flight.strip()
+
+    # Get location info first (needed for timezone)
+    location = await session.exec(
+        Select(Location).Where(Location.id == qr_code.location_id)
+    ).first()
+
+    if not location:
+        raise HTTPException(status_code=404, detail="Location not found")
+
+    # Build query for trips
+    query_conditions = [
+        (TripDB.location_id == qr_code.location_id),
+        (TripDB.airline == airline_normalized),
+        (TripDB.flight_number == flight_normalized),
+        (TripDB.pick_up_date == pickup_date)
+    ]
+
+    # Add type filter if provided
+    if type:
+        query_conditions.append(TripDB.trip_type == type.lower())
+
+    # Search for trips matching criteria
+    trips = await session.exec(
+        Select(TripDB).Where(*query_conditions).OrderBy(TripDB.pick_up_time)
+    ).all()
+
+    if not trips:
+        raise HTTPException(status_code=404, detail="No trips found matching criteria")
+
+    def format_trip_response(trip):
+        """Format a single trip for response."""
+        # Normalize riders data (handle old typo format and new format)
+        riders_data = {"pilots": 0, "flight_attendants": 0}
+        if trip.riders:
+            if "pilots" in trip.riders and "flight_attendants" in trip.riders:
+                riders_data = trip.riders
+            elif "fligth" in trip.riders or "in_fligth" in trip.riders:
+                riders_data = {
+                    "pilots": trip.riders.get("fligth", 0),
+                    "flight_attendants": trip.riders.get("in_fligth", 0)
+                }
+
+        return {
+            "id": str(trip.id),
+            "pick_up_time": trip.pick_up_time.strftime("%H:%M"),
+            "pick_up_location": trip.pick_up_location,
+            "drop_off_location": trip.drop_off_location,
+            "airline": trip.airline,
+            "flight_number": trip.flight_number,
+            "trip_type": trip.trip_type,
+            "status": trip.status,
+            "riders": riders_data
+        }
+
+    # Update scan count for analytics
+    qr_code.scan_count = (qr_code.scan_count or 0) + 1
+    qr_code.last_scanned_at = datetime.utcnow()
+    session.add(qr_code)
+    await session.commit()
+
+    # Build response with location context
+    response_base = {
+        "location": {
+            "id": str(location.id),
+            "name": location.name,
+            "timezone": location.timezone  # Document timezone for date interpretation
+        },
+        "query": {
+            "airline": airline_normalized,
+            "flight_number": flight_normalized,
+            "date": date,
+            "type_filter": type
+        }
+    }
+
+    # If exactly 1 trip, return it directly
+    if len(trips) == 1:
+        return {
+            **response_base,
+            "data": format_trip_response(trips[0]),
+            "multiple_results": False
+        }
+
+    # If multiple trips, return list for user selection
+    return {
+        **response_base,
+        "data": [format_trip_response(t) for t in trips],
+        "multiple_results": True,
+        "message": f"Found {len(trips)} trips. Please select one or add type filter (inbound/outbound/ground)."
+    }
+
+
+# ============================================================================
+# QR CODE MANAGEMENT ENDPOINTS (Authentication required)
+# ============================================================================
+
+@router.get("/v1/organizations/{organization_id}/locations/{location_id}/qr-code")
+async def get_qr_code(
+    organization_id: str,
+    location_id: str,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["manager"]))
+):
+    """
+    Get the QR code for a specific location.
+
+    Each location has exactly ONE QR code (1:1 relationship).
+    Returns 404 if no QR code exists for this location yet.
+    Use POST to create the QR code if it doesn't exist.
+    """
+    from shared.db.schemas import QRCode
+
+    # Validate UUIDs
+    try:
+        org_uuid = UUID(organization_id)
+        loc_uuid = UUID(location_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid UUID format")
+
+    # Verify user has access to this organization
+    user_data = request.state.user_data
+    user_org_id = user_data.get("organization_id")
+
+    if str(user_org_id) != organization_id:
+        raise HTTPException(status_code=403, detail="No access to this organization")
+
+    # Verify location belongs to organization
+    location = await session.exec(
+        Select(Location).Where(
+            (Location.id == loc_uuid) &
+            (Location.organization_id == org_uuid)
+        )
+    ).first()
+
+    if not location:
+        raise HTTPException(status_code=404, detail="Location not found in this organization")
+
+    # Get the QR code for this location (exactly 1 per location)
+    qr_code = await session.exec(
+        Select(QRCode).Where(QRCode.location_id == loc_uuid)
+    ).first()
+
+    if not qr_code:
+        raise HTTPException(
+            status_code=404,
+            detail="No QR code exists for this location. Use POST to create one."
+        )
+
+    return {
+        "id": str(qr_code.id),
+        "organization_id": str(qr_code.organization_id),
+        "location_id": str(qr_code.location_id),
+        "name": qr_code.name,
+        "airlines": qr_code.airlines,
+        "status": qr_code.status,
+        "qr_url": f"https://web.gt360.app/crew-lookup?qr={qr_code.id}",
+        "scan_count": qr_code.scan_count,
+        "last_scanned_at": qr_code.last_scanned_at.isoformat() if qr_code.last_scanned_at else None,
+        "created_at": qr_code.created_at.isoformat(),
+        "updated_at": qr_code.updated_at.isoformat()
+    }
+
+
+@router.post("/v1/organizations/{organization_id}/locations/{location_id}/qr-code")
+async def get_or_create_qr_code(
+    organization_id: str,
+    location_id: str,
+    qr_data: CreateQRCode,
+    request: Request,
+    response: Response,
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["manager"]))
+):
+    """
+    Get or create the QR code for a location (idempotent).
+
+    LOGIC:
+    - If QR already exists for this location → returns existing QR (status 200)
+    - If no QR exists → creates new QR with frontend-provided UUID (status 201)
+
+    Each location has exactly ONE QR code (1:1 relationship).
+    The QR URL is stable and never changes once created.
+
+    IMPORTANT: The UUID comes from the frontend (crypto.randomUUID()).
+    This allows the QR code to be displayed immediately in the UI.
+    """
+    from shared.db.schemas import QRCode, QRCodeStatus
+
+    # Validate UUIDs
+    try:
+        org_uuid = UUID(organization_id)
+        loc_uuid = UUID(location_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid UUID format")
+
+    # Verify user has access to this organization
+    user_data = request.state.user_data
+    user_org_id = user_data.get("organization_id")
+
+    if str(user_org_id) != organization_id:
+        raise HTTPException(status_code=403, detail="No access to this organization")
+
+    # Verify location belongs to organization
+    location = await session.exec(
+        Select(Location).Where(
+            (Location.id == loc_uuid) &
+            (Location.organization_id == org_uuid)
+        )
+    ).first()
+
+    if not location:
+        raise HTTPException(status_code=404, detail="Location not found in this organization")
+
+    # Check if QR already exists for this location (1:1 relationship)
+    existing_qr = await session.exec(
+        Select(QRCode).Where(QRCode.location_id == loc_uuid)
+    ).first()
+
+    if existing_qr:
+        # Return existing QR (idempotent) with 200 status
+        response.status_code = 200
+        return {
+            "id": str(existing_qr.id),
+            "organization_id": str(existing_qr.organization_id),
+            "location_id": str(existing_qr.location_id),
+            "name": existing_qr.name,
+            "airlines": existing_qr.airlines,
+            "status": existing_qr.status,
+            "qr_url": f"https://web.gt360.app/crew-lookup?qr={existing_qr.id}",
+            "scan_count": existing_qr.scan_count,
+            "last_scanned_at": existing_qr.last_scanned_at.isoformat() if existing_qr.last_scanned_at else None,
+            "created_at": existing_qr.created_at.isoformat(),
+            "updated_at": existing_qr.updated_at.isoformat(),
+            "created": False  # Indicates this was already existing
+        }
+
+    # Create new QR code with frontend-provided UUID
+    qr_code = QRCode(
+        id=qr_data.id,  # UUID from frontend
+        organization_id=org_uuid,
+        location_id=loc_uuid,
+        name=qr_data.name or f"QR - {location.name}",
+        airlines=qr_data.airlines,
+        status=QRCodeStatus.ACTIVE,
+        metadata=qr_data.metadata,
+        scan_count=0
+    )
+
+    session.add(qr_code)
+
+    try:
+        await session.commit()
+        await session.refresh(qr_code)
+    except Exception as e:
+        await session.rollback()
+        raise HTTPException(status_code=400, detail=f"Failed to create QR code: {str(e)}")
+
+    # Return new QR code with 201 status
+    response.status_code = 201
+    return {
+        "id": str(qr_code.id),
+        "organization_id": str(qr_code.organization_id),
+        "location_id": str(qr_code.location_id),
+        "name": qr_code.name,
+        "airlines": qr_code.airlines,
+        "status": qr_code.status,
+        "qr_url": f"https://web.gt360.app/crew-lookup?qr={qr_code.id}",
+        "scan_count": qr_code.scan_count,
+        "last_scanned_at": qr_code.last_scanned_at.isoformat() if qr_code.last_scanned_at else None,
+        "created_at": qr_code.created_at.isoformat(),
+        "updated_at": qr_code.updated_at.isoformat(),
+        "created": True  # Indicates this was newly created
     }
 
 

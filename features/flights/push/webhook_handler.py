@@ -5,207 +5,159 @@ When a flight status changes, AeroDataBox calls this webhook.
 We process the notification and:
 1. Publish to Redis for WebSocket clients
 2. If flight departed, activate real-time tracking
+3. Log all events to WEBHOOK_EVENTS.json for debugging
 """
 
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+import json
+import asyncio
+import logging
+from pathlib import Path
+from typing import Any, Dict
 
 from fastapi import APIRouter, Request, HTTPException, Query
 from fastapi.responses import JSONResponse
 
-from features.flights.models.tracking_models import (
-    PushNotification,
-    FlightTrackingState,
-    FlightStatus,
-    TrackingInterval,
-)
+from features.flights.models.tracking_models import PushNotification
 from features.flights.services.tracking_cache import get_tracking_cache
+from features.flights.utils.webhook_utils import (
+    utcnow,
+    is_valid_aerodatabox_request,
+    parse_aerodatabox_notification,
+)
 
 
 router = APIRouter(tags=["Flight Webhooks"])
+logger = logging.getLogger(__name__)
+
+# Path to webhook events log file
+WEBHOOK_EVENTS_FILE = Path(__file__).parent / "WEBHOOK_EVENTS.json"
+
+# Lock for thread-safe file writes
+_file_lock = asyncio.Lock()
 
 
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def parse_aerodatabox_notification(payload: Dict[str, Any]) -> PushNotification:
+async def save_webhook_event(
+    payload: Dict[str, Any],
+    trip_id: str,
+    date: str | None,
+    processed_status: str | None,
+    tracking_active: bool,
+    note: str | None = None,
+    error: str | None = None,
+) -> None:
     """
-    Parse AeroDataBox webhook payload into PushNotification.
+    Save webhook event to JSON file for debugging and analysis.
 
-    AeroDataBox sends flight status updates in various formats.
-    This function normalizes the data.
+    Args:
+        payload: Raw payload from AeroDataBox
+        trip_id: Trip ID from query params
+        date: Date from query params
+        processed_status: Status after processing
+        tracking_active: Whether tracking was activated
+        note: Extra context (e.g. ignored reasons)
+        error: Error message if processing failed
     """
-    # Extract flight number from various possible fields
-    flight_number = (
-        payload.get("number") or
-        payload.get("flightNumber") or
-        payload.get("flight", {}).get("number") or
-        payload.get("flightIata") or
-        payload.get("flightIcao")
-    )
+    event = {
+        "received_at": utcnow().isoformat(),
+        "trip_id": trip_id,
+        "date": date,
+        "processed_status": processed_status,
+        "tracking_active": tracking_active,
+        "raw_payload": payload,
+    }
 
-    # Extract status
-    status_raw = payload.get("status")
-    if isinstance(status_raw, dict):
-        status = status_raw.get("value") or status_raw.get("status")
-    else:
-        status = status_raw
+    if note:
+        event["note"] = note
+    if error:
+        event["error"] = error
 
-    # Extract departure info
-    departure = payload.get("departure", {})
-    dep_airport = (
-        departure.get("airport", {}).get("iata") or
-        departure.get("airport", {}).get("icao") or
-        departure.get("iata") or
-        payload.get("departureAirport")
-    )
+    try:
+        WEBHOOK_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-    dep_scheduled = departure.get("scheduledTime", {}).get("utc")
-    dep_estimated = departure.get("revisedTime", {}).get("utc")
-    dep_actual = departure.get("runwayTime", {}).get("utc")
+        async with _file_lock:
+            # Read existing events
+            events = []
+            if WEBHOOK_EVENTS_FILE.exists():
+                try:
+                    content = WEBHOOK_EVENTS_FILE.read_text()
+                    if content.strip():
+                        events = json.loads(content)
+                except (json.JSONDecodeError, Exception):
+                    # If file is corrupted, start fresh
+                    events = []
 
-    # Extract arrival info
-    arrival = payload.get("arrival", {})
-    arr_airport = (
-        arrival.get("airport", {}).get("iata") or
-        arrival.get("airport", {}).get("icao") or
-        arrival.get("iata") or
-        payload.get("arrivalAirport")
-    )
+            # Append new event
+            events.append(event)
 
-    arr_scheduled = arrival.get("scheduledTime", {}).get("utc")
-    arr_estimated = arrival.get("revisedTime", {}).get("utc")
-    arr_actual = arrival.get("runwayTime", {}).get("utc")
-
-    return PushNotification(
-        flight_number=flight_number,
-        flight_iata=payload.get("flightIata"),
-        flight_icao=payload.get("flightIcao"),
-        status=status,
-        departure_airport=dep_airport,
-        departure_scheduled=dep_scheduled,
-        departure_estimated=dep_estimated,
-        departure_actual=dep_actual,
-        arrival_airport=arr_airport,
-        arrival_scheduled=arr_scheduled,
-        arrival_estimated=arr_estimated,
-        arrival_actual=arr_actual,
-        raw=payload,
-        received_at=utcnow().isoformat(),
-    )
-
-
-def should_activate_tracking(status: Optional[str]) -> bool:
-    """Determine if we should start real-time tracking based on status."""
-    if not status:
-        return False
-
-    status_upper = status.upper()
-
-    # Activate tracking when flight departs
-    return status_upper in [
-        "DEPARTED",
-        "ENROUTE",
-        "INFLIGHT",
-        "AIRBORNE",
-        "TAKINGOFF",
-        "TAKING_OFF",
-    ]
-
-
-def should_stop_tracking(status: Optional[str]) -> bool:
-    """Determine if we should stop tracking based on status."""
-    if not status:
-        return False
-
-    status_upper = status.upper()
-
-    # Stop tracking when flight lands or is cancelled
-    return status_upper in [
-        "LANDED",
-        "ARRIVED",
-        "CANCELED",
-        "CANCELLED",
-        "DIVERTED",
-    ]
+            # Write back to file
+            WEBHOOK_EVENTS_FILE.write_text(
+                json.dumps(events, indent=2, default=str)
+            )
+    except Exception as exc:
+        logger.warning("No se pudo guardar evento del webhook: %s", exc)
 
 
 @router.post("/v1/webhooks/flights/push")
 async def receive_push_notification(
     request: Request,
-    trip_id: str = Query(..., description="Trip ID from subscription"),
-    date: str = Query(None, description="Date from subscription"),
+    trip_id: str | None = Query(None, description="Trip ID from subscription (optional)"),
+    date: str | None = Query(None, description="Date from subscription"),
 ):
     """
-    Receive push notification from AeroDataBox.
+    Receive push notification from AeroDataBox and fan it out to WebSocket listeners.
 
-    This endpoint is called by AeroDataBox when a subscribed flight
-    changes status.
-
-    Query params are passed from the subscription webhook URL.
+    Trip ID is now optional; if it is missing we fall back to the flight number
+    for routing the message to Redis/WS subscribers.
     """
+    if not is_valid_aerodatabox_request(request):
+        raise HTTPException(403, "Forbidden")
+
     try:
         payload = await request.json()
     except Exception:
+        await save_webhook_event(
+            payload={},
+            trip_id=trip_id or "",
+            date=date,
+            processed_status=None,
+            tracking_active=False,
+            note="invalid json payload",
+        )
         raise HTTPException(400, "Invalid JSON payload")
 
-    # Parse notification
-    notification = parse_aerodatabox_notification(payload)
+    # Normalize payload from AeroDataBox
+    notification: PushNotification = parse_aerodatabox_notification(payload)
+    target_trip_id = trip_id or notification.flight_number or "unknown"
 
-    if not notification.flight_number:
-        # Can't process without flight number
-        return JSONResponse({"status": "ignored", "reason": "no flight number"})
-
-    cache = await get_tracking_cache()
-
-    # Publish notification to Redis for WebSocket clients
-    await cache.publish_push_notification(notification, trip_id)
-
-    # Get or create tracking state
-    state = await cache.get_tracking_state(notification.flight_number, trip_id)
-
-    if not state:
-        state = FlightTrackingState(
-            flight_number=notification.flight_number,
-            trip_id=trip_id,
-            date_local=date or "",
-            status=FlightStatus.UNKNOWN,
-            is_tracking_active=False,
+    try:
+        cache = await get_tracking_cache()
+        await cache.publish_push_notification(notification, target_trip_id)
+    except Exception as exc:
+        await save_webhook_event(
+            payload=payload,
+            trip_id=target_trip_id,
+            date=date,
+            processed_status=notification.status,
+            tracking_active=False,
+            error=str(exc),
         )
+        raise
 
-    # Update status
-    if notification.status:
-        try:
-            state.status = FlightStatus(notification.status)
-        except ValueError:
-            state.status = FlightStatus.UNKNOWN
-
-    # Check if we should activate/deactivate tracking
-    if should_activate_tracking(notification.status):
-        state.is_tracking_active = True
-        state.current_interval = TrackingInterval.FAR
-        state.interval_seconds = 1200  # Start with 20 min, will adjust based on ETA
-
-    elif should_stop_tracking(notification.status):
-        state.is_tracking_active = False
-
-    # Save state
-    await cache.set_tracking_state(state)
-
-    # Update active flights set
-    await cache.update_tracking_active(
-        notification.flight_number,
-        trip_id,
-        state.is_tracking_active
+    # Save event to JSON file for debugging/traceability
+    await save_webhook_event(
+        payload=payload,
+        trip_id=target_trip_id,
+        date=date,
+        processed_status=notification.status,
+        tracking_active=False,
+        note="forwarded to ws",
     )
 
     return JSONResponse({
         "status": "ok",
         "flight_number": notification.flight_number,
-        "trip_id": trip_id,
+        "trip_id": target_trip_id,
         "flight_status": notification.status,
-        "tracking_active": state.is_tracking_active,
     })
 
 

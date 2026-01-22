@@ -70,6 +70,12 @@ class TripFilterService:
     - Respect Rule B: No-Collision Rule for Expand
     - Round results based on configured rounding mode (multiple_of_5 or odd_minutes)
     - Generate detailed logs
+
+    Preview Mode:
+    - Always calculates from original_pick_up_time (true original time)
+    - If reduce is enabled: combine/expand apply on top of reduced times
+    - If reduce is NOT enabled: combine/expand apply directly on original times
+    - This ensures preview always shows "what would happen if we apply these filters from scratch"
     """
 
     def __init__(self, session: AsyncSession):
@@ -79,6 +85,8 @@ class TripFilterService:
         self.exclusions: list[FilterExclusion] = []
         self.log: list[dict] = []
         self.rounding_mode: RoundingMode = RoundingMode.MULTIPLE_OF_5  # Default rounding mode
+        self.is_preview_mode: bool = False  # Track if we're in preview mode
+        self.reduce_enabled_in_request: bool = False  # Track if reduce is enabled in current request
 
     async def preview(
         self,
@@ -99,6 +107,10 @@ class TripFilterService:
         # Reset state
         self._reset_state()
 
+        # Set preview mode - this ensures we always calculate from original times
+        self.is_preview_mode = True
+        self.reduce_enabled_in_request = config.reduce and config.reduce.enabled
+
         # Set rounding mode from config
         self.rounding_mode = config.rounding_mode
 
@@ -112,6 +124,7 @@ class TripFilterService:
 
         logger.info(f"[FILTER] Eligible trips found: {total_evaluated} for location={location_id}, airline={airline}")
         logger.info(f"[FILTER] Config: reduce={config.reduce}, combine={config.combine}, expand={config.expand}")
+        logger.info(f"[FILTER] Preview mode: is_preview_mode={self.is_preview_mode}, reduce_enabled={self.reduce_enabled_in_request}")
 
         if not trips:
             return FilterPreviewResult(
@@ -144,8 +157,15 @@ class TripFilterService:
         # Build summary
         summary = self._build_summary()
 
+        # Consolidate changes: keep only the final state for each trip
+        # When multiple filters modify the same trip, we want to show:
+        # - original_time: the TRUE original time (before any filter)
+        # - new_time: the FINAL time (after all filters)
+        # - filter_applied: the LAST filter that modified it
+        consolidated_changes = self._consolidate_changes()
+
         # Format time fields according to user preference
-        formatted_changes = self._format_changes(self.changes, time_format)
+        formatted_changes = self._format_changes(consolidated_changes, time_format)
 
         return FilterPreviewResult(
             location_id=location_id,
@@ -163,18 +183,30 @@ class TripFilterService:
         airline: str,
         config: FilterRequest,
         time_format: str = "24h",
+        existing_batch_id: UUID = None,
+        skip_batch_record: bool = False,
     ) -> FilterApplyResult:
         """
         Apply filters and persist changes to database.
+
+        IMPORTANT: Apply always calculates from original_pick_up_time (same as preview).
+        This ensures consistency between preview and apply results.
 
         Args:
             location_id: UUID of the location
             airline: Airline code (e.g., "WN", "AA")
             config: Filter configuration
+            existing_batch_id: Optional. If provided, reuse this batch_id instead of creating new one.
+            skip_batch_record: If True, don't create a FilterBatch record (used when reusing existing batch).
         """
         # Reset state
         self._reset_state()
-        batch_id = uuid4()
+        batch_id = existing_batch_id if existing_batch_id else uuid4()
+
+        # Apply mode also uses "from original" logic to match preview behavior
+        # This ensures apply produces the same results as preview
+        self.is_preview_mode = True  # Use same logic as preview for calculations
+        self.reduce_enabled_in_request = config.reduce and config.reduce.enabled
 
         # Set rounding mode from config
         self.rounding_mode = config.rounding_mode
@@ -213,8 +245,20 @@ class TripFilterService:
             filtered_trips = self._filter_by_options(trips, config.expand)
             self._apply_expand(filtered_trips, config.expand, config.combine)
 
+        # V5: Track filter state (enabled, disabled, or not specified)
+        # enabled: true → Apply and mark TRUE
+        # enabled: false → Don't apply and mark FALSE (deactivate)
+        # not specified (None) → Don't touch that filter
+        filters_state = {
+            'reduce': config.reduce.enabled if config.reduce else None,
+            'combine': config.combine.enabled if config.combine else None,
+            'expand': config.expand.enabled if config.expand else None
+        }
+
         # Persist changes to database
         now = datetime.utcnow()
+
+        # Update trips that have filter changes applied
         for change in self.changes:
             trip = trip_lookup.get(change.trip_id)
             if trip:
@@ -224,12 +268,57 @@ class TripFilterService:
 
                 # Apply new time
                 trip.pick_up_time = change.new_time
+
+                # V5: Set independent filter flags based on config
+                # enabled: true → TRUE, enabled: false → FALSE, None → don't change
+                if filters_state['reduce'] is True:
+                    trip.reduce_applied = True
+                elif filters_state['reduce'] is False:
+                    trip.reduce_applied = False
+
+                if filters_state['combine'] is True:
+                    trip.combine_applied = True
+                elif filters_state['combine'] is False:
+                    trip.combine_applied = False
+
+                if filters_state['expand'] is True:
+                    trip.expand_applied = True
+                elif filters_state['expand'] is False:
+                    trip.expand_applied = False
+
+                # Keep filter_applied for backwards compatibility (use last applied filter)
                 trip.filter_applied = change.filter_applied
                 trip.filter_batch_id = batch_id
                 trip.filtered_at = now
                 trip.updated_at = now
 
                 # Add trip to session to ensure changes are tracked
+                self.session.add(trip)
+
+        # V5: Handle trips where filters are explicitly disabled (enabled: false)
+        # but no changes were made (e.g., only deactivating a filter)
+        for trip in trips:
+            # Skip if trip already processed in changes
+            if any(c.trip_id == trip.id for c in self.changes):
+                continue
+
+            # Check if any filter is being explicitly disabled
+            needs_update = False
+
+            if filters_state['reduce'] is False and trip.reduce_applied:
+                trip.reduce_applied = False
+                needs_update = True
+
+            if filters_state['combine'] is False and trip.combine_applied:
+                trip.combine_applied = False
+                needs_update = True
+
+            if filters_state['expand'] is False and trip.expand_applied:
+                trip.expand_applied = False
+                needs_update = True
+
+            if needs_update:
+                trip.updated_at = now
                 self.session.add(trip)
 
                 self.log.append({
@@ -243,6 +332,7 @@ class TripFilterService:
                 })
 
         # Create FilterBatch record for tracking and partial revert
+        # (skip if reusing an existing batch)
         filters_applied = []
         if config.reduce and config.reduce.enabled:
             filters_applied.append("reduce")
@@ -251,15 +341,16 @@ class TripFilterService:
         if config.expand and config.expand.enabled:
             filters_applied.append("expand")
 
-        filter_batch = FilterBatch(
-            id=batch_id,
-            location_id=location_id,
-            airline=airline,
-            config=config.model_dump(mode="json"),  # Store full config as JSON
-            filters_applied=filters_applied,
-            trips_affected=len(self.changes),
-        )
-        self.session.add(filter_batch)
+        if not skip_batch_record:
+            filter_batch = FilterBatch(
+                id=batch_id,
+                location_id=location_id,
+                airline=airline,
+                config=config.model_dump(mode="json"),  # Store full config as JSON
+                filters_applied=filters_applied,
+                trips_affected=len(self.changes),
+            )
+            self.session.add(filter_batch)
 
         # Commit changes
         await self.session.commit()
@@ -281,6 +372,7 @@ class TripFilterService:
         location_id: UUID,
         airline: str,
         batch_id: Optional[UUID] = None,
+        commit: bool = True,
     ) -> FilterRevertResult:
         """
         Revert filtered trips to their original pickup times.
@@ -290,6 +382,8 @@ class TripFilterService:
             airline: Airline code to filter
             batch_id: If provided, only revert trips from this batch.
                       If None, revert all filtered trips for this location+airline.
+            commit: If True, commits changes to database. If False, changes are staged but not committed.
+                    Set to False when called from auto-revert to maintain single transaction.
         """
         # Build query
         query = (
@@ -313,6 +407,12 @@ class TripFilterService:
                 trip.pick_up_time = trip.original_pick_up_time
                 trip.original_pick_up_time = None
                 trip.filter_applied = None
+
+                # V4: Clear independent filter flags
+                trip.reduce_applied = False
+                trip.combine_applied = False
+                trip.expand_applied = False
+
                 if trip.filter_batch_id:
                     batch_ids_reverted.add(trip.filter_batch_id)
                 trip.filter_batch_id = None
@@ -324,7 +424,9 @@ class TripFilterService:
 
                 reverted_count += 1
 
-        await self.session.commit()
+        # Only commit if requested (auto-revert sets commit=False to maintain single transaction)
+        if commit:
+            await self.session.commit()
 
         return FilterRevertResult(
             trips_reverted=reverted_count,
@@ -360,6 +462,8 @@ class TripFilterService:
         if filter_type not in valid_filters:
             raise ValueError(f"filter_type must be one of {valid_filters}, got: {filter_type}")
 
+        logger.info(f"[REVERT_PARTIAL] Starting partial revert: batch_id={batch_id}, filter_type={filter_type}")
+
         # Fetch FilterBatch record
         batch_query = Select(FilterBatch).Where(FilterBatch.id == batch_id)
         filter_batch = await self.session.exec(batch_query).first()
@@ -385,7 +489,12 @@ class TripFilterService:
         if not trips:
             raise ValueError(f"No trips found for batch {batch_id}")
 
+        # Save trip count before session manipulations
+        trips_count = len(trips)
+
         # Step 1: Revert all trips to original_pick_up_time
+        reverted_count = 0
+
         for trip in trips:
             if trip.original_pick_up_time:
                 trip.pick_up_time = trip.original_pick_up_time
@@ -394,9 +503,19 @@ class TripFilterService:
                 trip.filter_batch_id = None
                 trip.filtered_at = None
                 trip.updated_at = datetime.utcnow()
+
+                # V5: Clear independent filter flags (CRITICAL!)
+                # Without this, the boolean fields remain TRUE even after revert
+                trip.reduce_applied = False
+                trip.combine_applied = False
+                trip.expand_applied = False
+
                 self.session.add(trip)
+                reverted_count += 1
 
         await self.session.commit()
+        # CRITICAL: Expire all objects in session to ensure Step 3 gets fresh data from DB
+        self.session.expire_all()
 
         # Step 2: Reconstruct config without the filter being reverted
         original_config = FilterRequest(**filter_batch.config)
@@ -424,59 +543,61 @@ class TripFilterService:
         summary = {"reduce": 0, "combine": 0, "expand": 0, "excluded": 0}
 
         if remaining_filters:
-            # Re-apply using the existing apply logic
+            # Save filter_batch values before expunging (they'll be detached after expunge)
+            location_id_for_apply = filter_batch.location_id
+            airline_for_apply = filter_batch.airline
+
+            # CRITICAL: Clear the session before apply() to avoid identity map conflicts
+            # The Trip objects from Step 1 are still in the session and would interfere
+            self.session.expunge_all()
+
+            # Re-apply using the existing apply logic, reusing the original batch_id
+            # This eliminates the need for Step 3b (moving trips between batches)
             result = await self.apply(
-                location_id=filter_batch.location_id,
-                airline=filter_batch.airline,
+                location_id=location_id_for_apply,
+                airline=airline_for_apply,
                 config=modified_config,
+                existing_batch_id=batch_id,  # Reuse original batch
+                skip_batch_record=True,  # Don't create new FilterBatch record
             )
             changes_applied = result.changes_applied
             summary = result.summary
 
-            # Delete the new batch created by apply() since we're reusing the old batch_id
-            # The trips now have a new batch_id from the apply() call
-            new_batch_id = result.batch_id
-
-            # Fetch and delete the new batch
-            new_batch_query = Select(FilterBatch).Where(FilterBatch.id == new_batch_id)
-            new_batch = await self.session.exec(new_batch_query).first()
-            if new_batch:
-                self.session.delete(new_batch)
-
-            # Update trips to reference the original batch_id
-            updated_trips_query = (
-                Select(Trip)
-                .Where(Trip.filter_batch_id == new_batch_id)
-            )
-            updated_trips = await self.session.exec(updated_trips_query).all()
-            for trip in updated_trips:
-                trip.filter_batch_id = batch_id
-                self.session.add(trip)
-
-            await self.session.commit()
-
         # Step 4: Update FilterBatch with new config and revert history
-        filter_batch.config = modified_config.model_dump(mode="json")
-        filter_batch.filters_applied = remaining_filters
-        filter_batch.trips_affected = changes_applied
+        from psqlmodel import Update
 
-        # Track revert in history
-        if filter_batch.revert_history is None:
-            filter_batch.revert_history = {}
-
-        filter_batch.revert_history[filter_type] = {
+        # Build revert history
+        # First get current revert_history
+        batch_check = await self.session.exec(
+            Select(FilterBatch).Where(FilterBatch.id == batch_id)
+        ).first()
+        current_history = batch_check.revert_history if batch_check and batch_check.revert_history else {}
+        current_history[filter_type] = {
             "reverted_at": datetime.utcnow().isoformat(),
-            "trips_affected": len(trips),
+            "trips_affected": trips_count,
             "filters_reapplied": remaining_filters,
         }
 
-        self.session.add(filter_batch)
+        # Use direct UPDATE for FilterBatch to avoid ORM session issues
+        update_batch_stmt = (
+            Update(FilterBatch)
+            .Set(
+                config=modified_config.model_dump(mode="json"),
+                filters_applied=remaining_filters,
+                trips_affected=changes_applied,
+                revert_history=current_history
+            )
+            .Where(FilterBatch.id == batch_id)
+        )
+        await self.session.exec(update_batch_stmt)
         await self.session.commit()
+
+        logger.info(f"[REVERT_PARTIAL] Completed: reverted={filter_type}, remaining={remaining_filters}, changes={changes_applied}")
 
         return FilterRevertPartialResult(
             batch_id=batch_id,
             filter_reverted=filter_type,
-            trips_affected=len(trips),
+            trips_affected=trips_count,
             filters_reapplied=remaining_filters,
             changes_applied=changes_applied,
             summary=summary,
@@ -492,6 +613,8 @@ class TripFilterService:
         self.changes.clear()
         self.exclusions.clear()
         self.log.clear()
+        self.is_preview_mode = False
+        self.reduce_enabled_in_request = False
 
     async def _get_eligible_trips(
         self,
@@ -515,6 +638,8 @@ class TripFilterService:
             .Where(Trip.airline == airline)
             .Where(Trip.trip_type == TripType.OUTBOUND)
             .Where(Trip.status == TripStatus.SCHEDULED)
+            # V3: No filter by filter_applied to allow preview on trips with existing filters
+            # Auto-revert will handle this in /apply
         )
 
         # Apply date filters if provided
@@ -531,7 +656,15 @@ class TripFilterService:
         config: ReduceFilterConfig | CombineFilterConfig | ExpandFilterConfig,
     ) -> list[Trip]:
         """
-        Apply pre-selection filters (hotel names, time range).
+        Apply pre-selection filters (hotel names, time range, date range).
+
+        In preview mode, uses original_pick_up_time for time range filtering
+        to ensure we're filtering based on the true original times.
+
+        Filter priority (all must match):
+        1. hotel_names: Trip's pick_up_location must be in the list
+        2. time_range: Trip's pickup time must be within the range
+        3. date_range: Trip's pick_up_date must be within the range
         """
         result = trips
 
@@ -547,10 +680,67 @@ class TripFilterService:
         if config.time_range:
             result = [
                 t for t in result
-                if self._is_time_in_range(t.pick_up_time, config.time_range)
+                if self._is_time_in_range(self._get_base_time(t), config.time_range)
             ]
 
+        # Filter by date range (filter-level, more specific than global date filter)
+        if config.date_range:
+            result = self._filter_by_date_range(result, config.date_range)
+
         return result
+
+    def _filter_by_date_range(
+        self,
+        trips: list[Trip],
+        date_range,  # DateRange from filter_models
+    ) -> list[Trip]:
+        """
+        Filter trips by date range.
+
+        Args:
+            trips: List of trips to filter
+            date_range: DateRange object with date_from and date_to
+
+        Returns:
+            Filtered list of trips within the date range
+        """
+        result = []
+
+        # Parse date strings to date objects
+        date_from = None
+        date_to = None
+
+        if date_range.date_from:
+            date_from = date.fromisoformat(date_range.date_from)
+        if date_range.date_to:
+            date_to = date.fromisoformat(date_range.date_to)
+
+        for trip in trips:
+            if not trip.pick_up_date:
+                continue
+
+            # Check date_from constraint
+            if date_from and trip.pick_up_date < date_from:
+                continue
+
+            # Check date_to constraint
+            if date_to and trip.pick_up_date > date_to:
+                continue
+
+            result.append(trip)
+
+        return result
+
+    def _get_base_time(self, trip: Trip) -> time:
+        """
+        Get the base pickup time for a trip (for filtering purposes).
+
+        In preview mode: returns original_pick_up_time if exists, else pick_up_time
+        In apply mode: returns pick_up_time
+        """
+        if self.is_preview_mode and trip.original_pick_up_time:
+            return trip.original_pick_up_time
+        return trip.pick_up_time
 
     def _is_time_in_range(self, t: time, time_range: TimeRange) -> bool:
         """
@@ -706,6 +896,7 @@ class TripFilterService:
                                     f"Collision: gap with previous trip would enter Combine range ({gap_with_prev} min)",
                                     gap,
                                     gap_with_prev,
+                                    trips=[trip_a, trip_b],
                                 )
                                 collision = True
 
@@ -722,6 +913,7 @@ class TripFilterService:
                                     f"Collision: gap with next trip would enter Combine range ({gap_with_next} min)",
                                     gap,
                                     gap_with_next,
+                                    trips=[trip_a, trip_b],
                                 )
                                 collision = True
 
@@ -739,15 +931,29 @@ class TripFilterService:
         """
         Get the effective pickup time for a trip.
 
-        Priority: Most recent change > original pick_up_time
+        In Preview/Apply Mode (is_preview_mode=True):
+        - First checks self.changes for any previous filter result (e.g., reduce result)
+        - If no change found, uses original_pick_up_time (true original)
+        - This ensures filters always calculate from original times, not from already-modified DB times
 
-        This ensures Combine/Expand operate on times AFTER Reduce has been applied.
-        When multiple filters modify the same trip, the last change is used.
+        This ensures Combine/Expand operate on times AFTER Reduce has been applied (if enabled).
         """
         # Look for the most recent change (iterate backwards)
         for change in reversed(self.changes):
             if change.trip_id == trip.id:
                 return change.new_time
+
+        # In preview/apply mode, always use original_pick_up_time as base
+        if self.is_preview_mode:
+            # Use original_pick_up_time if it exists (trip was previously modified in DB)
+            # Otherwise use current pick_up_time (trip has never been modified)
+            base_time = trip.original_pick_up_time if trip.original_pick_up_time else trip.pick_up_time
+            logger.debug(
+                f"[FILTER] _get_effective_time trip={trip.id}: "
+                f"using {'original_pick_up_time' if trip.original_pick_up_time else 'pick_up_time'}={base_time} "
+                f"(original={trip.original_pick_up_time}, current={trip.pick_up_time})"
+            )
+            return base_time
 
         return trip.pick_up_time
 
@@ -785,6 +991,7 @@ class TripFilterService:
             hotel_name=trip.pick_up_location or "",
             pick_up_date=str(trip.pick_up_date) if trip.pick_up_date else None,
             airline=trip.airline,
+            flight_number=trip.flight_number,
         ))
 
     def _record_exclusion(
@@ -794,14 +1001,48 @@ class TripFilterService:
         reason: str,
         gap_before: int,
         gap_after: int,
+        trips: list = None,
     ):
         """Record an excluded operation."""
+        from features.trips.models.filter_models import TripExclusionInfo
+
+        # Extract trip info if trips are provided
+        trips_info = []
+        if trips:
+            for trip in trips:
+                # Format pick_up_time (current time, may be modified)
+                pick_up_time_str = None
+                if trip.pick_up_time:
+                    if isinstance(trip.pick_up_time, str):
+                        pick_up_time_str = trip.pick_up_time
+                    else:
+                        pick_up_time_str = trip.pick_up_time.strftime("%H:%M")
+
+                # Format original_pick_up_time (if trip was modified by filters)
+                original_time_str = None
+                if hasattr(trip, 'original_pick_up_time') and trip.original_pick_up_time:
+                    if isinstance(trip.original_pick_up_time, str):
+                        original_time_str = trip.original_pick_up_time
+                    else:
+                        original_time_str = trip.original_pick_up_time.strftime("%H:%M")
+
+                trips_info.append(TripExclusionInfo(
+                    trip_id=trip.id,
+                    airline=trip.airline,
+                    flight_number=trip.flight_number,
+                    hotel_name=trip.pick_up_location or "",
+                    pick_up_date=str(trip.pick_up_date) if trip.pick_up_date else None,
+                    pick_up_time=pick_up_time_str,
+                    original_pick_up_time=original_time_str,
+                ))
+
         self.exclusions.append(FilterExclusion(
             operation=operation,
             trip_ids=trip_ids,
             reason=reason,
             gap_before=gap_before,
             gap_after=gap_after,
+            trips_info=trips_info,
         ))
 
         self.log.append({
@@ -811,6 +1052,57 @@ class TripFilterService:
             "gap_before": gap_before,
             "gap_after": gap_after,
         })
+
+    def _consolidate_changes(self) -> list[TripChange]:
+        """
+        Consolidate multiple changes for the same trip into a single change.
+
+        When a trip is modified by multiple filters (e.g., Reduce then Combine),
+        we want to show only the final result with:
+        - original_time: the TRUE original time (from first change)
+        - new_time: the FINAL time (from last change)
+        - filter_applied: concatenated filters (e.g., "reduce+combine")
+
+        Returns:
+            List of consolidated TripChange objects
+        """
+        # Track first and last change for each trip
+        trip_changes: dict[UUID, dict] = {}
+
+        for change in self.changes:
+            trip_id = change.trip_id
+            if trip_id not in trip_changes:
+                # First change for this trip - store original_time
+                trip_changes[trip_id] = {
+                    "first_change": change,
+                    "last_change": change,
+                    "filters": [change.filter_applied],
+                }
+            else:
+                # Additional change - update last_change and add filter
+                trip_changes[trip_id]["last_change"] = change
+                trip_changes[trip_id]["filters"].append(change.filter_applied)
+
+        # Build consolidated changes
+        consolidated = []
+        for trip_id, data in trip_changes.items():
+            first = data["first_change"]
+            last = data["last_change"]
+            filters = data["filters"]
+
+            # Create consolidated change
+            consolidated.append(TripChange(
+                trip_id=trip_id,
+                original_time=first.original_time,  # TRUE original
+                new_time=last.new_time,  # FINAL time
+                filter_applied="+".join(filters) if len(filters) > 1 else filters[0],
+                hotel_name=first.hotel_name,
+                pick_up_date=first.pick_up_date,
+                airline=first.airline,
+                flight_number=first.flight_number,
+            ))
+
+        return consolidated
 
     def _build_summary(self) -> dict:
         """Build summary of changes."""
@@ -849,6 +1141,7 @@ class TripFilterService:
                 hotel_name=change.hotel_name,
                 pick_up_date=change.pick_up_date,
                 airline=change.airline,
+                flight_number=change.flight_number,
             )
             formatted_changes.append(formatted_change)
         return formatted_changes

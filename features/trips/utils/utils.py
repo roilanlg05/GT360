@@ -191,3 +191,149 @@ def _format_timedelta_offset(td) -> str:
     hours = total_seconds // 3600
     minutes = (total_seconds % 3600) // 60
     return f"{sign}{hours:02d}:{minutes:02d}"
+
+
+# ---- Timeline utilities ----
+
+def get_current_datetime_in_timezone(tz_name: str) -> datetime:
+    """
+    Get the current datetime in a specific timezone.
+
+    Args:
+        tz_name: IANA timezone name (e.g., "America/New_York")
+
+    Returns:
+        Current datetime in the specified timezone (timezone-aware)
+    """
+    return datetime.now(ZoneInfo(tz_name))
+
+
+def get_current_date_in_timezone(tz_name: str) -> date:
+    """
+    Get the current date in a specific timezone.
+
+    Args:
+        tz_name: IANA timezone name (e.g., "America/New_York")
+
+    Returns:
+        Current date in the specified timezone
+    """
+    return get_current_datetime_in_timezone(tz_name).date()
+
+
+def get_current_time_in_timezone(tz_name: str) -> time:
+    """
+    Get the current time in a specific timezone.
+
+    Args:
+        tz_name: IANA timezone name (e.g., "America/New_York")
+
+    Returns:
+        Current time in the specified timezone (without tzinfo)
+    """
+    return get_current_datetime_in_timezone(tz_name).time()
+
+
+def compute_is_live(
+    trip_status: str,
+    pick_up_date: date,
+    pick_up_time: time,
+    location_timezone: str
+) -> bool:
+    """
+    Determine if a trip is LIVE using Status + Time rules.
+
+    Rules (in priority order):
+    - COMPLETED or CANCELED → always HISTORY (False)
+    - EN_ROUTE → always LIVE (True)
+    - SCHEDULED → depends on whether pickup_time has passed in location timezone
+
+    Args:
+        trip_status: Trip status (scheduled, canceled, en_route, completed)
+        pick_up_date: Pickup date (local date)
+        pick_up_time: Pickup time (local time)
+        location_timezone: IANA timezone of the location
+
+    Returns:
+        True if trip is LIVE, False if HISTORY
+    """
+    from shared.db.schemas import TripStatus
+
+    # Status-based rules (highest priority)
+    if trip_status in (TripStatus.COMPLETED, TripStatus.CANCELED):
+        return False  # Always HISTORY
+
+    if trip_status == TripStatus.EN_ROUTE:
+        return True  # Always LIVE
+
+    # Time-based rule for SCHEDULED trips
+    now_local = get_current_datetime_in_timezone(location_timezone)
+
+    # Combine pickup date + time into a datetime
+    trip_datetime = datetime.combine(
+        pick_up_date,
+        pick_up_time,
+        tzinfo=ZoneInfo(location_timezone)
+    )
+
+    # LIVE if pickup time is in the future
+    return trip_datetime > now_local
+
+
+def format_time_for_display(t: time, format_24h: bool = True) -> str:
+    """
+    Format a time for display.
+
+    Args:
+        t: Time to format
+        format_24h: If True, use 24h format (14:30), else 12h format (2:30 PM)
+
+    Returns:
+        Formatted time string
+    """
+    if format_24h:
+        return f"{t.hour:02d}:{t.minute:02d}"
+    else:
+        hour = t.hour % 12 or 12
+        ampm = "AM" if t.hour < 12 else "PM"
+        return f"{hour}:{t.minute:02d} {ampm}"
+
+
+def build_cursor(pick_up_date: date, pick_up_time: time, trip_id: str) -> str:
+    """
+    Build a cursor string for timeline pagination.
+
+    Format: {date}T{time}_{trip_id}
+    Example: "2026-01-21T15:00:00_550e8400-e29b-41d4-a716-446655440000"
+
+    Args:
+        pick_up_date: Trip pickup date
+        pick_up_time: Trip pickup time
+        trip_id: Trip UUID as string
+
+    Returns:
+        Cursor string
+    """
+    time_str = f"{pick_up_time.hour:02d}:{pick_up_time.minute:02d}:{pick_up_time.second:02d}"
+    return f"{pick_up_date.isoformat()}T{time_str}_{trip_id}"
+
+
+def parse_cursor(cursor: str) -> tuple[date, time, str]:
+    """
+    Parse a cursor string into its components.
+
+    Args:
+        cursor: Cursor string in format "{date}T{time}_{trip_id}"
+
+    Returns:
+        Tuple of (pickup_date, pickup_time, trip_id)
+
+    Raises:
+        ValueError: If cursor format is invalid
+    """
+    try:
+        datetime_part, trip_id = cursor.rsplit("_", 1)
+        dt = datetime.fromisoformat(datetime_part)
+        return dt.date(), dt.time(), trip_id
+    except (ValueError, AttributeError) as e:
+        raise ValueError(f"Invalid cursor format: {cursor}") from e
