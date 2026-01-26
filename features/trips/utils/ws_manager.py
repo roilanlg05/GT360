@@ -118,6 +118,8 @@ class WSManager:
         """
         Listener for location-level events:
           - {"type":"trips_batch","location_id":"<loc>","events":[...]}
+          - {"type":"step_applied","location_id":"<loc>","filter_type":"reduce",...}
+          - {"type":"step_reverted","location_id":"<loc>","filter_type":"reduce",...}
           - {"type":"location_delete_started",...}
           - {"type":"location_deleted",...}
         """
@@ -138,6 +140,11 @@ class WSManager:
 
                 # Handle location deletion events - forward directly to all clients
                 if event_type in ("location_delete_started", "location_deleted"):
+                    await self.route_location_event(location_id, ev)
+                    continue
+
+                # Handle filter step events - forward to clients
+                if event_type in ("step_applied", "step_reverted"):
                     await self.route_location_event(location_id, ev)
                     continue
 
