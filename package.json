@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "claude": "^0.1.2",
+    "claude-cli": "^1.0.5"
+  }
+}

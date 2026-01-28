@@ -5,7 +5,7 @@ import logging
 import re
 from features.trips.models import Trip
 from features.trips.utils.trip_classifier import classify_trip_type_sync
-from datetime import datetime, date, timedelta, timezone
+from datetime import datetime, date, timezone
 from typing import Any, BinaryIO, List, Optional, Tuple
 
 from openpyxl import load_workbook
@@ -17,7 +17,13 @@ logger = logging.getLogger(__name__)
 
 # Vuelos tipo: WN 2453, AA1234, WN 2453-01, etc.
 FLIGHT_ONLY_RE = re.compile(
-    r"(?P<flight>[A-Z0-9]{2}\s*\d{3,4})(?:-\d{2})?"
+    r"(?P<flight>[A-Z0-9]{2}\s*\d{3,4}(?:-\d{2})?)"
+)
+
+# Extrae día desde sufijo -DD en el número de vuelo (ej. WN 2453-01)
+FLIGHT_DAY_RE = re.compile(
+    r"[A-Z0-9]{2}\s*\d{3,4}\s*-\s*(?P<day>\d{2})",
+    re.I
 )
 
 # Vuelos + fecha opcional + hora:
@@ -79,22 +85,36 @@ def _find_city_code(ws) -> Optional[str]:
 def _parse_service_date(value: Any) -> date:
     """
     Convierte la columna de fecha a date.
+    Esta columna solo trae mes y año, por lo que se fuerza día=1.
     Soporta date/datetime o strings tipo:
-    "01-Nov-2025", "2025-11-01", "11/01/2025", etc.
+    "01-Nov-2025", "2025-11-01", "11/01/2025", "Nov-2025", "11/2025", etc.
     """
     if isinstance(value, date) and not isinstance(value, datetime):
-        return value
+        return value.replace(day=1)
 
     if isinstance(value, datetime):
-        return value.date()
+        return value.date().replace(day=1)
 
     text = _normalize_str(value)
     if not text:
         raise ValueError("Fecha de servicio vacía")
 
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%d-%b-%Y", "%d-%B-%Y"):
+    for fmt in (
+        "%Y-%m-%d",
+        "%m/%d/%Y",
+        "%d/%m/%Y",
+        "%d-%b-%Y",
+        "%d-%B-%Y",
+        "%b-%Y",
+        "%b %Y",
+        "%B-%Y",
+        "%B %Y",
+        "%m/%Y",
+        "%Y-%m",
+    ):
         try:
-            return datetime.strptime(text, fmt).date()
+            parsed = datetime.strptime(text, fmt).date()
+            return parsed.replace(day=1)
         except ValueError:
             continue
 
@@ -115,6 +135,45 @@ def _parse_flight_only(value: str) -> Optional[str]:
         return None
 
     return m.group("flight")
+
+
+def _extract_flight_day(value: Any) -> Optional[int]:
+    """
+    Extrae el día (DD) del sufijo del número de vuelo (ej. "-01").
+    Devuelve int o None si no encuentra.
+    """
+    text = _normalize_str(value)
+    if not text:
+        return None
+
+    m = FLIGHT_DAY_RE.search(text)
+    if not m:
+        return None
+
+    try:
+        day = int(m.group("day"))
+    except Exception:
+        return None
+
+    if not (1 <= day <= 31):
+        return None
+
+    return day
+
+
+def _find_flight_text(*values: Any) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Encuentra el primer texto que contenga un número de vuelo válido.
+    Devuelve (texto_original_normalizado, vuelo) o (None, None).
+    """
+    for value in values:
+        text = _normalize_str(value)
+        if not text:
+            continue
+        flight = _parse_flight_only(text)
+        if flight:
+            return text, flight
+    return None, None
 
 
 def _parse_flight_and_time(value: str, service_date: date) -> Tuple[Optional[str], Optional[datetime]]:
@@ -350,15 +409,15 @@ def _process_excel_sync(
 
         if date_str:
             try:
-                service_date = _parse_service_date(date_raw)
-                current_service_date = service_date
+                base_service_date = _parse_service_date(date_raw)
+                current_service_date = base_service_date
             except Exception as exc:
                 logger.error("Error parseando fecha en fila %s: %s", row_idx, exc)
                 continue
         else:
             if current_service_date is None:
                 continue
-            service_date = current_service_date
+            base_service_date = current_service_date
 
         # --- Otras columnas ---
         pickup_val = get("pickup_from")
@@ -374,6 +433,22 @@ def _process_excel_sync(
             continue
 
         try:
+            pickup_flight_text, flight_from_pickup = _find_flight_text(pickup_raw, pickup_loc_val)
+            dropoff_flight_text, flight_from_dropoff = _find_flight_text(dropoff_raw, dropoff_loc_val)
+
+            # El día (DD) debe venir del sufijo del número de vuelo (-DD), no de la columna DATE.
+            flight_day = _extract_flight_day(pickup_flight_text) or _extract_flight_day(dropoff_flight_text)
+            if flight_day is None:
+                raise ValueError(
+                    "No se encontró el día en el número de vuelo (-DD) en la fila."
+                )
+            try:
+                service_date = base_service_date.replace(day=flight_day)
+            except ValueError:
+                raise ValueError(
+                    f"Día inválido {flight_day} para {base_service_date.strftime('%Y-%m')}"
+                )
+
             # Determinar código de aeropuerto
             airport_code: Optional[str] = None
             for v in (pickup_loc_val, dropoff_loc_val):
@@ -386,9 +461,6 @@ def _process_excel_sync(
             # como un dict: {"fligth": pilots, "in_fligth": fly_att}
             riders = _parse_department_riders(department_val)
 
-            # ¿Pick Up (From) es un vuelo?
-            flight_from_pickup = _parse_flight_only(pickup_raw)
-
             if flight_from_pickup:
                 # ----- Caso: PICK UP EN AEROPUERTO -----
                 airline, flight_number = _split_airline_and_number(flight_from_pickup)
@@ -398,15 +470,16 @@ def _process_excel_sync(
 
                 pick_up_location = airport_code or "AIRPORT"
 
-                dropoff_flight = _parse_flight_only(dropoff_raw)
-                if dropoff_flight and airport_code:
+                if flight_from_dropoff and airport_code:
                     drop_off_location = airport_code
                 else:
                     drop_off_location = dropoff_raw or (airport_code or "AIRPORT")
 
-                _, dropoff_dt = _parse_flight_and_time(dropoff_raw, service_date)
+                dropoff_time_source = dropoff_flight_text or dropoff_raw
+                _, dropoff_dt = _parse_flight_and_time(dropoff_time_source, service_date)
                 if dropoff_dt is None:
-                    _, pickup_dt = _parse_flight_and_time(pickup_raw, service_date)
+                    pickup_time_source = pickup_flight_text or pickup_raw
+                    _, pickup_dt = _parse_flight_and_time(pickup_time_source, service_date)
                 else:
                     pickup_dt = dropoff_dt
 
@@ -426,9 +499,10 @@ def _process_excel_sync(
                 # ----- Caso: PICK UP EN HOTEL -----
                 pick_up_location = pickup_raw
 
-                flight_from_dropoff, dropoff_dt = _parse_flight_and_time(dropoff_raw, service_date)
+                dropoff_time_source = dropoff_flight_text or dropoff_raw
+                flight_from_dropoff, dropoff_dt = _parse_flight_and_time(dropoff_time_source, service_date)
                 if not flight_from_dropoff or not dropoff_dt:
-                    raise ValueError(f"Formato inválido de vuelo en Drop Off: {dropoff_raw!r}")
+                    raise ValueError(f"Formato inválido de vuelo en Drop Off: {dropoff_time_source!r}")
 
                 airline, flight_number = _split_airline_and_number(flight_from_dropoff)
                 
@@ -448,6 +522,19 @@ def _process_excel_sync(
                 location_airport_code=location  # location es el código del aeropuerto
             )
 
+            # Trip hash
+            trip_hash = hash((
+                pick_up_date,
+                pick_up_time,
+                pick_up_location,
+                drop_off_location,
+                airline,
+                flight_number,
+                tuple(sorted(riders.items())),
+                trip_type
+            ))
+
+
             trips.append(
                 Trip(
                     pick_up_date=pick_up_date,
@@ -457,7 +544,8 @@ def _process_excel_sync(
                     airline=airline,
                     flight_number=flight_number,
                     riders=riders,
-                    trip_type=trip_type
+                    trip_type=trip_type,
+                    trip_hash=str(trip_hash)
                 )
             )
 

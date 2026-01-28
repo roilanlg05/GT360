@@ -36,15 +36,18 @@ El sistema de tracking de vuelos en tiempo real tiene dos componentes principale
 │                           FLUJO DE TRACKING                                  │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
-│  1. Frontend envía lista de vuelos a trackear                               │
+│  1. Frontend envía lista de vuelos a trackear (para AeroDataBox)            │
 │     POST /v1/flights/tracking/subscribe                                      │
 │                                                                              │
 │  2. Frontend conecta a WebSocket de push notifications                       │
-│     WS /ws/flights/push?trip_id=xxx&token=JWT                               │
+│     WS /ws/flights/push?location_id=xxx&flight_numbers=WN1036,AA123&token=JWT│
+│                                                                              │
+│     ⚠️ El location_id determina el aeropuerto de destino (IATA)             │
+│     Solo se reciben notificaciones de vuelos que llegan a ese aeropuerto    │
 │                                                                              │
 │  3. Cuando el vuelo despega (status: "Departed"):                           │
-│     - Backend activa tracking automáticamente                                │
-│     - Frontend conecta al WS de tracking                                     │
+│     - Frontend recibe: {"message": "Flight WN1036 has departed at 11:52"}   │
+│     - Frontend conecta al WS de tracking para posición en tiempo real       │
 │     WS /ws/flights/tracking?token=JWT                                        │
 │                                                                              │
 │  4. Frontend recibe posiciones en tiempo real con intervalos adaptativos:   │
@@ -54,8 +57,8 @@ El sistema de tracking de vuelos en tiempo real tiene dos componentes principale
 │     - 10-20 min: cada 1 min                                                 │
 │     - <10 min: cada 1 segundo                                               │
 │                                                                              │
-│  5. Cuando el vuelo aterriza (status: "Landed"):                            │
-│     - Backend desactiva tracking automáticamente                             │
+│  5. Cuando el vuelo aterriza (status: "Arrived"):                           │
+│     - Frontend recibe: {"message": "Flight WN1036 has arrived at 13:28"}    │
 │     - Frontend puede desconectar el WS de tracking                          │
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -429,17 +432,75 @@ Authorization: Bearer {jwt_token}
 
 Recibe notificaciones de cambios de estado del vuelo en tiempo real.
 
+### Arquitectura de Suscripción
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    FLUJO DE PUSH NOTIFICATIONS                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  1. Frontend se conecta con location_id + lista de flight_numbers           │
+│                                                                              │
+│  2. Backend obtiene el IATA de la location desde la DB                      │
+│     Ejemplo: location_id="abc123" -> location.name="SDF"                    │
+│                                                                              │
+│  3. Backend suscribe al cliente a rooms:                                     │
+│     - push:SDF:WN1036                                                        │
+│     - push:SDF:AA123                                                         │
+│                                                                              │
+│  4. Webhook recibe notificación de AeroDataBox:                             │
+│     - Extrae arrival_iata del payload (ej: "SDF")                           │
+│     - Extrae flight_number (ej: "WN1036")                                   │
+│     - Publica a canal: flight:push:SDF:WN1036                               │
+│                                                                              │
+│  5. Solo los clientes suscritos a SDF + WN1036 reciben la notificación      │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
 ### Conexión
 
 ```
-wss://api.gt360.app/ws/flights/push?trip_id={trip_id}&token={jwt_token}
+wss://api.gt360.app/ws/flights/push?location_id={location_id}&flight_numbers={flight_numbers}&token={jwt_token}
 ```
 
 **Parámetros de Query:**
-| Param | Required | Description |
-|-------|----------|-------------|
-| trip_id | Yes | ID del trip a monitorear |
-| token | Yes | JWT token de autenticación |
+| Param | Required | Description | Example |
+|-------|----------|-------------|---------|
+| location_id | Yes | UUID de la location a monitorear | `abc123-def456-...` |
+| flight_numbers | Yes | Lista de vuelos separados por coma | `WN1036,AA123,DL456` |
+| token | Yes | JWT token de autenticación | `eyJhbG...` |
+
+**Ejemplo de URL completa:**
+```
+wss://api.gt360.app/ws/flights/push?location_id=15da8f3a-aa38-44b7-9454-88dea364b4cf&flight_numbers=WN1036,AA123&token=eyJhbGciOiJIUzI1NiIs...
+```
+
+### Flujo de Autenticación
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         FLUJO DE AUTENTICACIÓN                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  1. CONEXIÓN INICIAL                                                         │
+│     - Cliente envía token JWT en query parameter                             │
+│     - Backend valida token y extrae claims                                   │
+│     - Si token inválido: cierra conexión con código 1008                    │
+│                                                                              │
+│  2. VALIDACIÓN DE LOCATION                                                   │
+│     - Backend consulta DB para obtener location.name (IATA)                 │
+│     - Si location no existe: envía error y cierra conexión                  │
+│                                                                              │
+│  3. KEEP-ALIVE (cada 30 segundos)                                           │
+│     - Cliente envía ping con token actualizado                              │
+│     - Backend valida token en cada ping                                      │
+│     - Si token expirado: envía error 401 y cierra conexión                  │
+│                                                                              │
+│  ⚠️ IMPORTANTE: El token es REQUERIDO en cada ping                          │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
 ### Mensajes del Servidor
 
@@ -447,38 +508,66 @@ wss://api.gt360.app/ws/flights/push?trip_id={trip_id}&token={jwt_token}
 ```json
 {
   "type": "connected",
-  "trip_id": "uuid-del-trip"
+  "location_id": "15da8f3a-aa38-44b7-9454-88dea364b4cf",
+  "location_iata": "SDF",
+  "flight_numbers": ["WN1036", "AA123"]
 }
 ```
 
-**2. Push notification (cambio de estado):**
+**2. Flight update (cambio de estado):**
 ```json
 {
-  "type": "push_notification",
-  "trip_id": "uuid-del-trip",
-  "notification": {
-    "flight_number": "WN1234",
-    "flight_iata": "WN1234",
-    "flight_icao": "SWA1234",
-    "status": "Departed",
-    "departure_airport": "ORD",
-    "departure_scheduled": "2026-01-18T12:00:00Z",
-    "departure_estimated": "2026-01-18T12:05:00Z",
-    "departure_actual": "2026-01-18T12:08:00Z",
-    "arrival_airport": "SDF",
-    "arrival_scheduled": "2026-01-18T14:30:00Z",
-    "arrival_estimated": "2026-01-18T14:35:00Z",
-    "arrival_actual": null,
-    "received_at": "2026-01-18T12:08:05Z"
-  }
+  "type": "flight_update",
+  "flight_number": "WN1036",
+  "status": "Arrived",
+  "message": "Flight WN1036 has arrived at 13:28",
+  "departure": {
+    "airport_iata": "BWI",
+    "airport_name": "Baltimore Washington Thurgood Marshall",
+    "scheduled_time": "2026-01-21 11:40-05:00",
+    "actual_time": "2026-01-21 11:52-05:00"
+  },
+  "arrival": {
+    "airport_iata": "SDF",
+    "airport_name": "Louisville Standiford Field",
+    "scheduled_time": "2026-01-21 13:35-05:00",
+    "actual_time": "2026-01-21 13:28-05:00"
+  },
+  "airline": {
+    "name": "Southwest Airlines",
+    "iata": "WN"
+  },
+  "aircraft": {
+    "reg": "N480WN",
+    "modeS": "A5EA9A",
+    "model": "Boeing 737-700"
+  },
+  "last_updated": "2026-01-21 18:29Z",
+  "received_at": "2026-01-21T18:29:25.720990+00:00",
+  "raw": { ... }
 }
 ```
+
+**Mensajes según status:**
+| Status | Mensaje |
+|--------|---------|
+| Arrived | `Flight WN1036 has arrived at 13:28` |
+| Departed | `Flight WN1036 has departed at 11:52` |
+| EnRoute | `Flight WN1036 is en route` |
+| Boarding | `Flight WN1036 is now boarding` |
+| GateClosed | `Flight WN1036 gate is now closed` |
+| Delayed | `Flight WN1036 has been delayed` |
+| Canceled | `Flight WN1036 has been canceled` |
+| Diverted | `Flight WN1036 has been diverted` |
+| Approaching | `Flight WN1036 is approaching SDF` |
+| CheckIn | `Flight WN1036 check-in is now open` |
+| Expected | `Flight WN1036 is expected at 13:35` |
 
 **3. Suscripción adicional confirmada:**
 ```json
 {
   "type": "subscribed",
-  "trip_id": "otro-trip-id"
+  "flight_number": "DL789"
 }
 ```
 
@@ -486,7 +575,7 @@ wss://api.gt360.app/ws/flights/push?trip_id={trip_id}&token={jwt_token}
 ```json
 {
   "type": "unsubscribed",
-  "trip_id": "uuid-del-trip"
+  "flight_number": "AA123"
 }
 ```
 
@@ -506,6 +595,22 @@ wss://api.gt360.app/ws/flights/push?trip_id={trip_id}&token={jwt_token}
 }
 ```
 
+```json
+{
+  "type": "error",
+  "code": 404,
+  "detail": "Location not found"
+}
+```
+
+```json
+{
+  "type": "error",
+  "code": 400,
+  "detail": "No flight numbers provided"
+}
+```
+
 ### Mensajes del Cliente
 
 **1. Ping (keep-alive con validación de token):**
@@ -515,78 +620,180 @@ wss://api.gt360.app/ws/flights/push?trip_id={trip_id}&token={jwt_token}
   "token": "jwt_token_actualizado"
 }
 ```
-> ⚠️ El token es **requerido** en el ping. Si no se envía, se cerrará la conexión.
+> ⚠️ El token es **REQUERIDO** en el ping. Si no se envía, se cerrará la conexión con código 1008.
 
-**2. Suscribirse a otro trip:**
+**2. Suscribirse a un vuelo adicional:**
 ```json
 {
   "action": "subscribe",
-  "trip_id": "otro-trip-id"
+  "flight_number": "DL789"
 }
 ```
 
-**3. Desuscribirse de un trip:**
+**3. Desuscribirse de un vuelo:**
 ```json
 {
   "action": "unsubscribe",
-  "trip_id": "uuid-del-trip"
+  "flight_number": "AA123"
 }
 ```
 
-### Estados que Activan/Desactivan Tracking
+### Estados de Vuelo (AeroDataBox)
 
-El backend activa automáticamente el tracking de posición cuando recibe estos estados:
-- `Departed`
-- `EnRoute`
-- `InFlight`
-- `Airborne`
-- `TakingOff` / `Taking_Off`
+| Código | Status | Descripción |
+|--------|--------|-------------|
+| 0 | Unknown | Estado desconocido |
+| 1 | Expected | Vuelo esperado |
+| 2 | EnRoute | En ruta |
+| 3 | CheckIn | Check-in abierto |
+| 4 | Boarding | Embarcando |
+| 5 | GateClosed | Puerta cerrada |
+| 6 | Departed | Despegó |
+| 7 | Delayed | Retrasado |
+| 8 | Approaching | Aproximándose |
+| 9 | Arrived | Aterrizó |
+| 10 | Canceled | Cancelado |
+| 11 | Diverted | Desviado |
+| 12 | CanceledUncertain | Cancelación incierta |
 
-El backend desactiva automáticamente el tracking cuando recibe:
-- `Landed`
-- `Arrived`
-- `Canceled` / `Cancelled`
-- `Diverted`
+### TypeScript Interfaces
+
+```typescript
+// Parámetros de conexión
+interface PushWSConnectionParams {
+  location_id: string;      // UUID de la location
+  flight_numbers: string;   // Comma-separated: "WN1036,AA123"
+  token: string;            // JWT token
+}
+
+// Mensaje de conexión exitosa
+interface ConnectedMessage {
+  type: "connected";
+  location_id: string;
+  location_iata: string;
+  flight_numbers: string[];
+}
+
+// Actualización de vuelo
+interface FlightUpdateMessage {
+  type: "flight_update";
+  flight_number: string;
+  status: FlightStatus;
+  message: string;          // Human-readable message
+  departure: {
+    airport_iata: string | null;
+    airport_name: string | null;
+    scheduled_time: string | null;
+    actual_time: string | null;
+  };
+  arrival: {
+    airport_iata: string | null;
+    airport_name: string | null;
+    scheduled_time: string | null;
+    actual_time: string | null;
+  };
+  airline: {
+    name: string | null;
+    iata: string | null;
+  };
+  aircraft: {
+    reg: string;
+    modeS: string;
+    model: string;
+  } | null;
+  last_updated: string;
+  received_at: string;
+  raw: Record<string, any>;
+}
+
+type FlightStatus =
+  | "Unknown"
+  | "Expected"
+  | "EnRoute"
+  | "CheckIn"
+  | "Boarding"
+  | "GateClosed"
+  | "Departed"
+  | "Delayed"
+  | "Approaching"
+  | "Arrived"
+  | "Canceled"
+  | "Diverted"
+  | "CanceledUncertain";
+
+// Mensajes del servidor
+type ServerMessage =
+  | ConnectedMessage
+  | FlightUpdateMessage
+  | { type: "subscribed"; flight_number: string }
+  | { type: "unsubscribed"; flight_number: string }
+  | { type: "pong" }
+  | { type: "error"; code?: number; detail: string };
+
+// Mensajes del cliente
+type ClientMessage =
+  | { action: "ping"; token: string }
+  | { action: "subscribe"; flight_number: string }
+  | { action: "unsubscribe"; flight_number: string };
+```
 
 ### Ejemplo de Implementación (React)
 
 ```typescript
-import { useEffect, useRef, useCallback } from 'react';
+import { useEffect, useRef, useCallback, useState } from 'react';
 
-interface PushNotification {
+interface FlightUpdate {
+  type: "flight_update";
   flight_number: string;
-  flight_iata: string | null;
-  flight_icao: string | null;
-  status: string | null;
-  departure_airport: string | null;
-  departure_scheduled: string | null;
-  departure_estimated: string | null;
-  departure_actual: string | null;
-  arrival_airport: string | null;
-  arrival_scheduled: string | null;
-  arrival_estimated: string | null;
-  arrival_actual: string | null;
+  status: string;
+  message: string;
+  departure: {
+    airport_iata: string | null;
+    airport_name: string | null;
+    scheduled_time: string | null;
+    actual_time: string | null;
+  };
+  arrival: {
+    airport_iata: string | null;
+    airport_name: string | null;
+    scheduled_time: string | null;
+    actual_time: string | null;
+  };
+  airline: {
+    name: string | null;
+    iata: string | null;
+  };
   received_at: string;
 }
 
 interface UsePushNotificationsOptions {
-  tripId: string;
+  locationId: string;
+  flightNumbers: string[];
   token: string;
-  onNotification: (notification: PushNotification) => void;
-  onStatusChange?: (flightNumber: string, status: string) => void;
+  onFlightUpdate: (update: FlightUpdate) => void;
   onError?: (error: { code?: number; detail: string }) => void;
+  onConnected?: (locationIata: string, flights: string[]) => void;
 }
 
 export function usePushNotifications({
-  tripId,
+  locationId,
+  flightNumbers,
   token,
-  onNotification,
-  onStatusChange,
+  onFlightUpdate,
   onError,
+  onConnected,
 }: UsePushNotificationsOptions) {
   const wsRef = useRef<WebSocket | null>(null);
+  const tokenRef = useRef(token);
   const pingIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const [isConnected, setIsConnected] = useState(false);
+  const [locationIata, setLocationIata] = useState<string | null>(null);
+
+  // Keep token reference updated
+  useEffect(() => {
+    tokenRef.current = token;
+  }, [token]);
 
   const connect = useCallback(() => {
     // Clear any existing reconnect timeout
@@ -594,17 +801,23 @@ export function usePushNotifications({
       clearTimeout(reconnectTimeoutRef.current);
     }
 
-    const ws = new WebSocket(
-      `wss://api.gt360.app/ws/flights/push?trip_id=${tripId}&token=${token}`
-    );
+    // Build connection URL
+    const flightNumbersParam = flightNumbers.join(',');
+    const wsUrl = `wss://api.gt360.app/ws/flights/push?location_id=${locationId}&flight_numbers=${flightNumbersParam}&token=${token}`;
+
+    const ws = new WebSocket(wsUrl);
 
     ws.onopen = () => {
       console.log('Push WS connected');
+      setIsConnected(true);
 
-      // Ping cada 30 segundos con token actualizado
+      // Ping every 30 seconds with updated token
       pingIntervalRef.current = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ action: 'ping', token }));
+          ws.send(JSON.stringify({
+            action: 'ping',
+            token: tokenRef.current,  // Use current token
+          }));
         }
       }, 30000);
     };
@@ -614,24 +827,27 @@ export function usePushNotifications({
 
       switch (data.type) {
         case 'connected':
-          console.log(`Connected to push notifications for trip: ${data.trip_id}`);
+          console.log(`Connected to location: ${data.location_iata}`);
+          console.log(`Monitoring flights: ${data.flight_numbers.join(', ')}`);
+          setLocationIata(data.location_iata);
+          onConnected?.(data.location_iata, data.flight_numbers);
           break;
 
-        case 'push_notification':
-          onNotification(data.notification);
-
-          // Detectar cambios de estado para activar/desactivar tracking
-          if (data.notification.status && onStatusChange) {
-            onStatusChange(data.notification.flight_number, data.notification.status);
-          }
+        case 'flight_update':
+          console.log(`Flight update: ${data.message}`);
+          onFlightUpdate(data);
           break;
 
         case 'subscribed':
-          console.log(`Subscribed to trip: ${data.trip_id}`);
+          console.log(`Subscribed to flight: ${data.flight_number}`);
           break;
 
         case 'unsubscribed':
-          console.log(`Unsubscribed from trip: ${data.trip_id}`);
+          console.log(`Unsubscribed from flight: ${data.flight_number}`);
+          break;
+
+        case 'pong':
+          // Keep-alive acknowledged
           break;
 
         case 'error':
@@ -646,11 +862,14 @@ export function usePushNotifications({
 
     ws.onclose = (event) => {
       console.log('Push WS disconnected', event.code);
+      setIsConnected(false);
+      setLocationIata(null);
+
       if (pingIntervalRef.current) {
         clearInterval(pingIntervalRef.current);
       }
 
-      // Reconectar después de 3 segundos (excepto si fue cerrado intencionalmente)
+      // Reconnect after 3 seconds (except if intentionally closed)
       if (event.code !== 1000) {
         reconnectTimeoutRef.current = setTimeout(connect, 3000);
       }
@@ -661,30 +880,32 @@ export function usePushNotifications({
     };
 
     wsRef.current = ws;
-  }, [tripId, token, onNotification, onStatusChange, onError]);
+  }, [locationId, flightNumbers, token, onFlightUpdate, onError, onConnected]);
 
-  // Función para suscribirse a un trip adicional
-  const subscribeToTrip = useCallback((additionalTripId: string) => {
+  // Subscribe to additional flight
+  const subscribeToFlight = useCallback((flightNumber: string) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({
         action: 'subscribe',
-        trip_id: additionalTripId,
+        flight_number: flightNumber.toUpperCase(),
       }));
     }
   }, []);
 
-  // Función para desuscribirse de un trip
-  const unsubscribeFromTrip = useCallback((tripIdToUnsub: string) => {
+  // Unsubscribe from flight
+  const unsubscribeFromFlight = useCallback((flightNumber: string) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({
         action: 'unsubscribe',
-        trip_id: tripIdToUnsub,
+        flight_number: flightNumber.toUpperCase(),
       }));
     }
   }, []);
 
   useEffect(() => {
-    connect();
+    if (locationId && flightNumbers.length > 0 && token) {
+      connect();
+    }
 
     return () => {
       if (pingIntervalRef.current) {
@@ -695,13 +916,75 @@ export function usePushNotifications({
       }
       wsRef.current?.close(1000);
     };
-  }, [connect]);
+  }, [connect, locationId, flightNumbers, token]);
 
   return {
-    ws: wsRef,
-    subscribeToTrip,
-    unsubscribeFromTrip,
+    isConnected,
+    locationIata,
+    subscribeToFlight,
+    unsubscribeFromFlight,
   };
+}
+```
+
+### Ejemplo de Uso del Hook
+
+```typescript
+function FlightMonitor({ locationId, trips }: Props) {
+  const { token } = useAuth();
+
+  // Extract flight numbers from trips
+  const flightNumbers = useMemo(() =>
+    trips
+      .filter(t => t.flight_number)
+      .map(t => t.flight_number!.replace(/\s/g, '')),  // Remove spaces
+    [trips]
+  );
+
+  const handleFlightUpdate = useCallback((update: FlightUpdate) => {
+    // Show notification
+    toast.info(update.message);
+
+    // Update trip status in state
+    setTrips(prev => prev.map(trip => {
+      if (trip.flight_number?.replace(/\s/g, '') === update.flight_number) {
+        return {
+          ...trip,
+          flight_status: update.status,
+          flight_arrival_time: update.arrival.actual_time,
+        };
+      }
+      return trip;
+    }));
+
+    // If flight arrived, maybe trigger some action
+    if (update.status === 'Arrived') {
+      console.log(`🛬 ${update.flight_number} arrived at ${update.arrival.airport_iata}`);
+    }
+  }, []);
+
+  const { isConnected, locationIata } = usePushNotifications({
+    locationId,
+    flightNumbers,
+    token,
+    onFlightUpdate: handleFlightUpdate,
+    onConnected: (iata, flights) => {
+      console.log(`Monitoring ${flights.length} flights arriving at ${iata}`);
+    },
+    onError: (error) => {
+      if (error.code === 401) {
+        // Token expired, refresh it
+        refreshToken();
+      }
+    },
+  });
+
+  return (
+    <div>
+      <ConnectionStatus connected={isConnected} location={locationIata} />
+      <TripsList trips={trips} />
+    </div>
+  );
 }
 ```
 
@@ -1013,19 +1296,23 @@ export function useFlightTracking({
 ### 1. Al cargar la página de trips
 
 ```typescript
-// 1. Obtener trips con vuelos
-const trips = await fetchTrips();
+// 1. Obtener trips con vuelos para una location específica
+const trips = await fetchTrips(locationId);
 
-// 2. Extraer vuelos para suscribir
+// 2. Extraer flight numbers (sin espacios, uppercase)
+const flightNumbers = trips
+  .filter(trip => trip.flight_number)
+  .map(trip => trip.flight_number!.replace(/\s/g, '').toUpperCase());
+
+// 3. Suscribir a push notifications via REST (para AeroDataBox)
 const flightsToSubscribe = trips
   .filter(trip => trip.flight_number && trip.pick_up_date)
   .map(trip => ({
-    flight_number: trip.flight_number,
+    flight_number: trip.flight_number!.replace(/\s/g, ''),
     trip_id: trip.id,
     date_local: trip.pick_up_date,
   }));
 
-// 3. Suscribir a push notifications (máximo 50 por request)
 const response = await fetch('/v1/flights/tracking/subscribe', {
   method: 'POST',
   headers: {
@@ -1036,35 +1323,53 @@ const response = await fetch('/v1/flights/tracking/subscribe', {
 });
 
 const result = await response.json();
-console.log(`Subscribed: ${result.success_count}/${result.total}`);
+console.log(`Subscribed to AeroDataBox: ${result.success_count}/${result.total}`);
 
-// 4. Conectar al WebSocket de push para cada trip
-// O usar un solo WS y suscribirse a múltiples trips
+// 4. Conectar al WebSocket de push con location_id + flight_numbers
+// Solo necesitas UNA conexión por location
+const wsUrl = `wss://api.gt360.app/ws/flights/push?location_id=${locationId}&flight_numbers=${flightNumbers.join(',')}&token=${token}`;
+const pushWs = new WebSocket(wsUrl);
 ```
 
-### 2. Cuando un vuelo despega (recibido via push)
+### 2. Cuando un vuelo cambia de estado (recibido via push WS)
 
 ```typescript
-// En el handler de push notifications
-const handlePushNotification = (notification: PushNotification) => {
-  const { flight_number, status, trip_id } = notification;
+// En el handler de flight updates
+const handleFlightUpdate = (update: FlightUpdate) => {
+  const { flight_number, status, message } = update;
+
+  // Mostrar notificación con el mensaje formateado
+  toast.info(message);  // "Flight WN1036 has arrived at 13:28"
 
   // Actualizar UI con nuevo estado
   updateFlightStatus(flight_number, status);
 
   // Si el vuelo despegó, iniciar tracking en tiempo real
-  if (['Departed', 'EnRoute', 'InFlight', 'Airborne'].includes(status)) {
-    trackingWs.startTracking({
-      flight_number,
-      trip_id,
-      origin_icao: getOriginIcao(trip_id),
-      destination_icao: getDestinationIcao(trip_id),
-    });
+  if (['Departed', 'EnRoute'].includes(status)) {
+    // Encontrar el trip correspondiente para obtener trip_id
+    const trip = trips.find(t =>
+      t.flight_number?.replace(/\s/g, '') === flight_number
+    );
+
+    if (trip) {
+      trackingWs.startTracking({
+        flight_number,
+        trip_id: trip.id,
+        origin_icao: trip.origin_icao,
+        destination_icao: trip.destination_icao,
+      });
+    }
   }
 
   // Si el vuelo aterrizó, detener tracking
-  if (['Landed', 'Arrived', 'Canceled', 'Diverted'].includes(status)) {
-    trackingWs.stopTracking(flight_number, trip_id);
+  if (['Arrived', 'Canceled', 'Diverted'].includes(status)) {
+    const trip = trips.find(t =>
+      t.flight_number?.replace(/\s/g, '') === flight_number
+    );
+
+    if (trip) {
+      trackingWs.stopTracking(flight_number, trip.id);
+    }
   }
 };
 ```
@@ -1260,14 +1565,27 @@ REDIS_URL=redis://localhost:6379
 El backend expone un webhook para recibir notificaciones de AeroDataBox:
 
 ```
-POST /v1/webhooks/flights/push?trip_id={trip_id}&date={date}
+POST /v1/webhooks/flights/push
 ```
 
 Este endpoint:
 1. Parsea la notificación de AeroDataBox
-2. Publica a Redis para WebSocket clients
-3. Activa/desactiva tracking según el estado del vuelo
-4. Actualiza el estado en cache
+2. Extrae `flight_number` de `subscription.subject.id` o `flights[0].number`
+3. Extrae `arrival_iata` de `flights[0].arrival.airport.iata`
+4. Genera mensaje formateado según el status (ej: "Flight WN1036 has arrived at 13:28")
+5. Publica a Redis canal: `flight:push:{arrival_iata}:{flight_number}`
+6. Solo clientes suscritos a ese arrival_iata + flight_number reciben la notificación
+
+**Response:**
+```json
+{
+  "status": "ok",
+  "flight_number": "WN1036",
+  "arrival_iata": "SDF",
+  "flight_status": "Arrived",
+  "message": "Flight WN1036 has arrived at 13:28"
+}
+```
 
 **Health Check:**
 ```
@@ -1281,3 +1599,23 @@ Response:
   "timestamp": "2026-01-18T14:30:00Z"
 }
 ```
+
+---
+
+## Resumen de Cambios Recientes
+
+### Nuevo formato de Push WebSocket (v2)
+
+| Aspecto | Antes | Ahora |
+|---------|-------|-------|
+| Parámetros | `trip_id` | `location_id` + `flight_numbers` |
+| Filtrado | Por trip_id | Por arrival_iata (del location) + flight_number |
+| Mensajes | `push_notification` con raw data | `flight_update` con mensaje formateado |
+| Suscripción dinámica | Por trip_id | Por flight_number |
+
+### Normalización de Flight Numbers
+
+⚠️ **IMPORTANTE**: Los flight numbers deben normalizarse sin espacios:
+- AeroDataBox envía: `"WN 1036"` (con espacio)
+- Frontend debe enviar: `"WN1036"` (sin espacio)
+- Backend normaliza ambos a uppercase sin espacios para matching

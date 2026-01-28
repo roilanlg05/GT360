@@ -22,13 +22,14 @@ class FilterType:
     COMBINE = "combine"
     EXPAND = "expand"
 
-
-@table("trips", schema="trips", unique_together=[
+""", unique_together=[
     "location_id", "pick_up_date",
     "pick_up_time", "airline",
     "flight_number", "pick_up_location",
     "drop_off_location"
-])
+]"""
+
+@table("trips", schema="trips")
 class Trip(PSQLModel):
 
     id: uuid = Column(
@@ -49,6 +50,11 @@ class Trip(PSQLModel):
             on_delete="CASCADE",
             nullable=False,
             index=True,
+    )
+
+    trip_hash: str = Column(
+        nullable=False,
+        index=True,
     )
 
     pick_up_date: date = Column(nullable=False, index=True)
@@ -101,7 +107,7 @@ class Trip(PSQLModel):
         index=True
     )
 
-    # === Filter tracking fields ===
+    # === Filter tracking fields (V2 Step-based) ===
     # Original pickup time before any filter was applied (NULL if never filtered)
     original_pick_up_time: time = Column(
         default=None,
@@ -109,16 +115,6 @@ class Trip(PSQLModel):
         index=True
     )
 
-    # DEPRECATED: Use reduce_applied, combine_applied, expand_applied instead
-    # Kept for backwards compatibility - will be removed in future version
-    filter_applied: str = Column(
-        max_len=20,
-        default=None,
-        nullable=True,
-        index=True
-    )
-
-    # === Independent filter tracking (V4) ===
     # Each filter can be applied independently
     reduce_applied: bool = Column(
         default=False,
@@ -138,13 +134,6 @@ class Trip(PSQLModel):
         index=True
     )
 
-    # Unique ID per filter execution batch (for grouping/reverting)
-    filter_batch_id: uuid = Column(
-        default=None,
-        nullable=True,
-        index=True
-    )
-
     # Timestamp when filter was applied
     filtered_at: timestamptz = Column(
         default=None,
@@ -152,8 +141,17 @@ class Trip(PSQLModel):
         index=True
     )
 
+    # Last step that modified this trip (V2 step system)
+    current_step_id: uuid = Column(
+        default=None,
+        foreign_key="trips.filter_steps.id",
+        on_delete="SET NULL",
+        nullable=True,
+        index=True
+    )
+
     status: str = Column(
-        default=TripStatus.SCHEDULED, 
-        nullable=False, 
+        default=TripStatus.SCHEDULED,
+        nullable=False,
         index=True
     )

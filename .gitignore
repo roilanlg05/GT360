@@ -79,3 +79,4 @@ secrets.yaml
 
 Api360-backend/
 .geofencing/
+.geofence_schemas/

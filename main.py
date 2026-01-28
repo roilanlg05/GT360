@@ -13,6 +13,10 @@ from features.flights.websockets.tracking_websocket import router as flight_trac
 from features.flights.push.webhook_handler import router as flight_webhook_router
 from features.profile.routes.profile_router import router as profile_router
 from features.profile.websockets.profile_websocket import router as profile_ws_router
+from features.drivers.routes.drivers_router import router as drivers_router
+from features.trips.routes.step_filter_router import router as step_filter_router
+from features.trips.routes.filter_preset_router import router as filter_preset_router
+from features.trips.routes.test_filter_router import router as test_filter_router
 """from features.geofencing.routes.validation_router import router as validation_router
 from features.geofencing.routes.geofence_router import router as geofence_router
 from features.geofencing.jobs import dwell_checker
@@ -54,7 +58,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.add_middleware(DenyDotfileMiddleware)
-app.add_middleware(HTTPErrorHandler)  # Maneja errores 500 con headers CORS
+#app.add_middleware(HTTPErrorHandler)  # Maneja errores 500 con headers CORS
 app.add_middleware(RateLimitMiddleware)
 app.add_middleware(VerifyToken)
 app.add_middleware(RequestLoggerMiddleware)
@@ -103,5 +107,9 @@ app.include_router(flight_tracking_ws_router)
 app.include_router(flight_webhook_router)
 app.include_router(profile_router)
 app.include_router(profile_ws_router)
+app.include_router(drivers_router)
+app.include_router(step_filter_router)
+app.include_router(filter_preset_router)
+app.include_router(test_filter_router)
 #app.include_router(validation_router)
 #app.include_router(geofence_router)

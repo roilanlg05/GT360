@@ -11,6 +11,7 @@ from uuid import UUID
 from shared.db.db_config import engine
 from shared.db.schemas import User
 from shared.redis.redis_client import redis_client as redis
+from shared.redis.redis_safe import safe_redis_call
 from features.auth.utils import decode_token
 
 
@@ -184,4 +185,9 @@ async def publish_profile_update(user_id: str, profile_data: dict):
     Call this function when profile is updated via API.
     """
     channel = f"{PROFILE_CHANNEL_PREFIX}{user_id}"
-    await redis.publish(channel, json.dumps(profile_data))
+    await safe_redis_call(
+        redis.publish,
+        channel,
+        json.dumps(profile_data),
+        context=f"publish {channel}",
+    )

@@ -2,6 +2,7 @@ from fastapi import APIRouter, Request, Header
 from shared.settings import settings
 from features.auth.utils import verify_webhook_signature
 from shared.redis.redis_client import redis_client as redis
+from shared.redis.redis_safe import safe_redis_call
 import json
 from collections import defaultdict
 
@@ -24,7 +25,15 @@ async def _is_duplicate_event(event_id: str) -> bool:
         return False
     key = f"{PROCESSED_EVENTS_KEY}:{event_id}"
     # SETNX: retorna True si la key fue creada (nuevo), None si ya existía (duplicado)
-    result = await redis.set(key, "1", ex=PROCESSED_EVENTS_TTL, nx=True)
+    result = await safe_redis_call(
+        redis.set,
+        key,
+        "1",
+        ex=PROCESSED_EVENTS_TTL,
+        nx=True,
+        context=f"set {key} dedup",
+        default=False,  # Si falla Redis, tratamos como no duplicado para no perder eventos
+    )
     return result is None  # None = ya existía = duplicado
 
 def _safe_str(x) -> str:
@@ -129,12 +138,21 @@ async def trips_webhook_batch(
 
     # Ejecuta pipeline (rápido)
     if accepted:
-        await pipe.execute()
+        await safe_redis_call(
+            pipe.execute,
+            context="trip webhook pipeline",
+        )
 
     # 3) Pub/Sub: 1 publish por location (no 1 por evento)
     #    Si aún quieres menos, puedes publicar 1 solo canal global.
     for location_id, items in by_location.items():
         msg = {"type": "trips_batch", "location_id": location_id, "events": items}
-        await redis.publish(f"loc:{location_id}", json.dumps(msg))
+        channel = f"loc:{location_id}"
+        await safe_redis_call(
+            redis.publish,
+            channel,
+            json.dumps(msg),
+            context=f"publish {channel}",
+        )
 
     return {"ok": True, "received": len(events), "accepted": accepted, "skipped": skipped, "duplicates": duplicates}

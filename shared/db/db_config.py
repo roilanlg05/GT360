@@ -17,7 +17,8 @@ engine = create_async_engine(
     models_path=
         "shared/db/schemas/",
     ignore_duplicates=True,
-    pool_close_timeout=10.0
+    pool_close_timeout=10.0,
+    watchdog_mode="aggressive"
 )
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:

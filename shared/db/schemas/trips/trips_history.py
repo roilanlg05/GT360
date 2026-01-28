@@ -2,12 +2,15 @@ from psqlmodel import table, Column, PSQLModel, UniqueConstraint, CheckConstrain
 from psqlmodel.orm.types import uuid, jsonb, timestamptz, date, time
 from psqlmodel.utils import gen_default_uuid, now
 
-@table('trips_history', schema="trips", unique_together=[
+
+""", unique_together=[
     "location_id", "pick_up_date", 
     "pick_up_time", "airline", 
     "flight_number", "pick_up_location",
     "drop_off_location"
-])
+]"""
+
+@table('trips_history', schema="trips")
 class TripHistory(PSQLModel):
 
     id: uuid = Column(
@@ -28,6 +31,11 @@ class TripHistory(PSQLModel):
         on_delete="CASCADE",
         nullable=False,
         index=True
+    )
+
+    trip_hash: str = Column(
+        nullable=False,
+        index=True,
     )
 
     pick_up_date: date = Column(nullable=False, index=True)

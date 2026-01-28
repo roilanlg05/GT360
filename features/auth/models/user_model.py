@@ -50,11 +50,13 @@ class CreateCrewMember(UserBase):
     airline: str | None = None
 
 
-class CreateDriver(UserBase):
+class CreateDriver(BaseModel):
     first_name: str
     last_name: str
+    email: EmailStr
     phone: str 
     organization_id: str
+    location_id: str
 
     @field_validator("phone")
     @classmethod

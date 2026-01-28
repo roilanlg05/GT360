@@ -38,6 +38,9 @@ class BaseAppSettings(BaseSettings):
         "/v1/webhooks/trips",
         "/v1/webhooks/flights",  # AeroDataBox push notifications
         "/v1/flights/",
+        "/v1/crew-lookup/config",  # QR code config (public)
+        "/v1/crew-lookup/health",  # QR code health check (public)
+        "/v1/trips/search/qr",  # QR code trip search (public)
     ]
 
     class Config:

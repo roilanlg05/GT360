@@ -20,7 +20,7 @@ class FlightWSManager:
     Manages WebSocket connections for flight tracking.
 
     Room structure:
-    - push:{trip_id} - clients subscribed to push notifications for a trip
+    - push:{location_iata}:{flight_number} - clients subscribed to push notifications
     - track:{flight_number}:{trip_id} - clients subscribed to position updates
     """
 
@@ -29,6 +29,8 @@ class FlightWSManager:
         self._rooms: Dict[str, Set[WebSocket]] = {}
         # WebSocket -> set of rooms it's in
         self._ws_rooms: Dict[WebSocket, Set[str]] = {}
+        # WebSocket -> metadata (location_iata, flight_numbers, etc.)
+        self._ws_metadata: Dict[WebSocket, Dict[str, Any]] = {}
         # Active Redis listeners
         self._listeners: Dict[str, asyncio.Task] = {}
         self._redis: Optional[redis.Redis] = None
@@ -40,10 +42,33 @@ class FlightWSManager:
             self._redis = redis_client
         return self._redis
 
-    async def connect(self, ws: WebSocket, claims: dict) -> None:
-        """Accept WebSocket connection."""
+    async def connect(
+        self,
+        ws: WebSocket,
+        claims: dict,
+        location_iata: Optional[str] = None
+    ) -> None:
+        """Accept WebSocket connection and store metadata."""
         await ws.accept()
         self._ws_rooms[ws] = set()
+        self._ws_metadata[ws] = {
+            "claims": claims,
+            "location_iata": location_iata,
+            "flight_numbers": set(),
+        }
+
+    def get_metadata(self, ws: WebSocket) -> Dict[str, Any]:
+        """Get metadata for a WebSocket connection."""
+        return self._ws_metadata.get(ws, {})
+
+    def set_location_iata(self, ws: WebSocket, iata: str) -> None:
+        """Set the location IATA for a WebSocket connection."""
+        if ws in self._ws_metadata:
+            self._ws_metadata[ws]["location_iata"] = iata
+
+    def get_location_iata(self, ws: WebSocket) -> Optional[str]:
+        """Get the location IATA for a WebSocket connection."""
+        return self._ws_metadata.get(ws, {}).get("location_iata")
 
     async def disconnect(self, ws: WebSocket) -> None:
         """Disconnect WebSocket from all rooms."""
@@ -53,6 +78,8 @@ class FlightWSManager:
                 self._rooms[room].discard(ws)
                 if not self._rooms[room]:
                     del self._rooms[room]
+        # Clean up metadata
+        self._ws_metadata.pop(ws, None)
 
     async def join_room(self, ws: WebSocket, room: str) -> None:
         """Add WebSocket to a room."""
@@ -91,35 +118,66 @@ class FlightWSManager:
             await self.disconnect(ws)
 
     # =========================================================================
-    # Push Notifications Room (by trip_id)
+    # Push Notifications Room (by location_iata + flight_number)
     # =========================================================================
 
-    def push_room(self, trip_id: str) -> str:
-        return f"push:{trip_id}"
+    def push_room(self, location_iata: str, flight_number: str) -> str:
+        """Generate room name for push notifications."""
+        return f"push:{location_iata.upper()}:{flight_number.upper()}"
 
-    async def subscribe_push(self, ws: WebSocket, trip_id: str) -> None:
-        """Subscribe WebSocket to push notifications for a trip."""
-        room = self.push_room(trip_id)
+    async def subscribe_push(
+        self,
+        ws: WebSocket,
+        location_iata: str,
+        flight_number: str
+    ) -> None:
+        """Subscribe WebSocket to push notifications for a flight at a location."""
+        room = self.push_room(location_iata, flight_number)
         await self.join_room(ws, room)
-        await self.ensure_push_listener(trip_id)
 
-    async def unsubscribe_push(self, ws: WebSocket, trip_id: str) -> None:
+        # Track flight number in metadata
+        if ws in self._ws_metadata:
+            self._ws_metadata[ws]["flight_numbers"].add(flight_number.upper())
+
+        await self.ensure_push_listener(location_iata, flight_number)
+
+    async def unsubscribe_push(
+        self,
+        ws: WebSocket,
+        location_iata: str,
+        flight_number: str
+    ) -> None:
         """Unsubscribe WebSocket from push notifications."""
-        room = self.push_room(trip_id)
+        room = self.push_room(location_iata, flight_number)
         await self.leave_room(ws, room)
 
-    async def ensure_push_listener(self, trip_id: str) -> None:
+        # Remove flight number from metadata
+        if ws in self._ws_metadata:
+            self._ws_metadata[ws]["flight_numbers"].discard(flight_number.upper())
+
+    async def ensure_push_listener(
+        self,
+        location_iata: str,
+        flight_number: str
+    ) -> None:
         """Ensure Redis listener is running for push notifications."""
-        channel = f"flight:push:{trip_id}"
+        channel = f"flight:push:{location_iata.upper()}:{flight_number.upper()}"
 
         async with self._lock:
             if channel in self._listeners:
                 return
 
-            task = asyncio.create_task(self._listen_push(trip_id, channel))
+            task = asyncio.create_task(
+                self._listen_push(location_iata, flight_number, channel)
+            )
             self._listeners[channel] = task
 
-    async def _listen_push(self, trip_id: str, channel: str) -> None:
+    async def _listen_push(
+        self,
+        location_iata: str,
+        flight_number: str,
+        channel: str
+    ) -> None:
         """Listen for push notifications from Redis pub/sub."""
         r = await self._get_redis()
         pubsub = r.pubsub()
@@ -138,12 +196,8 @@ class FlightWSManager:
                 try:
                     notification = json.loads(data)
                     await self.broadcast_to_room(
-                        self.push_room(trip_id),
-                        {
-                            "type": "push_notification",
-                            "trip_id": trip_id,
-                            "notification": notification,
-                        }
+                        self.push_room(location_iata, flight_number),
+                        notification  # Already formatted by webhook
                     )
                 except Exception:
                     pass
@@ -159,6 +213,43 @@ class FlightWSManager:
 
             async with self._lock:
                 self._listeners.pop(channel, None)
+
+    # =========================================================================
+    # Broadcast to all subscribers of a flight (used by webhook)
+    # =========================================================================
+
+    async def broadcast_push_notification(
+        self,
+        arrival_iata: str,
+        flight_number: str,
+        message: dict
+    ) -> None:
+        """
+        Broadcast push notification to all subscribers watching this flight
+        with matching arrival airport.
+        """
+        room = self.push_room(arrival_iata, flight_number)
+        await self.broadcast_to_room(room, message)
+
+    def get_subscribed_locations_for_flight(
+        self,
+        flight_number: str
+    ) -> Set[str]:
+        """
+        Get all location IATAs that have subscribers for a flight.
+        Used by webhook to determine who to notify.
+        """
+        locations = set()
+        flight_upper = flight_number.upper()
+
+        for room in self._rooms:
+            if room.startswith("push:") and room.endswith(f":{flight_upper}"):
+                # Extract location_iata from room name: push:{location_iata}:{flight_number}
+                parts = room.split(":")
+                if len(parts) == 3:
+                    locations.add(parts[1])
+
+        return locations
 
     # =========================================================================
     # Real-Time Tracking Room (by flight_number + trip_id)

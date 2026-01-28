@@ -17,6 +17,7 @@ Rules:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import time, datetime, date
 from typing import Optional
@@ -408,7 +409,12 @@ class StepFilterService:
         Uses minute precision (no rounding).
         Iterates over windows, each with its own config.
         Ventana sin config (enabled=False o minutes_to_reduce=None) se omite.
+
+        NOTE: Track processed trips to prevent duplicates when windows overlap.
         """
+        # Track trips already processed to prevent duplicates across overlapping windows
+        processed_trips = set()
+
         for window in config.windows:
             # Skip window if disabled or no config
             if not window.enabled or window.minutes_to_reduce is None:
@@ -418,6 +424,10 @@ class StepFilterService:
             filtered_trips = self._filter_by_hotel(trips, window.hotel_names)
 
             for trip in filtered_trips:
+                # Skip if already processed in a previous window
+                if trip.id in processed_trips:
+                    continue
+
                 # Use original if exists, otherwise current
                 base_time = trip.original_pick_up_time or trip.pick_up_time
 
@@ -435,6 +445,7 @@ class StepFilterService:
                     continue
 
                 self._record_change(trip, base_time, new_time, "reduce")
+                processed_trips.add(trip.id)
 
     def _apply_combine(self, trips: list[Trip], config: FilterStepConfig):
         """
@@ -815,7 +826,13 @@ class StepFilterService:
                         self.session.add(trip)
                         trips_recalculated += 1
 
-            await self.session.commit()
+                # CRITICAL FIX: Commit after EACH step to persist flags
+                # This ensures each step's changes are saved before the next step is applied
+                await self.session.commit()
+
+                # Refresh trip_lookup with committed changes for next iteration
+                trips = await self.session.exec(trips_query).all()
+                trip_lookup = {t.id: t for t in trips}
         else:
             # No remaining steps, clear original_pick_up_time
             for trip in trips:
@@ -826,6 +843,11 @@ class StepFilterService:
 
         # Get updated stack state
         stack_state = await self.get_stack(location_id, airline, str(pick_up_date))
+
+        # RACE CONDITION FIX: Add small delay to ensure all commits are fully visible
+        # in the database before WebSocket event triggers frontend refetch.
+        # Without this, frontend can refetch between commits and see incomplete data.
+        await asyncio.sleep(0.05)  # 50ms delay for commit propagation
 
         # Send notification
         await self._send_revert_notification(location_id, airline, step_id, filter_type)

@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 from timezonefinder import TimezoneFinder
 import json
 from shared.redis.redis_client import redis_client
+from shared.redis.redis_safe import safe_redis_call
 from psqlmodel import Select
 from shared.db.schemas import Location
 
@@ -18,7 +19,12 @@ async def save_trip_event_to_redis(trip_id: str, event_data: dict):
         event_data (dict): The event data to store.
     """
     key = f"trip:{trip_id}"
-    await redis_client.set(key, json.dumps(event_data))
+    await safe_redis_call(
+        redis_client.set,
+        key,
+        json.dumps(event_data),
+        context=f"set {key}",
+    )
 
 async def get_trip_event_from_redis(trip_id: str):
     """
@@ -29,7 +35,12 @@ async def get_trip_event_from_redis(trip_id: str):
         dict or None: The event data if exists, else None.
     """
     key = f"trip:{trip_id}"
-    data = await redis_client.get(key)
+    data = await safe_redis_call(
+        redis_client.get,
+        key,
+        context=f"get {key}",
+        default=None,
+    )
     return json.loads(data) if data else None
 
 async def get_locations_by_org_id(session, org_id):

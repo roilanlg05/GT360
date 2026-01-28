@@ -7,6 +7,7 @@ from datetime import timedelta, datetime, timezone
 from jose import jwt, JWTError
 from shared.settings import settings
 from shared.redis.redis_client import redis_client
+from shared.redis.redis_safe import safe_redis_call
 import secrets
 import hashlib
 from features.trips.utils import get_locations_by_org_id
@@ -453,9 +454,22 @@ async def blacklist_token(token: str, exp_seconds: int = 300):
     Returns:
         None
     """
-    if await redis_client.exists(f"blacklist:{token}"):
+    key = f"blacklist:{token}"
+    exists = await safe_redis_call(
+        redis_client.exists,
+        key,
+        context=f"exists {key}",
+        default=False,
+    )
+    if exists:
         raise ValueError("Token revoked")
-    await redis_client.setex(f"blacklist:{token}", exp_seconds, "blacklisted")
+    await safe_redis_call(
+        redis_client.setex,
+        key,
+        exp_seconds,
+        "blacklisted",
+        context=f"setex {key}",
+    )
 
 def verify_role(roles: list):
         

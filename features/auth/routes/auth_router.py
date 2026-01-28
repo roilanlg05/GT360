@@ -162,7 +162,7 @@ async def register_driver(
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
 
-    hashed_pass = hash_pwd(user_data.password)
+    hashed_pass = hash_pwd(secrets.token_urlsafe(12))
 
     try:
         # Verificar que la organización existe
@@ -176,6 +176,8 @@ async def register_driver(
 
         user = User(
             email=user_data.email.lower(),
+            first_name=user_data.first_name,
+            last_name=user_data.last_name,
             password_hash=hashed_pass,
             phone=user_data.phone,
             role="driver"
@@ -185,7 +187,8 @@ async def register_driver(
 
         driver = Driver(
             id=user.id,
-            organization_id=user_data.organization_id
+            organization_id=user_data.organization_id,
+            location_id=user_data.location_id,
         )
         session.add(driver)
 
@@ -265,15 +268,15 @@ async def sign_in(
     match user.role:
         case "manager":
             org_row = await session.exec(Select(Manager.organization_id).Where(Manager.id == user.id)).first()
-            if org_row[0] and org_row.organization_id:
+            if org_row and org_row.organization_id:
                 metadata["organization_id"] = str(org_row.organization_id)
         case "crew":
             airline_row = await session.exec(Select(Crew.airline).Where(Crew.id == user.id)).first()
-            if airline_row[0] and airline_row.airline:
+            if airline_row and airline_row.airline:
                 metadata["airline"] = airline_row.airline
         case "driver":
             driver_row = await session.exec(Select(Driver.organization_id, Driver.location_id).Where(Driver.id == user.id)).first()
-            if driver_row[0] and driver_row.organization_id:
+            if driver_row and driver_row.organization_id:
                 metadata["organization_id"] = str(driver_row.organization_id)
                 metadata["location_id"] = str(driver_row.location_id)
 
@@ -295,6 +298,10 @@ async def sign_in(
                 "access_token": access_token["access_token"],
                 "expires_at": access_token["exp"],  
                 "type": "Bearer"
+            },
+            "refresh_token": {
+                "refresh": raw,
+                "expires_at": exp
             },
             "user_data": metadata
         }
@@ -350,14 +357,20 @@ async def refresh_token(
     }
 
     # Agregar campos específicos del rol
-    if user.role == "manager":
-        org_row = await session.exec(Select(Manager.organization_id).Where(Manager.id == user.id)).first()
-        if org_row[0] and org_row.organization_id:
-            metadata["organization_id"] = str(org_row.organization_id)
-    elif user.role == "crew":
-        airline_row = await session.exec(Select(Crew.airline).Where(Crew.id == user.id)).first()
-        if airline_row[0] and airline_row.airline:
-            metadata["airline"] = airline_row.airline
+    match user.role:
+        case "manager":
+            org_row = await session.exec(Select(Manager.organization_id).Where(Manager.id == user.id)).first()
+            if org_row and org_row.organization_id:
+                metadata["organization_id"] = str(org_row.organization_id)
+        case "crew":
+            airline_row = await session.exec(Select(Crew.airline).Where(Crew.id == user.id)).first()
+            if airline_row and airline_row.airline:
+                metadata["airline"] = airline_row.airline
+        case "driver":
+            driver_row = await session.exec(Select(Driver.organization_id, Driver.location_id).Where(Driver.id == user.id)).first()
+            if driver_row and driver_row.organization_id:
+                metadata["organization_id"] = str(driver_row.organization_id)
+                metadata["location_id"] = str(driver_row.location_id)
                
 
     access_token = encode_token(str(user.id), metadata)
@@ -367,7 +380,11 @@ async def refresh_token(
 
     resp = {"data":{ 
                 "session": access_token,
-                "user_data": metadata 
+                "user_data": metadata,
+                "refresh_token": {
+                    "refresh": new_raw,
+                    "expires_at": new_exp
+            },
                 }}
     
     await session.commit()

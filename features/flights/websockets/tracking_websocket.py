@@ -242,11 +242,11 @@ async def ws_flight_tracking(ws: WebSocket, token: str):
             })
 
     except WebSocketDisconnect:
-        logger.debug("WebSocket disconnected normally")
+        pass  # Normal disconnection
     except (ConnectionClosedError, ConnectionClosedOK):
-        logger.debug("WebSocket connection closed")
-    except Exception as e:
-        logger.warning(f"WebSocket error: {e}")
+        pass  # Connection closed by client
+    except Exception:
+        pass  # Suppress all WS errors (client disconnected)
     finally:
         # Cleanup: cancel all tracking tasks
         if ws in _tracking_tasks:
@@ -254,7 +254,10 @@ async def ws_flight_tracking(ws: WebSocket, token: str):
                 task.cancel()
             del _tracking_tasks[ws]
 
-        await manager.disconnect(ws)
+        try:
+            await manager.disconnect(ws)
+        except Exception:
+            pass
 
         # Only close if connection is still open
         if ws.client_state == WebSocketState.CONNECTED:

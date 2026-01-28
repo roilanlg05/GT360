@@ -28,7 +28,7 @@ class HTTPErrorHandler(BaseHTTPMiddleware):
             logger.error(f"Unhandled error on {request.method} {request.url.path}: {error_msg}")
             logger.error(tb)
             # Include error details for debugging
-            return JSONResponse(
+            response = JSONResponse(
                 content={
                     "detail": "Internal server error",
                     "error": error_msg,
@@ -36,3 +36,17 @@ class HTTPErrorHandler(BaseHTTPMiddleware):
                 },
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
+
+            # Add CORS headers to error response
+            origin = request.headers.get("origin")
+            allowed_origins = [
+                "https://www.gt360.com",
+                "https://gt360.com",
+                "https://web.gt360.app",
+                "https://charmaine-leadless-ryleigh.ngrok-free.dev"
+            ]
+            if origin in allowed_origins:
+                response.headers["Access-Control-Allow-Origin"] = origin
+                response.headers["Access-Control-Allow-Credentials"] = "true"
+
+            return response

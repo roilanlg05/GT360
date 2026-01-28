@@ -100,7 +100,12 @@ async def _populate_redis_cache(location_id: str, trips: list) -> None:
             pipe.sadd(idx_key, trip_id)
 
     pipe.expire(idx_key, TRIP_TTL_SECONDS)
-    await pipe.execute()
+    try:
+        await pipe.execute()
+    except Exception:
+        # Cache population is best-effort; if Redis is unavailable or read-only,
+        # the app continues working with DB fallback
+        pass
 
 
 async def send_snapshot(ws: WebSocket, location_id: str) -> None:
