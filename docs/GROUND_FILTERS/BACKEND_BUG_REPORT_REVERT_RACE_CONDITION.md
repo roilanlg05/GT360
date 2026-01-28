@@ -34,7 +34,7 @@ Después de una investigación exhaustiva del código frontend, **confirmo que a
 
 Se reportan **3 problemas críticos** en el sistema de Ground Filters que requieren atención y un analisis critico del backend:
 
-1. **🐛 Bug: Columna Ground Filters "Va Un Paso Atrás" después de Revert** (CRÍTICO)
+1. **🐛 Bug: Columna Ground Filters "Va Un Paso erroneo" después de Revert** (CRÍTICO)
 2. **⚡ Performance: Reverts tardan 8-15 segundos** (MEDIO)
 3. **📊 Request: Trips Independientes en Notificaciones** (MEJORA)
 
@@ -90,7 +90,7 @@ Aplicando y revirtiendo filtros uno por uno:
    ✅ Columna: vacía (CORRECTO finalmente)
 ```
 
-**Patrón:** La columna comienza vacia y luego muestra el estado del erroneo 
+**Patrón:** La columna comienza vacia y luego muestra el estado erroneo 
 ### Logs del Frontend
 
 #### Después de Revertir EXPAND:
