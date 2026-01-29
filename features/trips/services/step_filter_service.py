@@ -573,16 +573,14 @@ class StepFilterService:
 
     async def _apply_expand(self, trips: list[Trip], config: FilterStepConfig):
         """
-        Apply Expand filter with smart 3-attempt strategy.
+        Apply Expand with CHAIN PATTERN approach.
 
-        Attempts:
-        1. Both: A moves back max_shift, B moves forward max_shift
-        2. Only A: A moves back max_shift, B stays
-        3. Only B: A stays, B moves forward max_shift
+        Identifica cadenas de trips con gaps pequeños y aplica patrones fijos:
+        - Cadena de 2: [-max, +max]
+        - Cadena de 3: [-max, 0, +max]
+        - Cadena de 4+: EXCLUIR (dejaría gaps intermedios problemáticos)
 
-        Rule A: A trip modified by Expand cannot be modified again.
         PRIORITY RULE: If Combine already modified a trip, Expand cannot touch it.
-        Procesa cada ventana con su propia config.
         """
         for window in config.windows:
             # Skip window if disabled or no config
@@ -608,111 +606,123 @@ class StepFilterService:
                 key=lambda t: self._time_to_minutes(self._get_effective_time(t))
             )
 
-            for i in range(len(sorted_trips) - 1):
-                trip_a = sorted_trips[i]
-                trip_b = sorted_trips[i + 1]
+            # PRIORITY RULE: Filter out trips blocked by Combine
+            available_trips = [
+                t for t in sorted_trips
+                if not t.combine_applied
+            ]
 
-                # Rule A check
-                if (trip_a.id in self.modified_by_combine_expand or
-                    trip_b.id in self.modified_by_combine_expand):
+            if len(available_trips) < 2:
+                continue
+
+            # Group by location (pickup_location, drop_off_location)
+            from collections import defaultdict
+            location_groups = defaultdict(list)
+            for trip in available_trips:
+                key = (trip.pick_up_location, trip.drop_off_location)
+                location_groups[key].append(trip)
+
+            # Process each location group independently
+            for (pickup_loc, dropoff_loc), group_trips in location_groups.items():
+                if len(group_trips) < 2:
                     continue
 
-                # PRIORITY RULE: Combine has absolute priority
-                if trip_a.combine_applied or trip_b.combine_applied:
-                    logger.info(
-                        f"[PRIORITY_RULE] Expand skipping pair "
-                        f"({trip_a.id}, {trip_b.id}): "
-                        f"Combine already claimed these trips "
-                        f"(combine_applied: {trip_a.combine_applied}, {trip_b.combine_applied})"
-                    )
-                    self._record_exclusion(
-                        f"expand({trip_a.id}, {trip_b.id})",
-                        [trip_a.id, trip_b.id],
-                        "Skipped: Combine has priority (applied in earlier step)",
-                        0,
-                        0,
-                        trips=[trip_a, trip_b],
-                    )
-                    continue
+                # Identify chains within this location group
+                chains = self._identify_expand_chains(
+                    group_trips,
+                    max_gap=window.max_gap,
+                    max_shift=window.max_shift
+                )
 
-                time_a = self._get_effective_time(trip_a)
-                time_b = self._get_effective_time(trip_b)
+                # Apply pattern to each chain
+                for chain in chains:
+                    pattern = self._get_expand_pattern(len(chain), window.max_shift)
 
-                gap = self._minutes_between(time_a, time_b)
-
-                if window.min_gap <= gap <= window.max_gap:
-                    # Get neighbors for collision check
-                    prev_time = self._get_effective_time(sorted_trips[i - 1]) if i > 0 else None
-                    next_time = self._get_effective_time(sorted_trips[i + 2]) if i + 2 < len(sorted_trips) else None
-
-                    # Try smart expand
-                    result = self._smart_expand(
-                        time_a, time_b, window.max_shift,
-                        prev_time, next_time, window,
-                        trip_a, trip_b
-                    )
-
-                    if result:
-                        new_time_a, new_time_b, attempt_name = result
-
-                        self._record_change(trip_a, time_a, new_time_a, "expand")
-                        self._record_change(trip_b, time_b, new_time_b, "expand")
-
-                        self.modified_by_combine_expand.add(trip_a.id)
-                        self.modified_by_combine_expand.add(trip_b.id)
-
-                        logger.debug(
-                            f"[STEP_FILTER] Expand succeeded with {attempt_name}: "
-                            f"{time_a}->{new_time_a}, {time_b}->{new_time_b}"
+                    if pattern is None:
+                        # Chain of 4+ trips → EXCLUDE
+                        self._record_exclusion(
+                            f"expand_chain({len(chain)} trips)",
+                            [t.id for t in chain],
+                            f"Chain of {len(chain)} trips would leave intermediate gaps (max 3 allowed)",
+                            0,
+                            0,
+                            trips=chain,
                         )
+                        logger.info(
+                            f"[EXPAND_CHAIN] Excluded chain of {len(chain)} trips at {pickup_loc} "
+                            f"(max 3 allowed)"
+                        )
+                        continue
 
-    def _smart_expand(
+                    # Apply shifts from pattern
+                    for i, trip in enumerate(chain):
+                        shift = pattern[i]
+                        if shift != 0:
+                            old_time = self._get_effective_time(trip)
+                            new_time = self._add_minutes(old_time, shift)
+                            self._record_change(trip, old_time, new_time, "expand")
+
+                    logger.debug(
+                        f"[EXPAND_CHAIN] Applied pattern {pattern} to chain of {len(chain)} trips "
+                        f"at {pickup_loc}→{dropoff_loc}"
+                    )
+
+    def _identify_expand_chains(
         self,
-        time_a: time,
-        time_b: time,
-        max_shift: int,
-        prev_time: Optional[time],
-        next_time: Optional[time],
-        window: TimeWindow,
-        trip_a: Trip,
-        trip_b: Trip
-    ) -> Optional[tuple[time, time, str]]:
+        trips: list[Trip],
+        max_gap: int,
+        max_shift: int
+    ) -> list[list[Trip]]:
         """
-        Smart expand with 3 attempts.
+        Identifica cadenas de trips con gaps pequeños.
 
-        Returns (new_time_a, new_time_b, attempt_name) or None if all fail.
+        Umbral de cadena = max_gap + (max_shift × 2) + 1
+
+        Si gap entre trips consecutivos <= (umbral - 1), están en la misma cadena.
+        Si gap >= umbral, son cadenas diferentes.
+
+        Returns: Lista de cadenas (cada cadena es una lista de trips).
         """
-        attempts = [
-            ("both", -max_shift, +max_shift),
-            ("only_a", -max_shift, 0),
-            ("only_b", 0, +max_shift),
-        ]
+        if not trips:
+            return []
 
-        for attempt_name, shift_a, shift_b in attempts:
-            try:
-                new_time_a = self._add_minutes(time_a, shift_a)
-                new_time_b = self._add_minutes(time_b, shift_b)
-            except ValueError:
-                # Time would go outside day - try next attempt
-                continue
+        threshold = max_gap + (max_shift * 2) + 1
+        chains = []
+        current_chain = [trips[0]]
 
-            # Validate times stay within day (redundant now but kept for clarity)
-            if not self._is_valid_time(new_time_a) or not self._is_valid_time(new_time_b):
-                continue
+        for i in range(1, len(trips)):
+            prev_time = self._get_effective_time(trips[i-1])
+            curr_time = self._get_effective_time(trips[i])
+            gap = self._minutes_between(prev_time, curr_time)
 
-            # Return the first valid attempt (no collision checks with Rule B removed)
-            return new_time_a, new_time_b, attempt_name
+            if gap <= threshold - 1:  # Gap pequeño → misma cadena
+                current_chain.append(trips[i])
+            else:
+                # Gap grande → nueva cadena
+                if len(current_chain) >= 2:
+                    chains.append(current_chain)
+                current_chain = [trips[i]]
 
-        # All attempts failed
-        self._record_exclusion(
-            f"expand({trip_a.id}, {trip_b.id})",
-            [trip_a.id, trip_b.id],
-            "All 3 expand attempts failed (collision or invalid time)",
-            self._minutes_between(time_a, time_b),
-            0,
-            trips=[trip_a, trip_b],
-        )
-        return None
+        # Agregar última cadena si tiene al menos 2 trips
+        if len(current_chain) >= 2:
+            chains.append(current_chain)
+
+        return chains
+
+    def _get_expand_pattern(self, chain_length: int, max_shift: int) -> Optional[list[int]]:
+        """
+        Retorna patrón de shifts según tamaño de cadena.
+
+        - Cadena de 2: [-max, +max]
+        - Cadena de 3: [-max, 0, +max]
+        - Cadena de 4+: None (excluir, dejaría gaps intermedios)
+        """
+        if chain_length == 2:
+            return [-max_shift, +max_shift]
+        elif chain_length == 3:
+            return [-max_shift, 0, +max_shift]
+        else:
+            return None  # Cadenas de 4+ no se procesan
 
     # =========================================================================
     # Internal Revert Logic
