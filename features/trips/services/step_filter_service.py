@@ -676,7 +676,7 @@ class StepFilterService:
         """
         Identifica cadenas de trips con gaps pequeños.
 
-        Umbral de cadena = max_gap + (max_shift × 2) + 1
+        Umbral de cadena = max_gap + max_shift
 
         Si gap entre trips consecutivos <= (umbral - 1), están en la misma cadena.
         Si gap >= umbral, son cadenas diferentes.
@@ -686,7 +686,7 @@ class StepFilterService:
         if not trips:
             return []
 
-        threshold = max_gap + (max_shift * 2) + 1
+        threshold = max_gap + max_shift
         chains = []
         current_chain = [trips[0]]
 
