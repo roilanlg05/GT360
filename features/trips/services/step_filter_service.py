@@ -713,16 +713,26 @@ class StepFilterService:
         """
         Retorna patrón de shifts según tamaño de cadena.
 
-        - Cadena de 2: [-max, +max]
-        - Cadena de 3: [-max, 0, +max]
-        - Cadena de 4+: None (excluir, dejaría gaps intermedios)
+        Patrón: Expandir solo los BORDES (primer y último trip)
+
+        - 2 trips: [-max, +max]
+        - 3 trips: [-max, 0, +max]
+        - 4 trips: [-max, 0, 0, +max]
+        - 5 trips: [-max, 0, 0, 0, +max]
+        - 6 trips: [-max, 0, 0, 0, 0, +max]
+        - 7+ trips: None (excluir, cadena muy larga)
         """
-        if chain_length == 2:
-            return [-max_shift, +max_shift]
-        elif chain_length == 3:
-            return [-max_shift, 0, +max_shift]
+        if chain_length < 2:
+            return None
+        elif chain_length > 6:
+            return None  # Cadenas de 7+ trips son muy largas
         else:
-            return None  # Cadenas de 4+ no se procesan
+            # Patrón general: [-max, 0, 0, ..., 0, +max]
+            # Primer trip: -max_shift
+            # Trips del medio: 0
+            # Último trip: +max_shift
+            pattern = [-max_shift] + [0] * (chain_length - 2) + [+max_shift]
+            return pattern
 
     # =========================================================================
     # Internal Revert Logic
