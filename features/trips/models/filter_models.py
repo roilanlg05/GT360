@@ -284,9 +284,12 @@ class EligibilityResult(BaseModel):
     location_id: UUID
     airline: str
     pick_up_date: str
+    filter_type: Optional[str] = None  # "reduce" | "combine" | "expand" (if checking specific type)
     total_trips: int
     eligible_trips: int
-    already_filtered: int
+    already_filtered: int  # Trips with ANY filter
+    trips_with_filter: Optional[int] = None  # Trips with THIS specific filter (if filter_type provided)
+    trips_new: Optional[int] = None  # Trips WITHOUT this filter (if filter_type provided)
     by_hotel: dict = Field(default_factory=dict)  # {"Hotel A": 10, "Hotel B": 5}
     by_time_range: dict = Field(default_factory=dict)  # {"00:00-06:00": 5, ...}
 

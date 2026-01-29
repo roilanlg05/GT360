@@ -267,10 +267,12 @@ class StepFilterService:
                 f"(total changes: {len(self.changes)})"
             )
 
-            # Send notification with independent count
+            # Send notification with independent count and total changes
             if self.changes:
                 await self._send_step_notification(
-                    location_id, airline, step_id, config.filter_type, independent_count
+                    location_id, airline, step_id, config.filter_type,
+                    trips_affected=independent_count,
+                    total_changes=len(self.changes)
                 )
 
         except Exception as e:
@@ -395,9 +397,14 @@ class StepFilterService:
         location_id: UUID,
         airline: str,
         pick_up_date_str: str,
+        filter_type: str = None,
     ) -> EligibilityResult:
         """
         Check filter eligibility for a day.
+
+        If filter_type is provided, returns breakdown of trips that:
+        - Already have this specific filter applied
+        - Would be NEW for this filter
         """
         pick_up_date = date.fromisoformat(pick_up_date_str)
 
@@ -415,20 +422,37 @@ class StepFilterService:
         # Count by hotel
         by_hotel: dict[str, int] = defaultdict(int)
         already_filtered = 0
+        trips_with_filter = 0
 
         for trip in trips:
             hotel = trip.pick_up_location or "Unknown"
             by_hotel[hotel] += 1
+
+            # General: ¿tiene algún filtro?
             if trip.original_pick_up_time is not None:
                 already_filtered += 1
+
+            # Específico: ¿tiene ESTE filtro?
+            if filter_type:
+                filter_flag = f"{filter_type}_applied"
+                if getattr(trip, filter_flag, False):
+                    trips_with_filter += 1
+
+        # Calcular trips nuevos para este filtro
+        trips_new = None
+        if filter_type:
+            trips_new = len(trips) - trips_with_filter
 
         return EligibilityResult(
             location_id=location_id,
             airline=airline,
             pick_up_date=pick_up_date_str,
+            filter_type=filter_type,
             total_trips=len(trips),
             eligible_trips=len(trips),  # All outbound scheduled are eligible
             already_filtered=already_filtered,
+            trips_with_filter=trips_with_filter if filter_type else None,
+            trips_new=trips_new,
             by_hotel=dict(by_hotel),
         )
 
@@ -1169,10 +1193,27 @@ class StepFilterService:
         step_id: UUID,
         filter_type: str,
         trips_affected: int,
+        total_changes: int = None,
     ):
-        """Send notification when a step is applied."""
+        """
+        Send notification when a step is applied.
+
+        Args:
+            trips_affected: Trips NEWLY affected by this filter
+            total_changes: Total trips modified (including re-applications)
+        """
         from shared.redis.redis_client import redis_client
         import json
+
+        # If total_changes not provided, use trips_affected
+        if total_changes is None:
+            total_changes = trips_affected
+
+        # Intelligent message
+        if trips_affected == 0 and total_changes > 0:
+            message = f"Filter re-applied: {filter_type} ({total_changes} trips updated)"
+        else:
+            message = f"Filter applied: {filter_type} ({trips_affected} new trips)"
 
         event = {
             "type": "step_applied",
@@ -1180,9 +1221,10 @@ class StepFilterService:
             "airline": airline,
             "step_id": str(step_id),
             "filter_type": filter_type,
-            "trips_affected": trips_affected,
+            "trips_affected": trips_affected,  # Solo nuevos
+            "total_changes": total_changes,     # Total modificados
             "timestamp": datetime.utcnow().isoformat(),
-            "message": f"Filter step applied: {filter_type} ({trips_affected} trips)"
+            "message": message
         }
 
         channel = f"loc:{location_id}"
@@ -1195,7 +1237,7 @@ class StepFilterService:
 
         logger.info(
             f"[STEP_FILTER] Notification sent: step={step_id}, "
-            f"filter={filter_type}, trips={trips_affected}"
+            f"filter={filter_type}, new={trips_affected}, total={total_changes}"
         )
 
     async def _send_revert_notification(

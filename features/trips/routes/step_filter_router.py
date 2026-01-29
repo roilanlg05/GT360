@@ -221,6 +221,7 @@ async def get_eligibility(
     location_id: str,
     airline: str,
     pick_up_date: str = Query(..., description="Date in YYYY-MM-DD format"),
+    filter_type: str = Query(None, description="Filter type to check: reduce, combine, or expand"),
     session: AsyncSession = Depends(get_db),
     _role=Depends(verify_role(["manager"]))
 ) -> EligibilityResult:
@@ -232,10 +233,12 @@ async def get_eligibility(
     - Eligible trips (outbound, scheduled)
     - Trips already filtered
     - Breakdown by hotel
+    - If filter_type provided: trips with/without this specific filter
 
     - **location_id**: Location UUID
     - **airline**: Airline code (e.g., "WN", "AA")
     - **pick_up_date**: Target date (YYYY-MM-DD)
+    - **filter_type**: Optional filter type ("reduce", "combine", "expand")
     """
     try:
         location_uuid = UUID(location_id)
@@ -245,7 +248,7 @@ async def get_eligibility(
     service = StepFilterService(session)
 
     try:
-        result = await service.get_eligibility(location_uuid, airline, pick_up_date)
+        result = await service.get_eligibility(location_uuid, airline, pick_up_date, filter_type)
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
