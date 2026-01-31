@@ -76,3 +76,63 @@ class TripResponse(BaseModel):
 
 class AssignUnassignDriverToTrip(BaseModel):
     driver_id: UUID
+
+
+class LocationDetails(BaseModel):
+    """Detalles de location para endpoint de trip details."""
+    id: UUID
+    name: str
+    timezone: str
+    address: Optional[str] = None
+    coordinates: Optional[dict] = None  # GeoJSON Point
+    radio_zone: Optional[float] = None
+    validation_status: str
+    provider: Optional[str] = None
+    model_config = {"from_attributes": True}
+
+
+class DriverDetails(BaseModel):
+    """Detalles de driver incluyendo info de User."""
+    id: UUID
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    email: str
+    phone: Optional[str] = None
+    pay_type: Optional[str] = None
+    is_active: bool
+    current_location: Optional[dict] = None  # GeoJSON Point del GPS
+    model_config = {"from_attributes": True}
+
+
+class FilterStepDetails(BaseModel):
+    """Detalles del filter step aplicado."""
+    id: UUID
+    filter_type: str  # reduce/combine/expand
+    step_order: int
+    config: dict
+    windows: list[dict]
+    trips_affected: int
+    created_at: datetime
+    is_active: bool
+    model_config = {"from_attributes": True}
+
+
+class HotelDetails(BaseModel):
+    """Detalles de hotel para pickup/dropoff."""
+    id: UUID
+    name: str
+    address: Optional[str] = None
+    coordinates: Optional[dict] = None  # GeoJSON Point
+    radio_zone: Optional[float] = None
+    validation_status: str
+    model_config = {"from_attributes": True}
+
+
+class TripDetailedResponse(BaseModel):
+    """Respuesta completa con trip y todos los datos relacionados."""
+    trip: dict  # Serializado con model_dump_with_time_format
+    location: LocationDetails
+    driver: Optional[DriverDetails] = None
+    filter_step: Optional[FilterStepDetails] = None
+    pickup_hotel: Optional[HotelDetails] = None
+    dropoff_hotel: Optional[HotelDetails] = None

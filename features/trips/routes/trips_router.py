@@ -5,9 +5,19 @@ from fastapi.responses import JSONResponse
 from shared.db.db_config import get_db
 from psqlmodel import Select, Count, Delete, AsyncSession, With, RawExpression, NotExists
 from psqlmodel.utils import unnest, Array
-from shared.db.schemas import Trip as TripDB, Location, Airport, Organization, Hotel
+from shared.db.schemas import Trip as TripDB, Location, Airport, Organization, Hotel, Driver, User, FilterStep
 from features.trips.utils.trip_importer import load_trips_from_bytes
-from features.trips.models import TripUpdate, CreateTrip, LocationZoneUpdate, HotelPointUpdate
+from features.trips.models import (
+    TripUpdate,
+    CreateTrip,
+    LocationZoneUpdate,
+    HotelPointUpdate,
+    TripDetailedResponse,
+    LocationDetails,
+    DriverDetails,
+    FilterStepDetails,
+    HotelDetails
+)
 from features.trips.models.qr_models import CreateQRCode, UpdateQRCode, QRCodeResponse
 from shared.middlewares.user_context import get_user_time_format
 from shared.utils.serialization import model_dump_with_time_format
@@ -651,6 +661,134 @@ async def get_trips(
         "limit": limit,
         "total": total
     }
+
+
+@router.get("/v1/locations/{location_id}/trips/{trip_id}/details")
+async def get_trip_details(
+    location_id: str,
+    trip_id: str,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["manager", "driver"]))
+):
+    """
+    Retorna detalles completos de un trip con todos los datos relacionados.
+
+    Incluye:
+    - Trip completo (23 campos)
+    - Location (timezone, address, coordenadas)
+    - Driver (si está asignado): info de usuario + GPS actual
+    - FilterStep (si se aplicaron filtros): configuración y ventanas
+    - Hotels (pickup y dropoff): direcciones, coordenadas, geofence
+
+    Returns:
+        dict: Trip details con objetos relacionados anidados
+
+    Raises:
+        400: UUID inválido
+        404: Trip no encontrado
+        403: Driver intentando acceder a trip no asignado
+    """
+    # 1. Validar UUIDs
+    try:
+        location_uuid = UUID(location_id)
+        trip_uuid = UUID(trip_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid UUID format")
+
+    # 2. Query principal: Trip + Location (ambos requeridos)
+    trip_location_stmt = (
+        Select(TripDB, Location)
+        .From(TripDB)
+        .Join(Location).On(TripDB.location_id == Location.id)
+        .Where((TripDB.id == trip_uuid) & (TripDB.location_id == location_uuid))
+    )
+
+    result = await session.exec(trip_location_stmt).first()
+    if not result:
+        raise HTTPException(status_code=404, detail="Trip not found")
+
+    trip, location = result
+
+    # 3. Verificar permisos de driver
+    user_data = request.state.user_data
+    if user_data.get("role") == "driver":
+        user_id = UUID(user_data.get("user_id"))
+        if trip.assigned_driver != user_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Drivers can only view trips assigned to them"
+            )
+
+    # 4. Query Driver + User (solo si está asignado)
+    driver_details = None
+    if trip.assigned_driver:
+        driver_stmt = (
+            Select(Driver, User)
+            .From(Driver)
+            .Join(User).On(Driver.id == User.id)
+            .Where(Driver.id == trip.assigned_driver)
+        )
+        driver_result = await session.exec(driver_stmt).first()
+        if driver_result:
+            driver, user = driver_result
+            driver_details = DriverDetails(
+                id=driver.id,
+                first_name=user.first_name,
+                last_name=user.last_name,
+                email=user.email,
+                phone=user.phone,
+                pay_type=driver.pay_type,
+                is_active=driver.is_active,
+                current_location=driver.point
+            )
+
+    # 5. Query FilterStep (solo si se aplicó filtro)
+    filter_step_details = None
+    if trip.current_step_id:
+        filter_step_stmt = Select(FilterStep).Where(FilterStep.id == trip.current_step_id)
+        filter_step = await session.exec(filter_step_stmt).first()
+        if filter_step:
+            filter_step_details = FilterStepDetails.model_validate(filter_step)
+
+    # 6. Query Hotels (match por nombre en pickup/dropoff location)
+    hotels_stmt = (
+        Select(Hotel)
+        .Where(
+            (Hotel.location_id == location_uuid) &
+            (Hotel.name.in_([trip.pick_up_location, trip.drop_off_location]))
+        )
+    )
+    hotels = await session.exec(hotels_stmt).all()
+
+    # Mapear hotels por nombre
+    pickup_hotel_details = None
+    dropoff_hotel_details = None
+    for hotel in hotels:
+        if hotel.name == trip.pick_up_location:
+            pickup_hotel_details = HotelDetails.model_validate(hotel)
+        if hotel.name == trip.drop_off_location:
+            dropoff_hotel_details = HotelDetails.model_validate(hotel)
+
+    # 7. Serializar trip con formato de tiempo del usuario
+    time_format = await get_user_time_format(request, session)
+    trip_dict = model_dump_with_time_format(trip, time_format)
+
+    # 8. Construir respuesta
+    response = TripDetailedResponse(
+        trip=trip_dict,
+        location=LocationDetails.model_validate(location),
+        driver=driver_details,
+        filter_step=filter_step_details,
+        pickup_hotel=pickup_hotel_details,
+        dropoff_hotel=dropoff_hotel_details
+    )
+
+    return JSONResponse(
+        status_code=200,
+        content=response.model_dump(mode="json")
+    )
+
 
 @router.delete("/v1/locations/{location_id}/trips/all")
 async def delete_all_trips(    
