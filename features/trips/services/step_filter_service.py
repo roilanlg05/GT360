@@ -663,18 +663,18 @@ class StepFilterService:
                     pattern = self._get_expand_pattern(len(chain), window.max_shift)
 
                     if pattern is None:
-                        # Chain of 4+ trips → EXCLUDE
+                        # Chain of 7+ trips → EXCLUDE
                         self._record_exclusion(
                             f"expand_chain({len(chain)} trips)",
                             [t.id for t in chain],
-                            f"Chain of {len(chain)} trips would leave intermediate gaps (max 3 allowed)",
+                            f"Chain of {len(chain)} trips exceeds maximum allowed (max 6 trips)",
                             0,
                             0,
                             trips=chain,
                         )
                         logger.info(
                             f"[EXPAND_CHAIN] Excluded chain of {len(chain)} trips at {pickup_loc} "
-                            f"(max 3 allowed)"
+                            f"(max 6 allowed)"
                         )
                         continue
 
@@ -702,8 +702,8 @@ class StepFilterService:
 
         Umbral de cadena = max_gap
 
-        Si gap entre trips consecutivos <= (umbral - 1), están en la misma cadena.
-        Si gap >= umbral, son cadenas diferentes.
+        Si gap entre trips consecutivos <= umbral, están en la misma cadena.
+        Si gap > umbral, son cadenas diferentes.
 
         Returns: Lista de cadenas (cada cadena es una lista de trips).
         """
@@ -719,7 +719,7 @@ class StepFilterService:
             curr_time = self._get_effective_time(trips[i])
             gap = self._minutes_between(prev_time, curr_time)
 
-            if gap <= threshold - 1:  # Gap pequeño → misma cadena
+            if gap <= threshold:  # Gap pequeño → misma cadena (consistente con Combine)
                 current_chain.append(trips[i])
             else:
                 # Gap grande → nueva cadena
@@ -737,26 +737,35 @@ class StepFilterService:
         """
         Retorna patrón de shifts según tamaño de cadena.
 
-        Patrón: Expandir solo los BORDES (primer y último trip)
+        Patrón "Acordeón": Expande proporcionalmente desde el centro hacia afuera.
 
         - 2 trips: [-max, +max]
         - 3 trips: [-max, 0, +max]
-        - 4 trips: [-max, 0, 0, +max]
-        - 5 trips: [-max, 0, 0, 0, +max]
-        - 6 trips: [-max, 0, 0, 0, 0, +max]
+        - 4 trips: [-max, -max/2, +max/2, +max]
+        - 5 trips: [-max, -max/2, 0, +max/2, +max]
+        - 6 trips: [-max, -max/2, -max/4, +max/4, +max/2, +max]
         - 7+ trips: None (excluir, cadena muy larga)
         """
         if chain_length < 2:
             return None
         elif chain_length > 6:
             return None  # Cadenas de 7+ trips son muy largas
-        else:
-            # Patrón general: [-max, 0, 0, ..., 0, +max]
-            # Primer trip: -max_shift
-            # Trips del medio: 0
-            # Último trip: +max_shift
-            pattern = [-max_shift] + [0] * (chain_length - 2) + [+max_shift]
-            return pattern
+
+        half_shift = max_shift // 2
+        quarter_shift = max_shift // 4
+
+        if chain_length == 2:
+            return [-max_shift, +max_shift]
+        elif chain_length == 3:
+            return [-max_shift, 0, +max_shift]
+        elif chain_length == 4:
+            return [-max_shift, -half_shift, +half_shift, +max_shift]
+        elif chain_length == 5:
+            return [-max_shift, -half_shift, 0, +half_shift, +max_shift]
+        elif chain_length == 6:
+            return [-max_shift, -half_shift, -quarter_shift, +quarter_shift, +half_shift, +max_shift]
+
+        return None
 
     # =========================================================================
     # Internal Revert Logic
