@@ -16,7 +16,10 @@ from features.trips.models import (
     LocationDetails,
     DriverDetails,
     FilterStepDetails,
-    HotelDetails
+    HotelDetails,
+    PickUpTripRequest,
+    StartTripRequest,
+    DropOffTripRequest
 )
 from features.trips.models.qr_models import CreateQRCode, UpdateQRCode, QRCodeResponse
 from shared.middlewares.user_context import get_user_time_format
@@ -32,6 +35,7 @@ from shared.db.schemas import TripType, TripStatus
 from shared.redis.redis_client import redis_client as redis
 from shared.redis.redis_safe import safe_redis_call
 import json
+import math
 
 
 
@@ -756,7 +760,7 @@ async def get_trip_details(
         Select(Hotel)
         .Where(
             (Hotel.location_id == location_uuid) &
-            (Hotel.name.in_([trip.pick_up_location, trip.drop_off_location]))
+            (Hotel.name.In([trip.pick_up_location, trip.drop_off_location]))
         )
     )
     hotels = await session.exec(hotels_stmt).all()
@@ -2717,3 +2721,239 @@ async def get_or_create_qr_code(
         "updated_at": qr_code.updated_at.isoformat(),
         "created": True  # Indicates this was newly created
     }
+
+
+def haversine_distance_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """
+    Calcula la distancia entre dos puntos geograficos en millas.
+    """
+    R = 3958.8  # Radio de la Tierra en millas
+
+    lat1_rad = math.radians(lat1)
+    lat2_rad = math.radians(lat2)
+    delta_lat = math.radians(lat2 - lat1)
+    delta_lon = math.radians(lon2 - lon1)
+
+    a = (math.sin(delta_lat / 2) ** 2 +
+         math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(delta_lon / 2) ** 2)
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+    return R * c
+
+
+@router.post("/v1/trips/{trip_id}/pick-up")
+async def pick_up_trip(
+    trip_id: str,
+    request_data: PickUpTripRequest,
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["driver"]))
+):
+    """
+    Marca el pickup de un trip validando que el driver este dentro del radio de la zona de recogida.
+
+    - Recibe la ubicacion del driver y la ubicacion del punto de pickup (hotel/aeropuerto)
+    - Valida que el driver este dentro del radio especificado
+    - Si esta dentro, actualiza picked_up_at con el timestamp actual
+    - Si no esta dentro, retorna error con la distancia actual
+    """
+    try:
+        uuid_trip_id = UUID(trip_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de trip invalido")
+
+    # Validar formato GeoJSON de las ubicaciones
+    driver_loc = request_data.driver_location
+    pickup_loc = request_data.pickup_location
+
+    if driver_loc.get("type") != "Point" or not isinstance(driver_loc.get("coordinates"), list):
+        raise HTTPException(status_code=400, detail="driver_location debe ser un GeoJSON Point valido")
+
+    if pickup_loc.get("type") != "Point" or not isinstance(pickup_loc.get("coordinates"), list):
+        raise HTTPException(status_code=400, detail="pickup_location debe ser un GeoJSON Point valido")
+
+    driver_coords = driver_loc["coordinates"]
+    pickup_coords = pickup_loc["coordinates"]
+
+    if len(driver_coords) < 2 or len(pickup_coords) < 2:
+        raise HTTPException(status_code=400, detail="coordinates debe tener [longitude, latitude]")
+
+    # Extraer lat/lon (GeoJSON es [lon, lat])
+    driver_lon, driver_lat = driver_coords[0], driver_coords[1]
+    pickup_lon, pickup_lat = pickup_coords[0], pickup_coords[1]
+
+    # Calcular distancia en millas
+    distance = haversine_distance_miles(driver_lat, driver_lon, pickup_lat, pickup_lon)
+
+    # Verificar si esta dentro del radio
+    if distance > request_data.radio_zone:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "driver_outside_radius",
+                "message": f"El driver esta fuera del radio de pickup",
+                "distance_miles": round(distance, 4),
+                "radius_miles": request_data.radio_zone
+            }
+        )
+
+    # Buscar el trip
+    trip = await session.exec(
+        Select(TripDB).Where(TripDB.id == uuid_trip_id)
+    ).first()
+
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip no encontrado")
+
+    # Validar que el driver asignado coincida
+    if trip.assigned_driver != request_data.driver_id:
+        raise HTTPException(
+            status_code=403,
+            detail="El driver no esta asignado a este trip"
+        )
+
+    # Actualizar picked_up_at
+    trip.picked_up_at = datetime.now(timezone.utc)
+    trip.status = TripStatus.EN_ROUTE
+    session.add(trip)
+    await session.commit()
+    await session.refresh(trip)
+
+    return JSONResponse(content={
+        "status": "ok",
+        "message": "Pickup registrado exitosamente",
+        "trip_id": str(trip.id),
+        "picked_up_at": trip.picked_up_at.isoformat(),
+        "distance_miles": round(distance, 4)
+    })
+
+
+@router.post("/v1/trips/{trip_id}/start")
+async def start_trip(
+    trip_id: str,
+    request_data: StartTripRequest,
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["driver"]))
+):
+    """
+    Inicia un trip actualizando started_at con el timestamp actual.
+
+    Este endpoint no requiere validacion de ubicacion.
+    """
+    try:
+        uuid_trip_id = UUID(trip_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de trip invalido")
+
+    # Buscar el trip
+    trip = await session.exec(
+        Select(TripDB).Where(TripDB.id == uuid_trip_id)
+    ).first()
+
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip no encontrado")
+
+    # Validar que el driver asignado coincida (si se proporciona driver_id)
+    if request_data.driver_id and trip.assigned_driver != request_data.driver_id:
+        raise HTTPException(
+            status_code=403,
+            detail="El driver no esta asignado a este trip"
+        )
+
+    # Actualizar started_at
+    trip.started_at = datetime.now(timezone.utc)
+    session.add(trip)
+    await session.commit()
+    await session.refresh(trip)
+
+    return JSONResponse(content={
+        "status": "ok",
+        "message": "Trip iniciado exitosamente",
+        "trip_id": str(trip.id),
+        "started_at": trip.started_at.isoformat()
+    })
+
+
+@router.post("/v1/trips/{trip_id}/drop-off")
+async def drop_off_trip(
+    trip_id: str,
+    request_data: DropOffTripRequest,
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["driver"]))
+):
+    """
+    Marca el drop off de un trip validando que el driver este dentro del radio del destino.
+
+    - Recibe la ubicacion del driver y la ubicacion del punto de destino (hotel/aeropuerto)
+    - Valida que el driver este dentro del radio especificado
+    - Si esta dentro, actualiza dropped_off_at con el timestamp actual y status a COMPLETED
+    - Si no esta dentro, retorna error con la distancia actual
+    """
+    try:
+        uuid_trip_id = UUID(trip_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de trip invalido")
+
+    # Validar formato GeoJSON de las ubicaciones
+    driver_loc = request_data.driver_location
+    dropoff_loc = request_data.dropoff_location
+
+    if driver_loc.get("type") != "Point" or not isinstance(driver_loc.get("coordinates"), list):
+        raise HTTPException(status_code=400, detail="driver_location debe ser un GeoJSON Point valido")
+
+    if dropoff_loc.get("type") != "Point" or not isinstance(dropoff_loc.get("coordinates"), list):
+        raise HTTPException(status_code=400, detail="dropoff_location debe ser un GeoJSON Point valido")
+
+    driver_coords = driver_loc["coordinates"]
+    dropoff_coords = dropoff_loc["coordinates"]
+
+    if len(driver_coords) < 2 or len(dropoff_coords) < 2:
+        raise HTTPException(status_code=400, detail="coordinates debe tener [longitude, latitude]")
+
+    # Extraer lat/lon (GeoJSON es [lon, lat])
+    driver_lon, driver_lat = driver_coords[0], driver_coords[1]
+    dropoff_lon, dropoff_lat = dropoff_coords[0], dropoff_coords[1]
+
+    # Calcular distancia en millas
+    distance = haversine_distance_miles(driver_lat, driver_lon, dropoff_lat, dropoff_lon)
+
+    # Verificar si esta dentro del radio
+    if distance > request_data.radio_zone:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "driver_outside_radius",
+                "message": f"El driver esta fuera del radio del destino",
+                "distance_miles": round(distance, 4),
+                "radius_miles": request_data.radio_zone
+            }
+        )
+
+    # Buscar el trip
+    trip = await session.exec(
+        Select(TripDB).Where(TripDB.id == uuid_trip_id)
+    ).first()
+
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip no encontrado")
+
+    # Validar que el driver asignado coincida
+    if trip.assigned_driver != request_data.driver_id:
+        raise HTTPException(
+            status_code=403,
+            detail="El driver no esta asignado a este trip"
+        )
+
+    # Actualizar dropped_off_at y status
+    trip.dropped_off_at = datetime.now(timezone.utc)
+    trip.status = TripStatus.COMPLETED
+    session.add(trip)
+    await session.commit()
+    await session.refresh(trip)
+
+    return JSONResponse(content={
+        "status": "ok",
+        "message": "Drop off registrado exitosamente",
+        "trip_id": str(trip.id),
+        "dropped_off_at": trip.dropped_off_at.isoformat(),
+        "distance_miles": round(distance, 4)
+    })

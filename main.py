@@ -49,8 +49,9 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://www.gt360.com",
-        "https://gt360.com",
-	    "https://web.gt360.app",
+        "https://dev.gt360.app",
+        "https://web.gt360.app",
+	    "https://gt360.app",
         "https://charmaine-leadless-ryleigh.ngrok-free.dev"
     ],
     allow_credentials=True,

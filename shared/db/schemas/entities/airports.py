@@ -3,18 +3,18 @@ from psqlmodel.orm.types import uuid, timestamptz
 from psqlmodel.utils import gen_default_uuid
 
 
-# Radio por defecto: 1 milla en metros
-DEFAULT_AIRPORT_RADIUS_METERS = 1609.344
+# Radio por defecto: 1 milla
+DEFAULT_AIRPORT_RADIUS = 1.0
 
-# Radio máximo: 2 millas en metros (mismo que hoteles)
-MAX_RADIUS_METERS = 3218.688
+# Radio máximo: 2 millas (mismo que hoteles)
+MAX_RADIUS = 2.0
 
 
 @table('airports', schema="entities", constraints=[
         UniqueConstraint("code", name="uq_airport_code"),
         CheckConstraint("latitude BETWEEN -90 AND 90", name="ck_airport_lat"),
         CheckConstraint("longitude BETWEEN -180 AND 180", name="ck_airport_lon"),
-        CheckConstraint("radio_zone IS NULL OR radio_zone <= 3218.688", name="ck_airport_max_radius"),
+        CheckConstraint("radio_zone IS NULL OR radio_zone <= 2.0", name="ck_airport_max_radius"),
     ]
 )
 class Airport(PSQLModel):
@@ -36,8 +36,8 @@ class Airport(PSQLModel):
 
     zone_code: str = Column(max_len=4, nullable=False, index=True)
 
-    # Geofencing: radio de la zona (en metros)
-    radio_zone: float = Column(default=DEFAULT_AIRPORT_RADIUS_METERS, nullable=True)
+    # Geofencing: radio de la zona (en millas)
+    radio_zone: float = Column(default=DEFAULT_AIRPORT_RADIUS, nullable=True)
 
     # Auditoría de modificaciones
     last_modified_at: timestamptz = Column(nullable=True)

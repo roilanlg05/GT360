@@ -136,3 +136,24 @@ class TripDetailedResponse(BaseModel):
     filter_step: Optional[FilterStepDetails] = None
     pickup_hotel: Optional[HotelDetails] = None
     dropoff_hotel: Optional[HotelDetails] = None
+
+
+class PickUpTripRequest(BaseModel):
+    """Request para marcar pickup de un trip validando ubicacion del driver."""
+    driver_id: UUID
+    driver_location: dict  # GeoJSON Point: {"type": "Point", "coordinates": [lon, lat]}
+    pickup_location: dict  # GeoJSON Point del hotel/aeropuerto
+    radio_zone: float  # Radio en millas
+
+
+class StartTripRequest(BaseModel):
+    """Request para iniciar un trip."""
+    driver_id: Optional[UUID] = None  # Opcional para validacion futura
+
+
+class DropOffTripRequest(BaseModel):
+    """Request para marcar drop off de un trip validando ubicacion del driver."""
+    driver_id: UUID
+    driver_location: dict  # GeoJSON Point: {"type": "Point", "coordinates": [lon, lat]}
+    dropoff_location: dict  # GeoJSON Point del hotel/aeropuerto destino
+    radio_zone: float  # Radio en millas

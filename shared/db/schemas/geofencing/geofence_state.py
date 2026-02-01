@@ -54,4 +54,4 @@ class GeofenceState(PSQLModel):
     last_position_at: timestamptz = Column(default=now, nullable=False)
     last_lat: float = Column(nullable=True)
     last_lon: float = Column(nullable=True)
-    last_distance: float = Column(nullable=True)  # Distancia al centro en metros
+    last_distance: float = Column(nullable=True)  # Distancia al centro en millas

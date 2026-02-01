@@ -61,7 +61,7 @@ class GeofenceEvent(PSQLModel):
     # Ubicación reportada al momento del evento
     reported_lat: float = Column(nullable=False)
     reported_lon: float = Column(nullable=False)
-    distance_to_center: float = Column(nullable=False)  # Distancia en metros al centro del geofence
+    distance_to_center: float = Column(nullable=False)  # Distancia en millas al centro del geofence
 
     # Para eventos DWELL: minutos acumulados dentro del geofence
     dwell_minutes: int = Column(nullable=True)
