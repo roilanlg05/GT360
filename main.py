@@ -51,7 +51,7 @@ app.add_middleware(
         "https://www.gt360.com",
         "https://dev.gt360.app",
         "https://web.gt360.app",
-	    "https://gt360.app",
+        "https://gt360.app",
         "https://charmaine-leadless-ryleigh.ngrok-free.dev"
     ],
     allow_credentials=True,

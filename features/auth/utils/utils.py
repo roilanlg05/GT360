@@ -286,11 +286,11 @@ def set_cookies(response, data:dict):
     for k, v in data.items():
         response.set_cookie(
             key=k,
-            value=v, 
-            httponly=True, 
-            secure=False,  
+            value=v,
+            httponly=True,
+            secure=True,
             samesite="lax",
-            #domain="192.168.0.133",
+            domain=".gt360.app",
             path="/",
             max_age=30 * 24 * 60 * 60,  # 30 días
         )
@@ -313,9 +313,9 @@ def delete_cookies(response, cookies:list[str]):
             key=cookie,
             path="/",
             httponly=True,
-            secure=False,  # Cambia a True si usas HTTPS en producción
-            samesite="lax", 
-            #domain="192.168.0.133", # Descomenta y ajusta el dominio si lo usas en set_cookies
+            secure=True,
+            samesite="lax",
+            domain=".gt360.app",
         )
 
 
