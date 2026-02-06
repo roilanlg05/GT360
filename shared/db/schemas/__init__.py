@@ -16,6 +16,7 @@ from .trips.trips import Trip, TripType, TripStatus, FilterType
 from .trips.trips_history import TripHistory
 from .trips.filter_steps import FilterStep, FilterType as StepFilterType
 from .trips.filter_presets import FilterPreset
+# Temporalmente comentado - bug en índices compuestos del ORM
 from .geofencing.geofence_events import GeofenceEvent, EventType, ActorType, TargetType
 from .geofencing.geofence_state import GeofenceState
 from .geofencing.geofence_settings import GeofenceSettings

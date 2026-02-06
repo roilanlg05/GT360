@@ -29,3 +29,11 @@ class DriverListResponse(BaseModel):
     """Response model for list of drivers."""
     drivers: list[DriverResponse]
     total: int
+
+class DriverActiveUpdate(BaseModel):
+    is_active: bool
+
+
+class DriverStatusResponse(BaseModel):
+    id: str
+    is_active: bool

@@ -1,0 +1,8 @@
+Collecting aiofiles
+  Downloading aiofiles-25.1.0-py3-none-any.whl.metadata (6.3 kB)
+Downloading aiofiles-25.1.0-py3-none-any.whl (14 kB)
+Installing collected packages: aiofiles
+Successfully installed aiofiles-25.1.0
+
+[notice] A new release of pip is available: 25.3 -> 26.0
+[notice] To update, run: pip install --upgrade pip

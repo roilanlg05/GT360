@@ -34,3 +34,13 @@ class Permission(BaseModel):
     name: PermissionEnum
     description: str
 
+class RefreshTokenRequest(BaseModel):
+    """
+    Request body for refresh token.
+
+    Supports multiple field names to ease integration across clients.
+    """
+
+    refresh_token: str | None = None
+    refresh: str | None = None
+    token: str | None = None

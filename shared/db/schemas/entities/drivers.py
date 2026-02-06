@@ -31,10 +31,12 @@ class Driver(PSQLModel):
 
     location_id: uuid = Column(
         default=None,
-        foreign_key = "entities.locations.id",
-        on_delete="CASCADE",
+        foreign_key="entities.locations.id",
+        on_delete="SET NULL",
+        nullable=True,
         index=True,
     )
+
 
     organization_id: uuid = Column(
         default=None,

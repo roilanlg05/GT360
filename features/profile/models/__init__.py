@@ -5,6 +5,12 @@ from .profile_models import (
     UserSettingsResponse,
     UserSettingsUpdate,
 )
+from .manager_profile_models import (
+    LocationInfo,
+    ManagerProfileResponse,
+    ManagerProfileUpdate,
+    ProfilePhotoUploadResponse,
+)
 
 __all__ = [
     "ProfileResponse",
@@ -12,4 +18,8 @@ __all__ = [
     "DeleteAccountRequest",
     "UserSettingsResponse",
     "UserSettingsUpdate",
+    "LocationInfo",
+    "ManagerProfileResponse",
+    "ManagerProfileUpdate",
+    "ProfilePhotoUploadResponse",
 ]

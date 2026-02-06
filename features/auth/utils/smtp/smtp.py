@@ -32,8 +32,8 @@ async def send_email(email: EmailStr, sub: str, html_content: str, confirmation_
 
     payload = {
         "sender": {
-            "name": "Api360",
-            "email": "no-reply@api360.app"
+            "name": "GT 360",
+            "email": "no-reply@gt360.app"
         },
         "to": recipent,
         "subject": sub,

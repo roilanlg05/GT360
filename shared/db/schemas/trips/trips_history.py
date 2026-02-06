@@ -50,7 +50,13 @@ class TripHistory(PSQLModel):
 
     flight_number: str = Column(nullable=False, index=True)
 
-    riders: jsonb = Column(nullable=False)
+    trip_type: str = Column(
+        max_len=10,
+        nullable=True,
+        index=True,
+    )
+
+    riders: jsonb = Column(nullable=True)
 
     started_at: timestamptz = Column(
         default=None, 
@@ -79,5 +85,50 @@ class TripHistory(PSQLModel):
     updated_at: timestamptz = Column(
         default=now,
         nullable=False, 
+        index=True
+    )
+
+    # === Filter tracking fields (V2 Step-based) ===
+    original_pick_up_time: time = Column(
+        default=None,
+        nullable=True,
+        index=True
+    )
+
+    reduce_applied: bool = Column(
+        default=False,
+        nullable=False,
+        index=True
+    )
+
+    combine_applied: bool = Column(
+        default=False,
+        nullable=False,
+        index=True
+    )
+
+    expand_applied: bool = Column(
+        default=False,
+        nullable=False,
+        index=True
+    )
+
+    filtered_at: timestamptz = Column(
+        default=None,
+        nullable=True,
+        index=True
+    )
+
+    current_step_id: uuid = Column(
+        default=None,
+        foreign_key="trips.filter_steps.id",
+        on_delete="SET NULL",
+        nullable=True,
+        index=True
+    )
+
+    status: str = Column(
+        default="scheduled",
+        nullable=False,
         index=True
     )

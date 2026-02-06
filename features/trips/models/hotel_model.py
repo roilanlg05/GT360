@@ -7,3 +7,6 @@ class HotelPointUpdate(BaseModel):
     radio_zone: Optional[float] = None
     address: Optional[str] = None
     validation_status: Optional[str] = None
+
+class HotelCreate(HotelPointUpdate):
+    name: str

@@ -3,11 +3,71 @@ from psqlmodel import Select, AsyncSession
 from shared.db.db_config import get_db
 from shared.db.schemas import Driver, User, Organization
 from features.auth.utils import verify_role
+from features.drivers.models.driver_models import DriverActiveUpdate, DriverStatusResponse
 from typing import Optional
 from uuid import UUID
 
 
 router = APIRouter(tags=["Drivers"])
+
+@router.get("/v1/drivers/me/status", response_model=DriverStatusResponse)
+async def get_my_driver_status(
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["driver"]))
+):
+    user_data = request.state.user_data
+    user_id = user_data.get("id")
+    org_id = user_data.get("organization_id")
+
+    try:
+        driver_uuid = UUID(str(user_id))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de usuario inválido")
+
+    driver = await session.exec(
+        Select(Driver).Where(Driver.id == driver_uuid)
+    ).first()
+    if not driver:
+        raise HTTPException(status_code=404, detail="Driver no encontrado")
+
+    if org_id and driver.organization_id and str(driver.organization_id) != str(org_id):
+        raise HTTPException(status_code=403, detail="Driver no pertenece a esta organización")
+
+    return DriverStatusResponse(id=str(driver.id), is_active=driver.is_active)
+
+
+@router.patch("/v1/drivers/me/active", response_model=DriverStatusResponse)
+async def set_my_driver_active_status(
+    request: Request,
+    data: DriverActiveUpdate,
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["driver"]))
+):
+    user_data = request.state.user_data
+    user_id = user_data.get("id")
+    org_id = user_data.get("organization_id")
+
+    try:
+        driver_uuid = UUID(str(user_id))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de usuario inválido")
+
+    driver = await session.exec(
+        Select(Driver).Where(Driver.id == driver_uuid)
+    ).first()
+    if not driver:
+        raise HTTPException(status_code=404, detail="Driver no encontrado")
+
+    if org_id and driver.organization_id and str(driver.organization_id) != str(org_id):
+        raise HTTPException(status_code=403, detail="Driver no pertenece a esta organización")
+
+    driver.is_active = data.is_active
+    session.add(driver)
+    await session.commit()
+    await session.refresh(driver)
+
+    return DriverStatusResponse(id=str(driver.id), is_active=driver.is_active)
 
 
 @router.get("/v1/organizations/{organization_id}/drivers")

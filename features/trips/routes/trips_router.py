@@ -3,9 +3,9 @@ from __future__ import annotations
 from fastapi import APIRouter, UploadFile, File, HTTPException, Query, Depends, Request, Response
 from fastapi.responses import JSONResponse
 from shared.db.db_config import get_db
-from psqlmodel import Select, Count, Delete, AsyncSession, With, RawExpression, NotExists
+from psqlmodel import Select, Count, Delete, AsyncSession, With, RawExpression, NotExists, Func
 from psqlmodel.utils import unnest, Array
-from shared.db.schemas import Trip as TripDB, Location, Airport, Organization, Hotel, Driver, User, FilterStep
+from shared.db.schemas import Trip as TripDB, TripHistory as TripHistoryDB, Location, Airport, Organization, Hotel, Driver, User, FilterStep
 from features.trips.utils.trip_importer import load_trips_from_bytes
 from features.trips.models import (
     TripUpdate,
@@ -16,10 +16,13 @@ from features.trips.models import (
     LocationDetails,
     DriverDetails,
     FilterStepDetails,
+    HotelCreate,
     HotelDetails,
     PickUpTripRequest,
     StartTripRequest,
-    DropOffTripRequest
+    DropOffTripRequest,
+    TripSearchResult,
+    TripSearchResponse
 )
 from features.trips.models.qr_models import CreateQRCode, UpdateQRCode, QRCodeResponse
 from shared.middlewares.user_context import get_user_time_format
@@ -327,54 +330,63 @@ async def upload_trips(
         await session.commit()
 
         # ===================================================================
-        # AUTO-APPLY PRESET (V2)
+        # AUTO-APPLY PRESET (V2) - Now supports new trips on existing dates!
         # ===================================================================
+        auto_apply_response = None  # Will be included in API response
+
         if trips_to_create and airline:
             from features.trips.services.filter_preset_service import FilterPresetService
+            from collections import defaultdict
 
-            # Get unique dates from imported trips
-            unique_dates_imported = {t.pick_up_date for t in trips_to_create}
+            # Group new trip IDs by pick_up_date
+            # This allows us to apply filters to ONLY the new trips
+            trips_by_date = defaultdict(list)
+            for trip in trips_to_create:
+                trips_by_date[trip.pick_up_date].append(trip.id)
 
-            # CRITICAL: Filter to ONLY new dates (not pre-existing)
-            # A date is "new" if it didn't exist before in trips.trips for this location+airline
-            new_dates = [d for d in unique_dates_imported if d not in existing_dates_for_airline]
+            print(
+                f"[AUTO_PRESET] Processing {len(trips_to_create)} new trips "
+                f"across {len(trips_by_date)} dates"
+            )
 
-            if not new_dates:
-                print(
-                    f"[AUTO_PRESET] No new dates to process "
-                    f"(all {len(unique_dates_imported)} dates already existed)"
+            # Auto-apply preset to new trips
+            # - For dates WITHOUT stack: Creates new stack from preset
+            # - For dates WITH stack: Applies existing stack to new trips only
+            preset_service = FilterPresetService(session)
+            try:
+                auto_apply_result = await preset_service.auto_apply_to_new_trips(
+                    location_id=location.id,
+                    airline=airline,
+                    trips_by_date=dict(trips_by_date)
                 )
-            else:
-                print(
-                    f"[AUTO_PRESET] Detected {len(new_dates)} new dates "
-                    f"(out of {len(unique_dates_imported)} total)"
-                )
 
-                # Auto-apply preset ONLY to new dates
-                preset_service = FilterPresetService(session)
-                try:
-                    auto_apply_result = await preset_service.auto_apply_preset(
-                        location_id=location.id,
-                        airline=airline,
-                        pick_up_dates=new_dates
+                # Prepare response for frontend
+                auto_apply_response = {
+                    "applied": auto_apply_result.applied,
+                    "reason": auto_apply_result.reason,
+                    "trips_affected": auto_apply_result.trips_affected,
+                    "days_processed": auto_apply_result.days_processed,
+                    "days_with_existing_stack": auto_apply_result.days_with_existing_stack,
+                }
+
+                if auto_apply_result.applied:
+                    print(
+                        f"[AUTO_PRESET] ✅ Applied filters: "
+                        f"{auto_apply_result.days_processed} new stacks created, "
+                        f"{auto_apply_result.days_with_existing_stack} existing stacks applied, "
+                        f"{auto_apply_result.trips_affected} trips affected"
                     )
+                else:
+                    print(f"[AUTO_PRESET] Not applied: {auto_apply_result.reason}")
 
-                    if auto_apply_result.applied:
-                        print(
-                            f"[AUTO_PRESET] ✅ Applied preset to {auto_apply_result.days_processed} days, "
-                            f"affected {auto_apply_result.trips_affected} trips"
-                        )
-                        if auto_apply_result.days_skipped > 0:
-                            print(
-                                f"[AUTO_PRESET] Skipped {auto_apply_result.days_skipped} days "
-                                "(already have stack)"
-                            )
-                    else:
-                        print(f"[AUTO_PRESET] Not applied: {auto_apply_result.reason}")
-
-                except Exception as e:
-                    # Don't fail the import if auto-apply fails
-                    print(f"[AUTO_PRESET] ⚠️ Auto-apply failed: {e}")
+            except Exception as e:
+                # Don't fail the import if auto-apply fails
+                print(f"[AUTO_PRESET] ⚠️ Auto-apply failed: {e}")
+                auto_apply_response = {
+                    "applied": False,
+                    "reason": f"Auto-apply failed: {str(e)}",
+                    "trips_affected": 0,
+                }
 
         # DESPUÉS del commit, enviar UN evento batch (batch_insert_mode se resetea automáticamente con COMMIT)
         if trips_to_create:
@@ -444,8 +456,9 @@ async def upload_trips(
                 "location_id": str(location.id),
                 "airport_code": airport,
                 "trips": trips,
-                "hotels": hotels_result
-            }, 
+                "hotels": hotels_result,
+                "auto_apply": auto_apply_response,  # Filter auto-apply result
+            },
             status_code=201
     )
 
@@ -543,6 +556,8 @@ async def get_trips(
     airline: Optional[str] = None,
     flight_number: Optional[str] = None,
     trip_type: Optional[str] = None,
+    assigned_driver: Optional[str] = None,
+    status: Optional[str] = None,
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=200),  # Optimizado para infinite scroll
     _role=Depends(verify_role(["manager", "driver", "crew"]))
@@ -580,6 +595,17 @@ async def get_trips(
 
     # Construir condiciones dinámicas según parámetros opcionales
     filters = [TripDB.location_id == location_uuid]
+    # Filtro por driver asignado
+    assigned_driver_uuid = None
+    if assigned_driver:
+        try:
+            assigned_driver_uuid = UUID(assigned_driver)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="ID de driver inválido")
+
+    if assigned_driver_uuid:
+        filters.append(TripDB.assigned_driver == assigned_driver_uuid)
+
     # filtros exactos
     if pick_up_date_obj:
         filters.append(TripDB.pick_up_date == pick_up_date_obj)
@@ -605,6 +631,8 @@ async def get_trips(
         filters.append(TripDB.flight_number == flight_number)
     if trip_type:
         filters.append(TripDB.trip_type == trip_type)
+    if status:
+        filters.append(TripDB.status == status)
     # ✅ Usar reduce para combinar con &
     from functools import reduce
     combined_filter = reduce(lambda a, b: a & b, filters)
@@ -643,6 +671,137 @@ async def get_trips(
     rows = await session.exec(trips_stmt).all()
 
     # Retornar lista vacía si no hay trips (en lugar de 404)
+    if not rows:
+        return {
+            "data": [],
+            "skip": skip,
+            "limit": limit,
+            "total": 0
+        }
+
+    trips = []
+    time_format = await get_user_time_format(request, session)
+
+    for row in rows:
+        trips.append(model_dump_with_time_format(row[0], time_format))
+
+    total = rows[0][1] if rows else 0
+
+    return {
+        "data": trips,
+        "skip": skip,
+        "limit": limit,
+        "total": total
+    }
+
+
+@router.get("/v1/locations/{location_id}/trips/history")
+async def get_trips_history(
+    location_id: str,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+    pick_up_date: Optional[str] = None,
+    pick_up_date_from: Optional[str] = None,
+    pick_up_date_to: Optional[str] = None,
+    pick_up_time: Optional[str] = None,
+    pick_up_time_from: Optional[str] = None,
+    pick_up_time_to: Optional[str] = None,
+    pick_up_location: Optional[str] = None,
+    drop_off_location: Optional[str] = None,
+    airline: Optional[str] = None,
+    flight_number: Optional[str] = None,
+    trip_type: Optional[str] = None,
+    assigned_driver: Optional[str] = None,
+    status: Optional[str] = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=200),
+    _role=Depends(verify_role(["manager", "driver", "crew"]))
+):
+    """Obtiene una lista paginada de trips archivados (trips_history) con los mismos filtros que /trips."""
+
+    # Validar UUID de location
+    try:
+        location_uuid = UUID(location_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de location inválido")
+
+    # Validar existencia de location
+    location = await session.exec(
+        Select(Location).Where(Location.id == location_uuid)
+    ).first()
+
+    if not location:
+        raise HTTPException(status_code=404, detail="Location no encontrada")
+
+    # Convertir strings a date/time objects
+    try:
+        pick_up_date_obj = date.fromisoformat(pick_up_date) if pick_up_date else None
+        pick_up_date_from_obj = date.fromisoformat(pick_up_date_from) if pick_up_date_from else None
+        pick_up_date_to_obj = date.fromisoformat(pick_up_date_to) if pick_up_date_to else None
+        pick_up_time_obj = time.fromisoformat(pick_up_time) if pick_up_time else None
+        pick_up_time_from_obj = time.fromisoformat(pick_up_time_from) if pick_up_time_from else None
+        pick_up_time_to_obj = time.fromisoformat(pick_up_time_to) if pick_up_time_to else None
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Formato de fecha/hora inválido: {e}")
+
+    filters = [TripHistoryDB.location_id == location_uuid]
+    # Filtro por driver asignado
+    assigned_driver_uuid = None
+    if assigned_driver:
+        try:
+            assigned_driver_uuid = UUID(assigned_driver)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="ID de driver inválido")
+
+    if assigned_driver_uuid:
+        filters.append(TripHistoryDB.assigned_driver == assigned_driver_uuid)
+
+
+    if pick_up_date_obj:
+        filters.append(TripHistoryDB.pick_up_date == pick_up_date_obj)
+    if pick_up_time_obj:
+        filters.append(TripHistoryDB.pick_up_time == pick_up_time_obj)
+
+    if pick_up_date_from_obj:
+        filters.append(TripHistoryDB.pick_up_date >= pick_up_date_from_obj)
+    if pick_up_date_to_obj:
+        filters.append(TripHistoryDB.pick_up_date <= pick_up_date_to_obj)
+    if pick_up_time_from_obj:
+        filters.append(TripHistoryDB.pick_up_time >= pick_up_time_from_obj)
+    if pick_up_time_to_obj:
+        filters.append(TripHistoryDB.pick_up_time <= pick_up_time_to_obj)
+
+    if pick_up_location:
+        filters.append(TripHistoryDB.pick_up_location.ilike(f"%{pick_up_location}%"))
+    if drop_off_location:
+        filters.append(TripHistoryDB.drop_off_location.ilike(f"%{drop_off_location}%"))
+    if airline:
+        filters.append(TripHistoryDB.airline.ilike(f"%{airline}%"))
+    if flight_number:
+        filters.append(TripHistoryDB.flight_number == flight_number)
+    if trip_type:
+        filters.append(TripHistoryDB.trip_type == trip_type)
+    if status:
+        filters.append(TripHistoryDB.status == status)
+
+    from functools import reduce
+    combined_filter = reduce(lambda a, b: a & b, filters)
+
+    total_count_col = Count(TripHistoryDB.id).Over().As("total_count")
+    trips_stmt = (
+        Select(TripHistoryDB, total_count_col)
+        .Where(combined_filter)
+        .OrderBy(
+            TripHistoryDB.pick_up_date.Desc(),
+            TripHistoryDB.pick_up_time.Desc(),
+            TripHistoryDB.id.Desc(),
+        )
+        .Offset(skip)
+        .Limit(limit)
+    )
+
+    rows = await session.exec(trips_stmt).all()
+
     if not rows:
         return {
             "data": [],
@@ -1898,6 +2057,56 @@ async def edit_hotel(
 
     return JSONResponse(content={"status": "ok", "hotel": hotel.model_dump(mode="json")})
 
+@router.post("/v1/locations/{location_id}/hotels", status_code=201)
+async def create_hotel(
+    location_id: str,
+    hotel_data: HotelCreate,
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["manager"]))
+):
+    """
+    Crea un nuevo hotel para una location.
+
+    Guía: similar a `edit_hotel`, pero creando el registro con nombre y
+    campos opcionales del perfil (point, radio_zone, address, validation_status).
+    """
+    try:
+        uuid_location_id = UUID(location_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de location inválido")
+
+    name = (hotel_data.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Nombre de hotel requerido")
+
+    location = await session.exec(
+        Select(Location).Where(Location.id == uuid_location_id)
+    ).first()
+    if not location:
+        raise HTTPException(status_code=404, detail="Location no encontrada")
+
+    existing = await session.exec(
+        Select(Hotel).Where((Hotel.location_id == uuid_location_id) & (Hotel.name == name))
+    ).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="Hotel ya existe en esta location")
+
+    hotel = Hotel(name=name, location_id=uuid_location_id)
+    if hotel_data.point is not None:
+        hotel.point = hotel_data.point
+    if hotel_data.radio_zone is not None:
+        hotel.radio_zone = hotel_data.radio_zone
+    if hotel_data.address is not None:
+        hotel.address = hotel_data.address
+    if hotel_data.validation_status is not None:
+        hotel.validation_status = hotel_data.validation_status
+
+    session.add(hotel)
+    await session.commit()
+    await session.refresh(hotel)
+
+    return JSONResponse(content={"status": "ok", "hotel": hotel.model_dump(mode="json")})
+
 
 # =============================================================================
 # TRIP DRIVER ASSIGNMENT ENDPOINT
@@ -2020,7 +2229,6 @@ async def assign_driver_to_trip(
 
     session.add(trip)
     await session.commit()
-    await session.refresh(trip)
 
     time_format = await get_user_time_format(request, session)
 
@@ -2126,6 +2334,204 @@ async def search_trips(
             "name": location.name
         }
     }
+
+
+# =============================================================================
+# ORGANIZATION-WIDE FLIGHT SEARCH
+# =============================================================================
+
+@router.get(
+    "/v1/organizations/{organization_id}/trips/search-by-flight",
+    response_model=TripSearchResponse
+)
+async def search_trips_by_flight_org_wide(
+    organization_id: str,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+    flight_number: str = Query(..., description="Número de vuelo (requerido)", min_length=1),
+    airline: Optional[str] = Query(None, description="Código de aerolínea (opcional, ej: WN, AA)"),
+    date: Optional[str] = Query(None, description="Fecha exacta (YYYY-MM-DD)"),
+    date_from: Optional[str] = Query(None, description="Fecha desde (YYYY-MM-DD)"),
+    date_to: Optional[str] = Query(None, description="Fecha hasta (YYYY-MM-DD)"),
+    trip_type: Optional[str] = Query(None, description="Tipo: inbound, outbound, ground"),
+    limit: Optional[int] = Query(50, ge=1, le=200, description="Límite de resultados"),
+    skip: Optional[int] = Query(0, ge=0, description="Offset para paginación"),
+    _role=Depends(verify_role(["manager", "driver", "crew"]))
+):
+    """
+    Busca trips por número de vuelo en TODAS las locations de una organización.
+
+    Endpoint optimizado para búsqueda simple por flight number sin necesidad
+    de conocer el location_id específico.
+
+    **Query Parameters:**
+    - `flight_number` (requerido): Número de vuelo a buscar
+    - `airline` (opcional): Filtrar por aerolínea específica
+    - `date` (opcional): Fecha exacta (YYYY-MM-DD)
+    - `date_from` / `date_to` (opcional): Rango de fechas
+    - `trip_type` (opcional): Filtrar por tipo de viaje
+    - `limit` (opcional): Máximo 200 resultados por página (default: 50)
+    - `skip` (opcional): Offset para paginación (default: 0)
+
+    **Ejemplos:**
+    - Búsqueda simple: `?flight_number=5468`
+    - Con aerolínea: `?flight_number=5468&airline=WN`
+    - Con fecha: `?flight_number=5468&date=2026-02-10`
+    - Rango de fechas: `?flight_number=5468&date_from=2026-02-01&date_to=2026-02-28`
+
+    **Returns:**
+    - Lista de trips con información de location incluida
+    - Total de resultados encontrados
+    - Paginación aplicada
+    """
+    from functools import reduce
+    from datetime import date as date_type
+
+    # Normalizar valores "undefined" del frontend a None
+    def normalize(val):
+        if val is None or val == "undefined" or val == "null" or val == "":
+            return None
+        return val
+
+    airline = normalize(airline)
+    date = normalize(date)
+    date_from = normalize(date_from)
+    date_to = normalize(date_to)
+    trip_type = normalize(trip_type)
+    limit = limit if limit is not None else 50
+    skip = skip if skip is not None else 0
+
+    # Validar organization_id
+    try:
+        org_uuid = UUID(organization_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de organización inválido")
+
+    # Verificar que el usuario pertenece a la organización
+    user_data = request.state.user_data
+    user_org_id = user_data.get("organization_id")
+
+    if str(user_org_id) != organization_id:
+        raise HTTPException(status_code=403, detail="No tiene acceso a esta organización")
+
+    # Validar existencia de la organización
+    org = await session.exec(
+        Select(Organization).Where(Organization.id == org_uuid)
+    ).first()
+
+    if not org:
+        raise HTTPException(status_code=404, detail="Organización no encontrada")
+
+    # Construir filtros base
+    filters = []
+
+    # Filtro por flight_number (requerido, exact match)
+    filters.append(TripDB.flight_number == flight_number.strip())
+
+    # Filtro por airline (opcional, case-insensitive)
+    if airline:
+        filters.append(TripDB.airline.ilike(airline.strip()))
+
+    # Filtros de fecha (mutuamente exclusivos con date)
+    if date:
+        try:
+            date_obj = date_type.fromisoformat(date)
+            filters.append(TripDB.pick_up_date == date_obj)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Formato de fecha inválido. Use YYYY-MM-DD")
+    else:
+        if date_from:
+            try:
+                date_from_obj = date_type.fromisoformat(date_from)
+                filters.append(TripDB.pick_up_date >= date_from_obj)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Formato de date_from inválido. Use YYYY-MM-DD")
+        if date_to:
+            try:
+                date_to_obj = date_type.fromisoformat(date_to)
+                filters.append(TripDB.pick_up_date <= date_to_obj)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Formato de date_to inválido. Use YYYY-MM-DD")
+
+    # Filtro por trip_type (opcional)
+    if trip_type:
+        if trip_type.lower() not in [TripType.INBOUND, TripType.OUTBOUND, TripType.GROUND]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Tipo de viaje inválido. Valores: {TripType.INBOUND}, {TripType.OUTBOUND}, {TripType.GROUND}"
+            )
+        filters.append(TripDB.trip_type == trip_type.lower())
+
+    # Combinar todos los filtros
+    combined_filter = reduce(lambda a, b: a & b, filters)
+
+    # Query optimizado con JOIN a locations para filtrar por organización
+    # y obtener el nombre de la location en una sola query
+    query = (
+        Select(TripDB, Location.name)
+        .From(TripDB)
+        .Join(Location).On(TripDB.location_id == Location.id)
+        .Where((Location.organization_id == org_uuid) & combined_filter)
+        .OrderBy(TripDB.pick_up_date.Desc(), TripDB.pick_up_time.Desc())
+    )
+
+    # Query para contar el total (sin limit/offset)
+    count_query = (
+        Select(Count(TripDB.id))
+        .From(TripDB)
+        .Join(Location).On(TripDB.location_id == Location.id)
+        .Where((Location.organization_id == org_uuid) & combined_filter)
+    )
+
+    # Ejecutar query de conteo
+    count_result = await session.exec(count_query).first()
+    total = count_result[0] if count_result else 0
+
+    # Ejecutar query con paginación
+    results = await session.exec(
+        query.Offset(skip).Limit(limit)
+    ).all()
+
+    # Construir respuesta
+    trips = []
+    for trip, location_name in results:
+        trip_dict = {
+            "id": trip.id,
+            "assigned_driver": trip.assigned_driver,
+            "location_id": trip.location_id,
+            "location_name": location_name,
+            "pick_up_date": trip.pick_up_date,
+            "pick_up_time": trip.pick_up_time,
+            "pick_up_location": trip.pick_up_location,
+            "drop_off_location": trip.drop_off_location,
+            "airline": trip.airline,
+            "flight_number": trip.flight_number,
+            "trip_type": trip.trip_type,
+            "status": trip.status,
+            # Riders breakdown (pilots, flight_attendants, deadheads, etc.)
+            "riders": trip.riders,
+            # Filter information
+            "original_pick_up_time": trip.original_pick_up_time,
+            "reduce_applied": trip.reduce_applied,
+            "combine_applied": trip.combine_applied,
+            "expand_applied": trip.expand_applied,
+            "filtered_at": trip.filtered_at,
+            "current_step_id": trip.current_step_id,
+            # Timestamps
+            "started_at": trip.started_at,
+            "picked_up_at": trip.picked_up_at,
+            "dropped_off_at": trip.dropped_off_at,
+            "created_at": trip.created_at,
+            "updated_at": trip.updated_at,
+        }
+        trips.append(TripSearchResult(**trip_dict))
+
+    return TripSearchResponse(
+        trips=trips,
+        total=total or 0,
+        limit=limit,
+        skip=skip
+    )
 
 
 # ============================================================================
@@ -2526,7 +2932,7 @@ async def list_organization_qr_codes(
                 "name": qr.name,
                 "airlines": qr.airlines,
                 "status": qr.status,
-                "qr_url": f"https://web.gt360.app/crew-lookup?qr={qr.id}",
+                "qr_url": f"https://dev.gt360.app/crew-lookup?qr={qr.id}",
                 "scan_count": qr.scan_count,
                 "last_scanned_at": qr.last_scanned_at.isoformat() if qr.last_scanned_at else None,
                 "created_at": qr.created_at.isoformat(),
@@ -2603,7 +3009,7 @@ async def get_qr_code(
         "name": qr_code.name,
         "airlines": qr_code.airlines,
         "status": qr_code.status,
-        "qr_url": f"https://web.gt360.app/crew-lookup?qr={qr_code.id}",
+        "qr_url": f"https://dev.gt360.app/crew-lookup?qr={qr_code.id}",
         "scan_count": qr_code.scan_count,
         "last_scanned_at": qr_code.last_scanned_at.isoformat() if qr_code.last_scanned_at else None,
         "created_at": qr_code.created_at.isoformat(),
@@ -2676,7 +3082,7 @@ async def get_or_create_qr_code(
             "name": existing_qr.name,
             "airlines": existing_qr.airlines,
             "status": existing_qr.status,
-            "qr_url": f"https://web.gt360.app/crew-lookup?qr={existing_qr.id}",
+            "qr_url": f"https://dev.gt360.app/crew-lookup?qr={existing_qr.id}",
             "scan_count": existing_qr.scan_count,
             "last_scanned_at": existing_qr.last_scanned_at.isoformat() if existing_qr.last_scanned_at else None,
             "created_at": existing_qr.created_at.isoformat(),
@@ -2714,7 +3120,7 @@ async def get_or_create_qr_code(
         "name": qr_code.name,
         "airlines": qr_code.airlines,
         "status": qr_code.status,
-        "qr_url": f"https://web.gt360.app/crew-lookup?qr={qr_code.id}",
+        "qr_url": f"https://dev.gt360.app/crew-lookup?qr={qr_code.id}",
         "scan_count": qr_code.scan_count,
         "last_scanned_at": qr_code.last_scanned_at.isoformat() if qr_code.last_scanned_at else None,
         "created_at": qr_code.created_at.isoformat(),
@@ -2830,6 +3236,7 @@ async def pick_up_trip(
 @router.post("/v1/trips/{trip_id}/start")
 async def start_trip(
     trip_id: str,
+    request: Request,
     request_data: StartTripRequest,
     session: AsyncSession = Depends(get_db),
     _role=Depends(verify_role(["driver"]))
@@ -2852,12 +3259,33 @@ async def start_trip(
     if not trip:
         raise HTTPException(status_code=404, detail="Trip no encontrado")
 
-    # Validar que el driver asignado coincida (si se proporciona driver_id)
-    if request_data.driver_id and trip.assigned_driver != request_data.driver_id:
-        raise HTTPException(
-            status_code=403,
-            detail="El driver no esta asignado a este trip"
-        )
+       # Validar estado: no permitir iniciar si ya está en ruta o fue cancelado
+    if trip.status == TripStatus.CANCELED:
+        raise HTTPException(status_code=409, detail="Trip was cancelled")
+    if trip.status == TripStatus.EN_ROUTE or trip.started_at:
+        raise HTTPException(status_code=409, detail="Trip already started")
+
+    # Obtener driver actual desde el token
+    user_data = getattr(request.state, "user_data", None)
+    driver_id_from_token = user_data.get("id") if user_data else None
+    if not driver_id_from_token:
+        raise HTTPException(status_code=401, detail="Missing or invalid authentication")
+
+    try:
+        current_driver_id = UUID(str(driver_id_from_token))
+    except Exception:
+        raise HTTPException(status_code=401, detail="Missing or invalid authentication")
+
+    # Si el cliente manda driver_id, debe coincidir con el token (anti-spoofing)
+    if request_data.driver_id and request_data.driver_id != current_driver_id:
+        raise HTTPException(status_code=403, detail="driver_id no coincide con el token")
+
+    # Si el trip NO tiene driver asignado, asignar el driver que hace el request
+    if not trip.assigned_driver:
+        trip.assigned_driver = current_driver_id
+    # Si ya tiene driver, validar que sea el mismo
+    elif trip.assigned_driver != current_driver_id:
+        raise HTTPException(status_code=403, detail="El driver no esta asignado a este trip")
 
     # Actualizar started_at
     trip.started_at = datetime.now(timezone.utc)
@@ -2948,7 +3376,6 @@ async def drop_off_trip(
     trip.status = TripStatus.COMPLETED
     session.add(trip)
     await session.commit()
-    await session.refresh(trip)
 
     return JSONResponse(content={
         "status": "ok",

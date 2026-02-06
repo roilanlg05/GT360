@@ -1,6 +1,10 @@
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+import logging
+from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
+import os
 from shared.db.db_config import engine
 from features.auth.routes.auth_router import router as auth_router
 from features.trips.routes.trips_router import router as trips_router
@@ -17,6 +21,8 @@ from features.drivers.routes.drivers_router import router as drivers_router
 from features.trips.routes.step_filter_router import router as step_filter_router
 from features.trips.routes.filter_preset_router import router as filter_preset_router
 from features.trips.routes.test_filter_router import router as test_filter_router
+from features.support.routes.support_router import router as support_router
+from shared.settings import settings
 """from features.geofencing.routes.validation_router import router as validation_router
 from features.geofencing.routes.geofence_router import router as geofence_router
 from features.geofencing.jobs import dwell_checker
@@ -27,7 +33,8 @@ from shared.middlewares.rate_limiter import RateLimitMiddleware
 from shared.middlewares.exceptions_handler import HTTPErrorHandler
 from shared.middlewares.deny_dotfiles import DenyDotfileMiddleware
 from fastapi.middleware.cors import CORSMiddleware
-
+from shared.db.triggers.trips_archive import ensure_trips_archive_trigger
+from psqlmodel import AsyncSession
 
 app = FastAPI()
 
@@ -35,6 +42,10 @@ app = FastAPI()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await engine.startup_async()
+     # Ensure archive trigger exists (drop-off -> history)
+    async with AsyncSession(engine) as _s:
+        await ensure_trips_archive_trigger(_s)
+        await _s.commit()
     # Start DWELL checker background job (runs every 60 seconds)
     #dwell_checker.start(interval_seconds=60)
     yield
@@ -50,7 +61,6 @@ app.add_middleware(
     allow_origins=[
         "https://www.gt360.com",
         "https://dev.gt360.app",
-        "https://web.gt360.app",
         "https://gt360.app",
         "https://charmaine-leadless-ryleigh.ngrok-free.dev"
     ],
@@ -63,6 +73,39 @@ app.add_middleware(DenyDotfileMiddleware)
 app.add_middleware(RateLimitMiddleware)
 app.add_middleware(VerifyToken)
 app.add_middleware(RequestLoggerMiddleware)
+
+
+# Exception handler para errores de validación 422
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """
+    Captura errores 422 y los loguea para debugging.
+    """
+    logger = logging.getLogger(__name__)
+    logger.error(f"[VALIDATION_ERROR] Path: {request.url.path}")
+    logger.error(f"[VALIDATION_ERROR] Errors: {exc.errors()}")
+    logger.error(f"[VALIDATION_ERROR] Body: {exc.body}")
+    logger.error(f"[VALIDATION_ERROR] Content-Type: {request.headers.get('content-type')}")
+    logger.error(f"[VALIDATION_ERROR] Content-Length: {request.headers.get('content-length')}")
+
+    origin = request.headers.get("origin")
+    allowed_origins = [
+        "https://www.gt360.com",
+        "https://dev.gt360.app",
+        "https://web.gt360.app",
+        "https://gt360.app",
+    ]
+
+    response = JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors()}
+    )
+
+    if origin in allowed_origins:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+
+    return response
 
 
 # Exception handler para asegurar CORS en todos los errores HTTP
@@ -78,9 +121,11 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     # Lista de orígenes permitidos (debe coincidir con CORSMiddleware)
     allowed_origins = [
         "https://www.gt360.com",
-        "https://gt360.com",
+        "https://dev.gt360.app",
         "https://web.gt360.app",
-        "https://charmaine-leadless-ryleigh.ngrok-free.dev"
+        "https://gt360.app",
+        "https://charmaine-leadless-ryleigh.ngrok-free.dev",
+        "http://192.168.1.101:5173/"
     ]
 
     # Crear respuesta con el detalle del error
@@ -95,6 +140,18 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         response.headers["Access-Control-Allow-Credentials"] = "true"
 
     return response
+
+
+# Lightweight health endpoints used by Docker/ingress healthchecks.
+# Must return 200 (not 404) so container can become healthy.
+@app.get("/health", include_in_schema=False)
+async def health():
+    return {"status": "ok"}
+
+
+@app.get("/ready", include_in_schema=False)
+async def ready():
+    return {"status": "ok"}
 
 
 app.include_router(auth_router)
@@ -112,5 +169,16 @@ app.include_router(drivers_router)
 app.include_router(step_filter_router)
 app.include_router(filter_preset_router)
 app.include_router(test_filter_router)
+app.include_router(support_router)
 #app.include_router(validation_router)
 #app.include_router(geofence_router)
+
+# Mount static files for uploads (profile pictures, etc.)
+# Create directory if it doesn't exist and we have permissions
+try:
+    if not os.path.exists(settings.UPLOAD_DIR):
+        os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
+    app.mount("/uploads", StaticFiles(directory=settings.UPLOAD_DIR), name="uploads")
+except PermissionError:
+    # In Docker, uploads may be handled differently or mounted as volume
+    pass

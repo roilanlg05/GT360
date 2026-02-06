@@ -10,8 +10,8 @@ from psqlmodel.utils import gen_default_uuid, now
         UniqueConstraint("actor_type", "actor_id", "target_type", "target_id", name="uq_geofence_state_actor_target")
     ],
     indexes=[
-        Index("idx_geofence_state_actor", "actor_type", "actor_id"),
-        Index("idx_geofence_state_inside", "is_inside"),
+        Index("actor_type", "actor_id", name="idx_geofence_state_actor"),
+        Index("is_inside", name="idx_geofence_state_inside"),
     ]
 )
 class GeofenceState(PSQLModel):
