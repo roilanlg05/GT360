@@ -107,6 +107,7 @@ class ManagerProfileService:
             organization_name=organization.name,
             organization_address=organization.address,
             organization_website=organization.website,
+            organization_pay_frequency=organization.pay_frequency or "weekly",
             membership_status=organization.plan or "freemium",
             locations=locations_info
         )
@@ -167,6 +168,8 @@ class ManagerProfileService:
             organization.address = update_dict["organization_address"]
         if "organization_website" in update_dict:
             organization.website = update_dict["organization_website"]
+        if "organization_pay_frequency" in update_dict:
+            organization.pay_frequency = update_dict["organization_pay_frequency"]
 
         # Update timestamps
         user.updated_at = datetime.now(timezone.utc)

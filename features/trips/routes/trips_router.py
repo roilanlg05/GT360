@@ -7,6 +7,7 @@ from psqlmodel import Select, Count, Delete, AsyncSession, With, RawExpression, 
 from psqlmodel.utils import unnest, Array
 from shared.db.schemas import Trip as TripDB, TripHistory as TripHistoryDB, Location, Airport, Organization, Hotel, Driver, User, FilterStep
 from features.trips.utils.trip_importer import load_trips_from_bytes
+from features.trips.utils.trip_pdf_importer import load_trips_from_pdf_bytes
 from features.trips.models import (
     TripUpdate,
     CreateTrip,
@@ -21,13 +22,14 @@ from features.trips.models import (
     PickUpTripRequest,
     StartTripRequest,
     DropOffTripRequest,
+    ArrivalLogRequest,
     TripSearchResult,
     TripSearchResponse
 )
 from features.trips.models.qr_models import CreateQRCode, UpdateQRCode, QRCodeResponse
 from shared.middlewares.user_context import get_user_time_format
 from shared.utils.serialization import model_dump_with_time_format
-from datetime import date, time, datetime, timezone
+from datetime import date, time, datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional
 from uuid import UUID
@@ -56,13 +58,26 @@ async def upload_trips(
 ) -> dict:
     """
     Sube un archivo Excel con el schedule de trips y los guarda en la base de datos.
+
+    IMPORTANTE: Los tiempos (pick_up_time) en el archivo Excel deben estar en el timezone
+    local de la location (aeropuerto). El sistema asignará automáticamente el timezone
+    correcto basado en las coordenadas del aeropuerto (usando timezonefinder).
+
+    Por ejemplo: Si el aeropuerto es SDF (Louisville), los tiempos deben estar en
+    America/New_York timezone, no en UTC.
     """
     # Validar extensión del archivo
-    if not file.filename or not (file.filename.endswith(".xlsx") or file.filename.endswith(".xlsm") or file.filename.endswith(".xls")):
+    EXCEL_EXTENSIONS = (".xlsx", ".xlsm", ".xls")
+    PDF_EXTENSIONS = (".pdf",)
+    ALLOWED_EXTENSIONS = EXCEL_EXTENSIONS + PDF_EXTENSIONS
+
+    if not file.filename or not file.filename.lower().endswith(ALLOWED_EXTENSIONS):
         raise HTTPException(
             status_code=400,
-            detail="Debe subir un archivo Excel (.xlsx / .xlsm / .xls).",
+            detail="Debe subir un archivo Excel (.xlsx / .xlsm / .xls) o PDF (.pdf).",
         )
+
+    is_pdf = file.filename.lower().endswith(".pdf")
 
     user_data = request.state.user_data
     org_id = user_data.get("organization_id")
@@ -84,20 +99,23 @@ async def upload_trips(
     # Leer el contenido del archivo
     content = await file.read()
 
-    # Cargar viajes desde el Excel (función asíncrona)
+    # Cargar viajes desde el archivo (Excel o PDF)
     try:
-        trips_import = await load_trips_from_bytes(content, location=airport, plan=organization.plan, airlinex=airline)
+        if is_pdf:
+            trips_import = await load_trips_from_pdf_bytes(content, location=airport, plan=organization.plan, airlinex=airline)
+        else:
+            trips_import = await load_trips_from_bytes(content, location=airport, plan=organization.plan, airlinex=airline)
     except ValueError as e:
         # Errores de validación (código de aeropuerto incorrecto, múltiples aerolíneas, etc.)
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
-        # Errores de formato del Excel (hoja no encontrada, encabezados incorrectos, etc.)
+        # Errores de formato del archivo (hoja no encontrada, encabezados incorrectos, etc.)
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         # Cualquier otro error inesperado
         raise HTTPException(
             status_code=400,
-            detail=f"Error al procesar el archivo Excel: {str(e)}"
+            detail=f"Error al procesar el archivo: {str(e)}"
         )
 
     if not trips_import:
@@ -470,8 +488,21 @@ async def create_trip(
     session: AsyncSession = Depends(get_db),
     _role=Depends(verify_role(["manager"]))
     ):
+    """
+    Crea un nuevo trip en una location específica.
 
-    
+    IMPORTANTE: El campo pick_up_time debe enviarse en el timezone LOCAL de la location
+    (no en UTC). El sistema asignará automáticamente el timezone correcto basado en el
+    timezone configurado para esa location.
+
+    Ejemplo:
+    - Location: SDF (timezone: America/New_York)
+    - pick_up_time: "14:30:00" → Se interpreta como 14:30 hora de Nueva York
+    - NO enviar: "18:30:00" (UTC), esto causaría errores de interpretación
+
+    El sistema calculará automáticamente el trip_type (inbound/outbound/ground) si no
+    se proporciona.
+    """
     try:
         from uuid import UUID
         location_uuid = UUID(location_id)
@@ -558,15 +589,16 @@ async def get_trips(
     trip_type: Optional[str] = None,
     assigned_driver: Optional[str] = None,
     status: Optional[str] = None,
+    order: Optional[str] = Query("asc", regex="^(asc|desc)$"),
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=200),  # Optimizado para infinite scroll
     _role=Depends(verify_role(["manager", "driver", "crew"]))
 ):
-
     """
     Obtiene una lista paginada de trips.
     """
     from uuid import UUID
+    from functools import reduce
 
     # Validar UUID de location
     try:
@@ -587,6 +619,7 @@ async def get_trips(
         pick_up_date_obj = date.fromisoformat(pick_up_date) if pick_up_date else None
         pick_up_date_from_obj = date.fromisoformat(pick_up_date_from) if pick_up_date_from else None
         pick_up_date_to_obj = date.fromisoformat(pick_up_date_to) if pick_up_date_to else None
+
         pick_up_time_obj = time.fromisoformat(pick_up_time) if pick_up_time else None
         pick_up_time_from_obj = time.fromisoformat(pick_up_time_from) if pick_up_time_from else None
         pick_up_time_to_obj = time.fromisoformat(pick_up_time_to) if pick_up_time_to else None
@@ -595,6 +628,7 @@ async def get_trips(
 
     # Construir condiciones dinámicas según parámetros opcionales
     filters = [TripDB.location_id == location_uuid]
+
     # Filtro por driver asignado
     assigned_driver_uuid = None
     if assigned_driver:
@@ -606,21 +640,50 @@ async def get_trips(
     if assigned_driver_uuid:
         filters.append(TripDB.assigned_driver == assigned_driver_uuid)
 
-    # filtros exactos
+    # Filtros exactos
     if pick_up_date_obj:
         filters.append(TripDB.pick_up_date == pick_up_date_obj)
     if pick_up_time_obj:
         filters.append(TripDB.pick_up_time == pick_up_time_obj)
-    # filtros rango
-    if pick_up_date_from_obj:
+
+    # ✅ Rango correcto usando "datetime" (date+time) SIN SQLAlchemy
+    # Reglas:
+    # - Si viene date_from+time_from => (date>from) OR (date==from AND time>=from_time)
+    # - Si viene solo date_from => date>=from
+    # - time_from sin date_from => error (ambiguo)
+    # - Si viene date_to+time_to => (date<to) OR (date==to AND time<=to_time)
+    # - Si viene solo date_to => date<=to
+    # - time_to sin date_to => error (ambiguo)
+
+    # FROM
+    if pick_up_date_from_obj and pick_up_time_from_obj:
+        filters.append(
+            (TripDB.pick_up_date > pick_up_date_from_obj)
+            | (
+                (TripDB.pick_up_date == pick_up_date_from_obj)
+                & (TripDB.pick_up_time >= pick_up_time_from_obj)
+            )
+        )
+    elif pick_up_date_from_obj:
         filters.append(TripDB.pick_up_date >= pick_up_date_from_obj)
-    if pick_up_date_to_obj:
+    elif pick_up_time_from_obj:
+        raise HTTPException(status_code=400, detail="pick_up_time_from requiere pick_up_date_from")
+
+    # TO
+    if pick_up_date_to_obj and pick_up_time_to_obj:
+        filters.append(
+            (TripDB.pick_up_date < pick_up_date_to_obj)
+            | (
+                (TripDB.pick_up_date == pick_up_date_to_obj)
+                & (TripDB.pick_up_time <= pick_up_time_to_obj)
+            )
+        )
+    elif pick_up_date_to_obj:
         filters.append(TripDB.pick_up_date <= pick_up_date_to_obj)
-    if pick_up_time_from_obj:
-        filters.append(TripDB.pick_up_time >= pick_up_time_from_obj)
-    if pick_up_time_to_obj:
-        filters.append(TripDB.pick_up_time <= pick_up_time_to_obj)
-    # filtros texto
+    elif pick_up_time_to_obj:
+        raise HTTPException(status_code=400, detail="pick_up_time_to requiere pick_up_date_to")
+
+    # Filtros texto
     if pick_up_location:
         filters.append(TripDB.pick_up_location.ilike(f"%{pick_up_location}%"))
     if drop_off_location:
@@ -633,44 +696,27 @@ async def get_trips(
         filters.append(TripDB.trip_type == trip_type)
     if status:
         filters.append(TripDB.status == status)
-    # ✅ Usar reduce para combinar con &
-    from functools import reduce
+
+    # Combinar con &
     combined_filter = reduce(lambda a, b: a & b, filters)
 
-    # Contar total con los mismos filtros
-    """count_stmt = Select(Count(TripDB.id)).From(TripDB).Where(combined_filter)
-    total = await session.exec(count_stmt).first()
-
-    # Obtener trips paginados aplicando filtros
-    trips_stmt = (
-        Select(TripDB, )
-        .Where(combined_filter)
-        .OrderBy(
-            TripDB.pick_up_date,
-            TripDB.pick_up_time,
-            TripDB.id,
-        )
-        .Asc()
-        .Offset(skip)
-        .Limit(limit)
-    )"""
-
     total_count_col = Count(TripDB.id).Over().As("total_count")
+
+    if order == "desc":
+        order_clauses = [TripDB.pick_up_date.Desc(), TripDB.pick_up_time.Desc(), TripDB.id.Desc()]
+    else:
+        order_clauses = [TripDB.pick_up_date.Asc(), TripDB.pick_up_time.Asc(), TripDB.id.Asc()]
+
     trips_stmt = (
-        Select(TripDB, total_count_col)  # Seleccionas el modelo Y el total
+        Select(TripDB, total_count_col)
         .Where(combined_filter)
-        .OrderBy(
-            TripDB.pick_up_date.Asc(),
-            TripDB.pick_up_time.Asc(),
-            TripDB.id.Asc(),
-        )
+        .OrderBy(*order_clauses)
         .Offset(skip)
         .Limit(limit)
     )
 
     rows = await session.exec(trips_stmt).all()
 
-    # Retornar lista vacía si no hay trips (en lugar de 404)
     if not rows:
         return {
             "data": [],
@@ -713,11 +759,15 @@ async def get_trips_history(
     trip_type: Optional[str] = None,
     assigned_driver: Optional[str] = None,
     status: Optional[str] = None,
+    order: Optional[str] = Query("desc", regex="^(asc|desc)$"),
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=200),
     _role=Depends(verify_role(["manager", "driver", "crew"]))
 ):
     """Obtiene una lista paginada de trips archivados (trips_history) con los mismos filtros que /trips."""
+
+    from uuid import UUID
+    from functools import reduce
 
     # Validar UUID de location
     try:
@@ -738,6 +788,7 @@ async def get_trips_history(
         pick_up_date_obj = date.fromisoformat(pick_up_date) if pick_up_date else None
         pick_up_date_from_obj = date.fromisoformat(pick_up_date_from) if pick_up_date_from else None
         pick_up_date_to_obj = date.fromisoformat(pick_up_date_to) if pick_up_date_to else None
+
         pick_up_time_obj = time.fromisoformat(pick_up_time) if pick_up_time else None
         pick_up_time_from_obj = time.fromisoformat(pick_up_time_from) if pick_up_time_from else None
         pick_up_time_to_obj = time.fromisoformat(pick_up_time_to) if pick_up_time_to else None
@@ -745,6 +796,7 @@ async def get_trips_history(
         raise HTTPException(status_code=400, detail=f"Formato de fecha/hora inválido: {e}")
 
     filters = [TripHistoryDB.location_id == location_uuid]
+
     # Filtro por driver asignado
     assigned_driver_uuid = None
     if assigned_driver:
@@ -756,21 +808,42 @@ async def get_trips_history(
     if assigned_driver_uuid:
         filters.append(TripHistoryDB.assigned_driver == assigned_driver_uuid)
 
-
+    # Filtros exactos
     if pick_up_date_obj:
         filters.append(TripHistoryDB.pick_up_date == pick_up_date_obj)
     if pick_up_time_obj:
         filters.append(TripHistoryDB.pick_up_time == pick_up_time_obj)
 
-    if pick_up_date_from_obj:
+    # ✅ Rango correcto usando "datetime" (date+time) SIN SQLAlchemy
+    # FROM
+    if pick_up_date_from_obj and pick_up_time_from_obj:
+        filters.append(
+            (TripHistoryDB.pick_up_date > pick_up_date_from_obj)
+            | (
+                (TripHistoryDB.pick_up_date == pick_up_date_from_obj)
+                & (TripHistoryDB.pick_up_time >= pick_up_time_from_obj)
+            )
+        )
+    elif pick_up_date_from_obj:
         filters.append(TripHistoryDB.pick_up_date >= pick_up_date_from_obj)
-    if pick_up_date_to_obj:
-        filters.append(TripHistoryDB.pick_up_date <= pick_up_date_to_obj)
-    if pick_up_time_from_obj:
-        filters.append(TripHistoryDB.pick_up_time >= pick_up_time_from_obj)
-    if pick_up_time_to_obj:
-        filters.append(TripHistoryDB.pick_up_time <= pick_up_time_to_obj)
+    elif pick_up_time_from_obj:
+        raise HTTPException(status_code=400, detail="pick_up_time_from requiere pick_up_date_from")
 
+    # TO
+    if pick_up_date_to_obj and pick_up_time_to_obj:
+        filters.append(
+            (TripHistoryDB.pick_up_date < pick_up_date_to_obj)
+            | (
+                (TripHistoryDB.pick_up_date == pick_up_date_to_obj)
+                & (TripHistoryDB.pick_up_time <= pick_up_time_to_obj)
+            )
+        )
+    elif pick_up_date_to_obj:
+        filters.append(TripHistoryDB.pick_up_date <= pick_up_date_to_obj)
+    elif pick_up_time_to_obj:
+        raise HTTPException(status_code=400, detail="pick_up_time_to requiere pick_up_date_to")
+
+    # Filtros texto
     if pick_up_location:
         filters.append(TripHistoryDB.pick_up_location.ilike(f"%{pick_up_location}%"))
     if drop_off_location:
@@ -784,18 +857,19 @@ async def get_trips_history(
     if status:
         filters.append(TripHistoryDB.status == status)
 
-    from functools import reduce
     combined_filter = reduce(lambda a, b: a & b, filters)
 
     total_count_col = Count(TripHistoryDB.id).Over().As("total_count")
+
+    if order == "desc":
+        order_clauses = [TripHistoryDB.pick_up_date.Desc(), TripHistoryDB.pick_up_time.Desc(), TripHistoryDB.id.Desc()]
+    else:
+        order_clauses = [TripHistoryDB.pick_up_date.Asc(), TripHistoryDB.pick_up_time.Asc(), TripHistoryDB.id.Asc()]
+
     trips_stmt = (
         Select(TripHistoryDB, total_count_col)
         .Where(combined_filter)
-        .OrderBy(
-            TripHistoryDB.pick_up_date.Desc(),
-            TripHistoryDB.pick_up_time.Desc(),
-            TripHistoryDB.id.Desc(),
-        )
+        .OrderBy(*order_clauses)
         .Offset(skip)
         .Limit(limit)
     )
@@ -1041,6 +1115,128 @@ async def delete_trips(
     
     return Response(status_code=204)
 
+
+@router.delete("/v1/locations/{location_id}/airlines/{airline}/trips/all")
+async def delete_trips_by_airline(
+    location_id: str,
+    airline: str,
+    pick_up_date: Optional[str] = Query(None, description="Opcional: Borrar solo trips de esta fecha (YYYY-MM-DD)"),
+    status: Optional[str] = Query(None, description="Opcional: Borrar solo trips con este status"),
+    confirm: str = Query(..., description="Escribe 'DELETE_ALL' para confirmar"),
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["manager"]))
+):
+    """
+    Elimina todos los trips de una aerolínea específica en una location.
+
+    Parámetros:
+    - location_id: UUID de la location
+    - airline: Código de aerolínea (ej: WN, AA, DL)
+    - pick_up_date: (Opcional) Solo borrar trips de esta fecha
+    - status: (Opcional) Solo borrar trips con este status
+    - confirm: Debe ser "DELETE_ALL" para confirmar la operación
+
+    Ejemplos:
+    - DELETE /v1/locations/{id}/airlines/WN/trips/all?confirm=DELETE_ALL
+      → Borra TODOS los trips de WN en esa location
+
+    - DELETE /v1/locations/{id}/airlines/WN/trips/all?pick_up_date=2026-02-02&confirm=DELETE_ALL
+      → Borra solo trips de WN del 2 de febrero
+
+    - DELETE /v1/locations/{id}/airlines/WN/trips/all?status=scheduled&confirm=DELETE_ALL
+      → Borra solo trips scheduled de WN (no afecta trips en progreso)
+    """
+    from uuid import UUID
+    from datetime import date
+
+    # Validar confirmación
+    if confirm != "DELETE_ALL":
+        raise HTTPException(
+            status_code=400,
+            detail="Confirmación requerida. Envía confirm='DELETE_ALL' para proceder."
+        )
+
+    # Validar location_id
+    try:
+        uuid_location_id = UUID(location_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de location inválido")
+
+    # Verificar que la location existe
+    location = await session.exec(
+        Select(Location).Where(Location.id == uuid_location_id)
+    ).first()
+
+    if not location:
+        raise HTTPException(status_code=404, detail="Location no encontrada")
+
+    # Contar trips antes de borrar (para logging y response)
+    count_query = (
+        Select(TripDB.id)
+        .Where(TripDB.location_id == uuid_location_id)
+        .Where(TripDB.airline == airline)
+    )
+
+    # Agregar filtros opcionales
+    if pick_up_date:
+        try:
+            parsed_date = date.fromisoformat(pick_up_date)
+            count_query = count_query.Where(TripDB.pick_up_date == parsed_date)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Formato de fecha inválido: {pick_up_date}. Use YYYY-MM-DD"
+            )
+
+    if status:
+        count_query = count_query.Where(TripDB.status == status)
+
+    trips_to_delete = await session.exec(count_query).all()
+    trips_count = len(trips_to_delete)
+
+    if trips_count == 0:
+        return {
+            "status": "ok",
+            "message": "No se encontraron trips para eliminar con los criterios especificados",
+            "trips_deleted": 0,
+            "airline": airline,
+            "location_id": location_id,
+            "filters": {
+                "pick_up_date": pick_up_date,
+                "status": status
+            }
+        }
+
+    # Construir DELETE statement con los mismos filtros
+    del_stmt = (
+        Delete(TripDB)
+        .Where(TripDB.location_id == uuid_location_id)
+        .Where(TripDB.airline == airline)
+    )
+
+    if pick_up_date:
+        del_stmt = del_stmt.Where(TripDB.pick_up_date == parsed_date)
+
+    if status:
+        del_stmt = del_stmt.Where(TripDB.status == status)
+
+    # Ejecutar DELETE
+    await session.exec(del_stmt)
+    await session.commit()
+
+    return {
+        "status": "ok",
+        "message": f"Successfully deleted {trips_count} trips",
+        "trips_deleted": trips_count,
+        "airline": airline,
+        "location_id": location_id,
+        "filters": {
+            "pick_up_date": pick_up_date,
+            "status": status
+        }
+    }
+
+
 @router.patch("/v1/locations/{location_id}/trips/{trip_id}")
 async def edit_trip(
     location_id: str,
@@ -1052,6 +1248,18 @@ async def edit_trip(
 ):
     """
     Actualiza un trip por su ID y location_id.
+
+    IMPORTANTE: Si se actualiza pick_up_time, debe enviarse en el timezone LOCAL de la
+    location (no en UTC). El sistema asignará automáticamente el timezone correcto basado
+    en el timezone configurado para esa location.
+
+    Ejemplo:
+    - Location: SDF (timezone: America/New_York)
+    - pick_up_time: "15:45:00" → Se interpreta como 15:45 hora de Nueva York
+    - NO enviar: "19:45:00" (UTC)
+
+    Si se actualizan pick_up_location o drop_off_location, el sistema recalculará
+    automáticamente el trip_type.
     """
     from uuid import UUID
 
@@ -2050,6 +2258,11 @@ async def edit_hotel(
         hotel.address = hotel_data.address
     if hotel_data.validation_status is not None:
         hotel.validation_status = hotel_data.validation_status
+        if hotel_data.validation_status == "VALIDATED":
+            from shared.utils.hotel_name_shortener import generate_short_name
+            location = await session.get(Location, uuid_location_id)
+            city_name = location.name if location else None
+            hotel.short_name = await generate_short_name(hotel.name, city_name=city_name)
 
     session.add(hotel)
     await session.commit()
@@ -3155,69 +3368,88 @@ async def pick_up_trip(
     _role=Depends(verify_role(["driver"]))
 ):
     """
-    Marca el pickup de un trip validando que el driver este dentro del radio de la zona de recogida.
+    Marks the pickup of a trip validating that the driver is within the pickup zone radius.
 
-    - Recibe la ubicacion del driver y la ubicacion del punto de pickup (hotel/aeropuerto)
-    - Valida que el driver este dentro del radio especificado
-    - Si esta dentro, actualiza picked_up_at con el timestamp actual
-    - Si no esta dentro, retorna error con la distancia actual
+    - Receives the driver's location and the pickup point location (hotel/airport)
+    - Validates that the driver is within the specified radius
+    - If within range, updates picked_up_at with current timestamp
+    - If not within range, returns error with current distance
     """
     try:
         uuid_trip_id = UUID(trip_id)
     except ValueError:
-        raise HTTPException(status_code=400, detail="ID de trip invalido")
+        raise HTTPException(status_code=400, detail="Invalid trip ID")
 
-    # Validar formato GeoJSON de las ubicaciones
+    # Validate GeoJSON format of locations
     driver_loc = request_data.driver_location
     pickup_loc = request_data.pickup_location
 
     if driver_loc.get("type") != "Point" or not isinstance(driver_loc.get("coordinates"), list):
-        raise HTTPException(status_code=400, detail="driver_location debe ser un GeoJSON Point valido")
+        raise HTTPException(status_code=400, detail="driver_location must be a valid GeoJSON Point")
 
     if pickup_loc.get("type") != "Point" or not isinstance(pickup_loc.get("coordinates"), list):
-        raise HTTPException(status_code=400, detail="pickup_location debe ser un GeoJSON Point valido")
+        raise HTTPException(status_code=400, detail="pickup_location must be a valid GeoJSON Point")
 
     driver_coords = driver_loc["coordinates"]
     pickup_coords = pickup_loc["coordinates"]
 
     if len(driver_coords) < 2 or len(pickup_coords) < 2:
-        raise HTTPException(status_code=400, detail="coordinates debe tener [longitude, latitude]")
+        raise HTTPException(status_code=400, detail="coordinates must have [longitude, latitude]")
 
-    # Extraer lat/lon (GeoJSON es [lon, lat])
+    # Extract lat/lon (GeoJSON is [lon, lat])
     driver_lon, driver_lat = driver_coords[0], driver_coords[1]
     pickup_lon, pickup_lat = pickup_coords[0], pickup_coords[1]
 
-    # Calcular distancia en millas
+    # Calculate distance in miles
     distance = haversine_distance_miles(driver_lat, driver_lon, pickup_lat, pickup_lon)
 
-    # Verificar si esta dentro del radio
+    # Verify if within radius
     if distance > request_data.radio_zone:
         raise HTTPException(
             status_code=400,
             detail={
                 "error": "driver_outside_radius",
-                "message": f"El driver esta fuera del radio de pickup",
+                "message": f"Driver is outside the pickup radius",
                 "distance_miles": round(distance, 4),
                 "radius_miles": request_data.radio_zone
             }
         )
 
-    # Buscar el trip
+    # Find the trip
     trip = await session.exec(
         Select(TripDB).Where(TripDB.id == uuid_trip_id)
     ).first()
 
     if not trip:
-        raise HTTPException(status_code=404, detail="Trip no encontrado")
+        raise HTTPException(status_code=404, detail="Trip not found")
 
-    # Validar que el driver asignado coincida
+    # Validate that the driver is active
+    driver = await session.exec(Select(Driver).Where(Driver.id == request_data.driver_id)).first()
+    if not driver or not driver.is_active:
+        raise HTTPException(status_code=403, detail="The driver is not active, cannot perform pickup")
+
+    # Validate that the assigned driver matches
     if trip.assigned_driver != request_data.driver_id:
         raise HTTPException(
             status_code=403,
-            detail="El driver no esta asignado a este trip"
+            detail="Driver is not assigned to this trip"
         )
 
-    # Actualizar picked_up_at
+    # Validate that trip has been started
+    if not trip.started_at:
+        raise HTTPException(
+            status_code=400,
+            detail="Trip has not been started. Driver must start the trip first."
+        )
+
+    # Validate that driver has arrived at pickup location
+    if not trip.arrived_pickup_at:
+        raise HTTPException(
+            status_code=400,
+            detail="Driver has not arrived at pickup location. Must log arrival at pickup location first."
+        )
+
+    # Update picked_up_at
     trip.picked_up_at = datetime.now(timezone.utc)
     trip.status = TripStatus.EN_ROUTE
     session.add(trip)
@@ -3226,7 +3458,7 @@ async def pick_up_trip(
 
     return JSONResponse(content={
         "status": "ok",
-        "message": "Pickup registrado exitosamente",
+        "message": "Pickup registered successfully",
         "trip_id": str(trip.id),
         "picked_up_at": trip.picked_up_at.isoformat(),
         "distance_miles": round(distance, 4)
@@ -3276,6 +3508,11 @@ async def start_trip(
     except Exception:
         raise HTTPException(status_code=401, detail="Missing or invalid authentication")
 
+    # Validar que el driver esté activo
+    driver = await session.exec(Select(Driver).Where(Driver.id == current_driver_id)).first()
+    if not driver or not driver.is_active:
+        raise HTTPException(status_code=403, detail="The driver is not active, cannot start trips")
+
     # Si el cliente manda driver_id, debe coincidir con el token (anti-spoofing)
     if request_data.driver_id and request_data.driver_id != current_driver_id:
         raise HTTPException(status_code=403, detail="driver_id no coincide con el token")
@@ -3287,8 +3524,66 @@ async def start_trip(
     elif trip.assigned_driver != current_driver_id:
         raise HTTPException(status_code=403, detail="El driver no esta asignado a este trip")
 
+    # Validar restricciones de tiempo según el tipo de trip
+    if trip.trip_type and trip.pick_up_date and trip.pick_up_time:
+        # Obtener location para la timezone
+        location = await session.exec(
+            Select(Location).Where(Location.id == trip.location_id)
+        ).first()
+        
+        if location and location.timezone:
+            # Crear datetime naive del pickup
+            pickup_datetime_naive = datetime.combine(trip.pick_up_date, trip.pick_up_time)
+            
+            # Convertir a timezone de la location
+            location_tz = ZoneInfo(location.timezone)
+            pickup_datetime_local = pickup_datetime_naive.replace(tzinfo=location_tz)
+            
+            # Convertir a UTC para comparar
+            pickup_datetime_utc = pickup_datetime_local.astimezone(timezone.utc)
+            current_time = datetime.now(timezone.utc)
+
+            if trip.trip_type.lower() == TripType.INBOUND:
+                # Trips inbound: pueden empezar hasta 1 hora antes
+                earliest_start_utc = pickup_datetime_utc - timedelta(hours=1)
+                if current_time < earliest_start_utc:
+                    earliest_start_local = earliest_start_utc.astimezone(location_tz)
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Inbound trips can only be started up to 1 hour before pickup time. Earliest start: {earliest_start_local.strftime('%H:%M %Z')}"
+                    )
+            elif trip.trip_type.lower() == TripType.OUTBOUND:
+                # Trips outbound: pueden empezar solo 25 minutos antes
+                earliest_start_utc = pickup_datetime_utc - timedelta(minutes=25)
+                if current_time < earliest_start_utc:
+                    earliest_start_local = earliest_start_utc.astimezone(location_tz)
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Outbound trips can only be started up to 25 minutes before pickup time. Earliest start: {earliest_start_local.strftime('%H:%M %Z')}"
+                    )
+        else:
+            # Fallback si no hay location o timezone: usar UTC asumiendo que los datos están en UTC
+            pickup_datetime = datetime.combine(trip.pick_up_date, trip.pick_up_time).replace(tzinfo=timezone.utc)
+            current_time = datetime.now(timezone.utc)
+
+            if trip.trip_type.lower() == TripType.INBOUND:
+                earliest_start = pickup_datetime - timedelta(hours=1)
+                if current_time < earliest_start:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Inbound trips can only be started up to 1 hour before pickup time. Earliest start: {earliest_start.strftime('%H:%M UTC')}"
+                    )
+            elif trip.trip_type.lower() == TripType.OUTBOUND:
+                earliest_start = pickup_datetime - timedelta(minutes=25)
+                if current_time < earliest_start:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Outbound trips can only be started up to 25 minutes before pickup time. Earliest start: {earliest_start.strftime('%H:%M UTC')}"
+                    )
+
     # Actualizar started_at
     trip.started_at = datetime.now(timezone.utc)
+    trip.status = TripStatus.EN_ROUTE
     session.add(trip)
     await session.commit()
     await session.refresh(trip)
@@ -3309,52 +3604,230 @@ async def drop_off_trip(
     _role=Depends(verify_role(["driver"]))
 ):
     """
-    Marca el drop off de un trip validando que el driver este dentro del radio del destino.
+    Marks the drop off of a trip validating that the driver is within the destination radius.
 
-    - Recibe la ubicacion del driver y la ubicacion del punto de destino (hotel/aeropuerto)
-    - Valida que el driver este dentro del radio especificado
-    - Si esta dentro, actualiza dropped_off_at con el timestamp actual y status a COMPLETED
-    - Si no esta dentro, retorna error con la distancia actual
+    - Receives the driver's location and the destination point location (hotel/airport)
+    - Validates that the driver is within the specified radius
+    - If within range, updates dropped_off_at with current timestamp and status to COMPLETED
+    - If not within range, returns error with current distance
     """
     try:
         uuid_trip_id = UUID(trip_id)
     except ValueError:
-        raise HTTPException(status_code=400, detail="ID de trip invalido")
+        raise HTTPException(status_code=400, detail="Invalid trip ID")
 
-    # Validar formato GeoJSON de las ubicaciones
+    # Validate GeoJSON format of locations
     driver_loc = request_data.driver_location
     dropoff_loc = request_data.dropoff_location
 
     if driver_loc.get("type") != "Point" or not isinstance(driver_loc.get("coordinates"), list):
-        raise HTTPException(status_code=400, detail="driver_location debe ser un GeoJSON Point valido")
+        raise HTTPException(status_code=400, detail="driver_location must be a valid GeoJSON Point")
 
     if dropoff_loc.get("type") != "Point" or not isinstance(dropoff_loc.get("coordinates"), list):
-        raise HTTPException(status_code=400, detail="dropoff_location debe ser un GeoJSON Point valido")
+        raise HTTPException(status_code=400, detail="dropoff_location must be a valid GeoJSON Point")
 
     driver_coords = driver_loc["coordinates"]
     dropoff_coords = dropoff_loc["coordinates"]
 
     if len(driver_coords) < 2 or len(dropoff_coords) < 2:
-        raise HTTPException(status_code=400, detail="coordinates debe tener [longitude, latitude]")
+        raise HTTPException(status_code=400, detail="coordinates must have [longitude, latitude]")
 
-    # Extraer lat/lon (GeoJSON es [lon, lat])
+    # Extract lat/lon (GeoJSON is [lon, lat])
     driver_lon, driver_lat = driver_coords[0], driver_coords[1]
     dropoff_lon, dropoff_lat = dropoff_coords[0], dropoff_coords[1]
 
-    # Calcular distancia en millas
+    # Calculate distance in miles
     distance = haversine_distance_miles(driver_lat, driver_lon, dropoff_lat, dropoff_lon)
 
-    # Verificar si esta dentro del radio
+    # Verify if within radius
     if distance > request_data.radio_zone:
         raise HTTPException(
             status_code=400,
             detail={
                 "error": "driver_outside_radius",
-                "message": f"El driver esta fuera del radio del destino",
+                "message": f"Driver is outside the destination radius",
                 "distance_miles": round(distance, 4),
                 "radius_miles": request_data.radio_zone
             }
         )
+
+    # Find the trip
+    trip = await session.exec(
+        Select(TripDB).Where(TripDB.id == uuid_trip_id)
+    ).first()
+
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found")
+
+    # Validate that the driver is active
+    driver = await session.exec(Select(Driver).Where(Driver.id == request_data.driver_id)).first()
+    if not driver or not driver.is_active:
+        raise HTTPException(status_code=403, detail="The driver is not active, cannot perform drop off")
+
+    # Validate that the assigned driver matches
+    if trip.assigned_driver != request_data.driver_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Driver is not assigned to this trip"
+        )
+
+    # Validate that all previous trip steps have been completed
+    if not trip.started_at:
+        raise HTTPException(
+            status_code=400,
+            detail="Trip has not been started. Driver must mark the trip as started first."
+        )
+
+    if not trip.arrived_pickup_at:
+        raise HTTPException(
+            status_code=400,
+            detail="Driver has not arrived at pickup location. Must log arrival at pickup location first."
+        )
+
+    if not trip.picked_up_at:
+        raise HTTPException(
+            status_code=400,
+            detail="Passenger has not been picked up. Driver must mark the passenger pickup first."
+        )
+
+    if not trip.arrived_dropoff_at:
+        raise HTTPException(
+            status_code=400,
+            detail="Driver has not arrived at drop-off location. Must log arrival at drop-off location first."
+        )
+
+    # Update dropped_off_at and status
+    trip.dropped_off_at = datetime.now(timezone.utc)
+    trip.status = TripStatus.COMPLETED
+    session.add(trip)
+    await session.commit()
+
+    return JSONResponse(content={
+        "status": "ok",
+        "message": "Drop off registered successfully",
+        "trip_id": str(trip.id),
+        "dropped_off_at": trip.dropped_off_at.isoformat(),
+        "distance_miles": round(distance, 4)
+    })
+
+
+@router.post("/v1/trips/{trip_id}/log-arrival")
+async def log_driver_arrival(
+    trip_id: str,
+    request_data: ArrivalLogRequest,
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["driver"]))
+):
+    """
+    Loguea la llegada del driver al pick-up location o al drop-off location.
+
+    - Recibe el tipo de llegada: "pick-up" o "drop-off"
+    - Obtiene la timezone de la location del trip
+    - Registra el timestamp en hora local de la location
+    - arrived_pickup_at: cuando el driver llega al punto de recogida
+    - arrived_dropoff_at: cuando el driver llega al punto de destino
+    """
+    # Validar tipo
+    arrival_type = request_data.type.lower().strip()
+    if arrival_type not in ("pick-up", "drop-off"):
+        raise HTTPException(
+            status_code=400,
+            detail="type must be 'pick-up' or 'drop-off'"
+        )
+
+    try:
+        uuid_trip_id = UUID(trip_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid trip ID")
+
+    # Buscar el trip
+    trip = await session.exec(
+        Select(TripDB).Where(TripDB.id == uuid_trip_id)
+    ).first()
+
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found")
+
+    # Validar que el driver este activo
+    driver = await session.exec(
+        Select(Driver).Where(Driver.id == request_data.driver_id)
+    ).first()
+    if not driver or not driver.is_active:
+        raise HTTPException(status_code=403, detail="The driver is not active")
+
+    # Validar que el driver asignado coincida
+    if trip.assigned_driver != request_data.driver_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Driver is not assigned to this trip"
+        )
+
+    # Obtener location para la timezone
+    location = await session.exec(
+        Select(Location).Where(Location.id == trip.location_id)
+    ).first()
+
+    if not location or not location.timezone:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not determine location timezone"
+        )
+
+    # Calcular hora local usando la timezone de la location
+    location_tz = ZoneInfo(location.timezone)
+    local_now = datetime.now(location_tz)
+
+    if arrival_type == "pick-up":
+        if trip.arrived_pickup_at:
+            raise HTTPException(
+                status_code=409,
+                detail="Arrival at pick-up location already logged"
+            )
+        trip.arrived_pickup_at = local_now
+        field_name = "arrived_pickup_at"
+    else:
+        if trip.arrived_dropoff_at:
+            raise HTTPException(
+                status_code=409,
+                detail="Arrival at drop-off location already logged"
+            )
+        trip.arrived_dropoff_at = local_now
+        field_name = "arrived_dropoff_at"
+
+    session.add(trip)
+    await session.commit()
+    await session.refresh(trip)
+
+    logged_value = getattr(trip, field_name)
+
+    return JSONResponse(content={
+        "status": "ok",
+        "message": f"Arrival at {arrival_type} location logged successfully",
+        "trip_id": str(trip.id),
+        field_name: logged_value.isoformat(),
+        "timezone": location.timezone
+    })
+
+
+@router.post("/v1/trips/{trip_id}/relief")
+async def relief_trip(
+    trip_id: str,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["driver"]))
+):
+    """
+    Permite al driver asignado soltar un trip en curso, devolviendolo a estado SCHEDULED
+    sin driver asignado para que otro driver lo pueda tomar.
+
+    - Solo el driver asignado puede hacer relief de su propio trip
+    - El trip debe estar EN_ROUTE y no haber completado el drop-off
+    - Resetea: assigned_driver, status, started_at, picked_up_at, arrived_pickup_at, arrived_dropoff_at
+    """
+    try:
+        uuid_trip_id = UUID(trip_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de trip invalido")
 
     # Buscar el trip
     trip = await session.exec(
@@ -3364,23 +3837,100 @@ async def drop_off_trip(
     if not trip:
         raise HTTPException(status_code=404, detail="Trip no encontrado")
 
-    # Validar que el driver asignado coincida
-    if trip.assigned_driver != request_data.driver_id:
+    # Validar que el trip este en ruta
+    if trip.status != TripStatus.EN_ROUTE:
         raise HTTPException(
-            status_code=403,
-            detail="El driver no esta asignado a este trip"
+            status_code=409,
+            detail="Solo se puede hacer relief de un trip que esta en ruta"
         )
 
-    # Actualizar dropped_off_at y status
-    trip.dropped_off_at = datetime.now(timezone.utc)
-    trip.status = TripStatus.COMPLETED
+    # Validar que no se haya completado el drop-off
+    if trip.dropped_off_at:
+        raise HTTPException(
+            status_code=409,
+            detail="No se puede hacer relief de un trip que ya completo el drop-off"
+        )
+
+    # Obtener driver actual desde el token
+    user_data = getattr(request.state, "user_data", None)
+    driver_id_from_token = user_data.get("id") if user_data else None
+    if not driver_id_from_token:
+        raise HTTPException(status_code=401, detail="Missing or invalid authentication")
+
+    try:
+        current_driver_id = UUID(str(driver_id_from_token))
+    except Exception:
+        raise HTTPException(status_code=401, detail="Missing or invalid authentication")
+
+    # Validar que el driver este activo
+    driver = await session.exec(Select(Driver).Where(Driver.id == current_driver_id)).first()
+    if not driver or not driver.is_active:
+        raise HTTPException(status_code=403, detail="The driver is not active, cannot perform relief")
+
+    # Validar que el driver que hace relief sea el mismo asignado al trip
+    if trip.assigned_driver != current_driver_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Solo el driver asignado puede hacer relief de este trip"
+        )
+
+    # Guardar location_id antes del reset para la notificacion WebSocket
+    location_id = str(trip.location_id)
+
+    # Obtener organization_id para notificacion
+    location = await session.exec(
+        Select(Location).Where(Location.id == trip.location_id)
+    ).first()
+    organization_id = str(location.organization_id) if location else None
+
+    # Resetear el trip a estado disponible
+    trip.assigned_driver = None
+    trip.status = TripStatus.SCHEDULED
+    trip.started_at = None
+    trip.picked_up_at = None
+    trip.arrived_pickup_at = None
+    trip.arrived_dropoff_at = None
+
     session.add(trip)
     await session.commit()
+    await session.refresh(trip)
+
+    # Notificar via WebSocket que el trip fue liberado
+    ws_event = {
+        "type": "trips_batch",
+        "location_id": location_id,
+        "events": [{
+            "trip_id": str(trip.id),
+            "event_type": "trip_relieved",
+            "trip": {
+                "id": str(trip.id),
+                "assigned_driver": None,
+                "status": trip.status,
+                "started_at": None,
+                "picked_up_at": None,
+                "arrived_pickup_at": None,
+                "arrived_dropoff_at": None,
+            }
+        }]
+    }
+
+    await safe_redis_call(
+        redis.publish,
+        f"loc:{location_id}",
+        json.dumps(ws_event),
+        context="relief trip ws notification (location)"
+    )
+
+    if organization_id:
+        await safe_redis_call(
+            redis.publish,
+            f"org:{organization_id}",
+            json.dumps(ws_event),
+            context="relief trip ws notification (org)"
+        )
 
     return JSONResponse(content={
         "status": "ok",
-        "message": "Drop off registrado exitosamente",
-        "trip_id": str(trip.id),
-        "dropped_off_at": trip.dropped_off_at.isoformat(),
-        "distance_miles": round(distance, 4)
+        "message": "Trip released successfully",
+        "trip_id": str(trip.id)
     })

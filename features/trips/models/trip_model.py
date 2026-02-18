@@ -57,6 +57,8 @@ class TripResponse(BaseModel):
     started_at: Optional[datetime] = None
     picked_up_at: Optional[datetime] = None
     dropped_off_at: Optional[datetime] = None
+    arrived_pickup_at: Optional[datetime] = None
+    arrived_dropoff_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
 
@@ -67,6 +69,7 @@ class TripResponse(BaseModel):
     expand_applied: bool = False
     filtered_at: Optional[datetime] = None
     current_step_id: Optional[UUID] = None
+    filter_order: Optional[str] = None  # ej: "expand,reduce" o "reduce,combine,expand"
 
     # Trip status
     status: Optional[str] = None
@@ -105,6 +108,8 @@ class TripSearchResult(BaseModel):
     started_at: Optional[datetime] = None
     picked_up_at: Optional[datetime] = None
     dropped_off_at: Optional[datetime] = None
+    arrived_pickup_at: Optional[datetime] = None
+    arrived_dropoff_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
 
@@ -127,7 +132,7 @@ class LocationDetails(BaseModel):
     name: str
     timezone: str
     address: Optional[str] = None
-    coordinates: Optional[dict] = None  # GeoJSON Point
+    point: Optional[dict] = None  # GeoJSON Point
     radio_zone: Optional[float] = None
     validation_status: str
     provider: Optional[str] = None
@@ -143,7 +148,7 @@ class DriverDetails(BaseModel):
     phone: Optional[str] = None
     pay_type: Optional[str] = None
     is_active: bool
-    current_location: Optional[dict] = None  # GeoJSON Point del GPS
+    point: Optional[dict] = None  # GeoJSON Point del GPS
     model_config = {"from_attributes": True}
 
 
@@ -164,8 +169,9 @@ class HotelDetails(BaseModel):
     """Detalles de hotel para pickup/dropoff."""
     id: UUID
     name: str
+    short_name: Optional[str] = None
     address: Optional[str] = None
-    coordinates: Optional[dict] = None  # GeoJSON Point
+    point: Optional[dict] = None  # GeoJSON Point
     radio_zone: Optional[float] = None
     validation_status: str
     model_config = {"from_attributes": True}
@@ -200,3 +206,9 @@ class DropOffTripRequest(BaseModel):
     driver_location: dict  # GeoJSON Point: {"type": "Point", "coordinates": [lon, lat]}
     dropoff_location: dict  # GeoJSON Point del hotel/aeropuerto destino
     radio_zone: float  # Radio en millas
+
+
+class ArrivalLogRequest(BaseModel):
+    """Request para loguear llegada del driver al pick-up o drop-off location."""
+    type: str  # "pick-up" or "drop-off"
+    driver_id: UUID

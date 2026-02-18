@@ -2,7 +2,7 @@
 Manager Profile Models - Pydantic models for manager profile endpoints.
 """
 
-from typing import Optional, List
+from typing import Optional, List, Literal
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -32,6 +32,7 @@ class ManagerProfileResponse(BaseModel):
     organization_name: str = Field(..., description="Nombre de la organizacion")
     organization_address: Optional[str] = Field(None, description="Direccion fisica de la org")
     organization_website: Optional[str] = Field(None, description="Website de la org")
+    organization_pay_frequency: str = Field(default="weekly", description="Frecuencia de pago: daily, weekly, biweekly")
     membership_status: str = Field(default="freemium", description="Plan: freemium, pro, enterprise")
 
     # Locations data
@@ -52,6 +53,7 @@ class ManagerProfileUpdate(BaseModel):
     organization_name: Optional[str] = Field(None, min_length=1, max_length=200)
     organization_address: Optional[str] = Field(None, max_length=500)
     organization_website: Optional[str] = Field(None, max_length=255)
+    organization_pay_frequency: Optional[Literal["daily", "weekly", "biweekly"]] = Field(None, description="Frecuencia de pago: daily, weekly, biweekly")
 
     @field_validator("organization_website")
     @classmethod

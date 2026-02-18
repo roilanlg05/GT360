@@ -3,6 +3,8 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from starlette.requests import Request
 from starlette.datastructures import State
 from shared.settings import settings
+from shared.redis.redis_client import redis_client
+from shared.redis.redis_safe import safe_redis_call
 
 from features.auth.utils import get_token, decode_token
 
@@ -54,6 +56,16 @@ class VerifyToken:
             try:
                 token = get_token(request)
                 payload = decode_token(token)
+
+                # Check if token has been blacklisted (e.g. after sign-out)
+                blacklisted = await safe_redis_call(
+                    redis_client.exists,
+                    f"blacklist:{token}",
+                    context="blacklist check",
+                    default=False,
+                )
+                if blacklisted:
+                    raise ValueError("Token revoked")
             except ValueError as e:
                 # Send 401 response with CORS headers
                 await self._send_error_response(scope, send, 401, str(e))

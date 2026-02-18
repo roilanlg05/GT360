@@ -189,6 +189,7 @@ async def register_driver(
             id=user.id,
             organization_id=user_data.organization_id,
             location_id=user_data.location_id,
+            pay_frequency=org.pay_frequency or "weekly",
         )
         session.add(driver)
 
@@ -261,7 +262,10 @@ async def sign_in(
     metadata = {
         "email": user.email,
         "phone": user.phone,
-        "role": user.role
+        "role": user.role,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "profile_pic": user.profile_pic
     }
 
 
@@ -326,6 +330,7 @@ async def sign_out(
         ["refresh_token", "expires_at"])
 
     return JSONResponse({"message": "All cookies revoked"}, status_code=200)
+
 @router.post("/refresh")
 async def refresh_token(
     response: Response,
@@ -354,7 +359,10 @@ async def refresh_token(
     metadata = {
         "email": user.email,
         "phone": user.phone,
-        "role": user.role
+        "role": user.role,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "profile_pic": user.profile_pic
     }
 
     # Agregar campos específicos del rol

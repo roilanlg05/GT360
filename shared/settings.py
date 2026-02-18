@@ -25,6 +25,7 @@ class BaseAppSettings(BaseSettings):
     ALGORITHM: str = os.getenv("ALGORITHM")
     PEPPER: Optional[str] = os.getenv("PEPPER")
     WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET")
+    GROQ_API_KEY: Optional[str] = os.getenv("GROQ_API_KEY")
     PUBLIC_PATHS: list[str] = [
         "/v1/auth/register",
         "/v1/auth/sign-in",

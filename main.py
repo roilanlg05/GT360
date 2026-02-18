@@ -18,10 +18,20 @@ from features.flights.push.webhook_handler import router as flight_webhook_route
 from features.profile.routes.profile_router import router as profile_router
 from features.profile.websockets.profile_websocket import router as profile_ws_router
 from features.drivers.routes.drivers_router import router as drivers_router
+from features.drivers.routes.shifts_router import router as shifts_router
+from features.drivers.routes.expenses_router import router as expenses_router
+from features.drivers.routes.earnings_router import router as earnings_router
+from features.drivers.routes.tax_router import router as tax_router
+from features.drivers.routes.manager_shifts_router import router as manager_shifts_router
+from features.drivers.routes.manager_expenses_router import router as manager_expenses_router
+from features.drivers.routes.manager_1099_router import router as manager_1099_router
+from features.drivers.routes.rating_router import router as rating_router
 from features.trips.routes.step_filter_router import router as step_filter_router
 from features.trips.routes.filter_preset_router import router as filter_preset_router
 from features.trips.routes.test_filter_router import router as test_filter_router
 from features.support.routes.support_router import router as support_router
+from features.trips.routes.review_router import router as review_router
+from features.trips.routes.alarm_router import router as alarm_router
 from shared.settings import settings
 """from features.geofencing.routes.validation_router import router as validation_router
 from features.geofencing.routes.geofence_router import router as geofence_router
@@ -34,6 +44,7 @@ from shared.middlewares.exceptions_handler import HTTPErrorHandler
 from shared.middlewares.deny_dotfiles import DenyDotfileMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 from shared.db.triggers.trips_archive import ensure_trips_archive_trigger
+from shared.db.triggers.driver_earnings_triggers import ensure_driver_earnings_triggers
 from psqlmodel import AsyncSession
 
 app = FastAPI()
@@ -42,9 +53,19 @@ app = FastAPI()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await engine.startup_async()
+    # Ensure schemas exist
+    async with AsyncSession(engine) as _s:
+        await _s.exec("CREATE SCHEMA IF NOT EXISTS reviews")
+        await _s.exec("CREATE SCHEMA IF NOT EXISTS drivers")
+        await _s.exec("CREATE SCHEMA IF NOT EXISTS ratings")
+        await _s.commit()
      # Ensure archive trigger exists (drop-off -> history)
     async with AsyncSession(engine) as _s:
         await ensure_trips_archive_trigger(_s)
+        await _s.commit()
+    # Ensure driver earnings triggers exist (updated_at for all tables)
+    async with AsyncSession(engine) as _s:
+        await ensure_driver_earnings_triggers(_s)
         await _s.commit()
     # Start DWELL checker background job (runs every 60 seconds)
     #dwell_checker.start(interval_seconds=60)
@@ -125,7 +146,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         "https://web.gt360.app",
         "https://gt360.app",
         "https://charmaine-leadless-ryleigh.ngrok-free.dev",
-        "http://192.168.1.101:5173/"
+        "http://192.168.1.101:3000/"
     ]
 
     # Crear respuesta con el detalle del error
@@ -166,10 +187,21 @@ app.include_router(flight_webhook_router)
 app.include_router(profile_router)
 app.include_router(profile_ws_router)
 app.include_router(drivers_router)
+# Driver earnings system routers
+app.include_router(shifts_router)
+app.include_router(expenses_router)
+app.include_router(earnings_router)
+app.include_router(tax_router)
+app.include_router(manager_shifts_router)
+app.include_router(manager_expenses_router)
+app.include_router(manager_1099_router)
 app.include_router(step_filter_router)
 app.include_router(filter_preset_router)
 app.include_router(test_filter_router)
 app.include_router(support_router)
+app.include_router(review_router)
+app.include_router(alarm_router)
+app.include_router(rating_router)
 #app.include_router(validation_router)
 #app.include_router(geofence_router)
 

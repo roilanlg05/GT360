@@ -1,7 +1,7 @@
 # WebSocket Integration Guide for Frontend Developers
 
-**Version:** 1.0
-**Last Updated:** 2026-01-05
+**Version:** 1.1
+**Last Updated:** 2026-02-11
 **Backend:** GT360 API
 
 ---
@@ -12,13 +12,14 @@
 2. [WebSocket Endpoints](#2-websocket-endpoints)
 3. [Authentication System](#3-authentication-system)
 4. [Message Formats](#4-message-formats)
-5. [Ping/Pong & Token Revalidation](#5-pingpong--token-revalidation)
-6. [Token Refresh Flow](#6-token-refresh-flow)
-7. [Reconnection Strategy](#7-reconnection-strategy)
-8. [Error Codes & Close Codes](#8-error-codes--close-codes)
-9. [TypeScript Implementation Examples](#9-typescript-implementation-examples)
-10. [Best Practices](#10-best-practices)
-11. [Troubleshooting](#11-troubleshooting)
+5. [Trip Operations & Real-Time Updates](#5-trip-operations--real-time-updates)
+6. [Ping/Pong & Token Revalidation](#6-pingpong--token-revalidation)
+7. [Token Refresh Flow](#7-token-refresh-flow)
+8. [Reconnection Strategy](#8-reconnection-strategy)
+9. [Error Codes & Close Codes](#9-error-codes--close-codes)
+10. [TypeScript Implementation Examples](#10-typescript-implementation-examples)
+11. [Best Practices](#11-best-practices)
+12. [Troubleshooting](#12-troubleshooting)
 
 ---
 
@@ -131,26 +132,45 @@ Upon successful connection, the server immediately sends a snapshot of all curre
 {
   "type": "snapshot",
   "location_id": "550e8400-e29b-41d4-a716-446655440000",
+  "location_info": {
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "name": "SDF",
+    "timezone": "America/New_York"
+  },
   "trips": [
     {
       "id": "trip-uuid-1",
+      "assigned_driver": null,
       "location_id": "550e8400-e29b-41d4-a716-446655440000",
+      "trip_hash": "abc123def456",
       "pick_up_date": "2026-01-05",
-      "pick_up_time": "14:30:00+00:00",
+      "pick_up_time": "14:30:00-05:00",
       "pick_up_location": "The Galt House",
       "drop_off_location": "SDF",
       "airline": "Southwest Airlines",
       "flight_number": "WN 1234",
-      "riders": 4,
+      "trip_type": "outbound",
+      "riders": {"pilots": 2, "flight_attendants": 2},
+      "status": "scheduled",
       "started_at": null,
       "picked_up_at": null,
       "dropped_off_at": null,
+      "arrived_pickup_at": null,
+      "arrived_dropoff_at": null,
+      "original_pick_up_time": null,
+      "reduce_applied": false,
+      "combine_applied": false,
+      "expand_applied": false,
+      "filtered_at": null,
+      "current_step_id": null,
       "created_at": "2026-01-05T10:00:00.000Z",
       "updated_at": "2026-01-05T10:00:00.000Z"
     }
   ]
 }
 ```
+
+**Note:** The `pick_up_time` includes timezone offset (e.g., `-05:00` for EST) which represents the local time at the location.
 
 **Supported Client Actions:**
 
@@ -389,20 +409,37 @@ Authorization: Bearer <access_token>
 {
   "type": "snapshot",
   "location_id": "550e8400-e29b-41d4-a716-446655440000",
+  "location_info": {
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "name": "SDF",
+    "timezone": "America/New_York"
+  },
   "trips": [
     {
       "id": "trip-uuid",
+      "assigned_driver": null,
       "location_id": "location-uuid",
+      "trip_hash": "abc123def456",
       "pick_up_date": "2026-01-05",
-      "pick_up_time": "14:30:00+00:00",
+      "pick_up_time": "14:30:00-05:00",
       "pick_up_location": "Hotel Name",
       "drop_off_location": "Airport Code",
       "airline": "Airline Name",
       "flight_number": "XX 1234",
-      "riders": 4,
+      "trip_type": "outbound",
+      "riders": {"pilots": 2, "flight_attendants": 2},
+      "status": "scheduled",
       "started_at": null,
       "picked_up_at": null,
       "dropped_off_at": null,
+      "arrived_pickup_at": null,
+      "arrived_dropoff_at": null,
+      "original_pick_up_time": null,
+      "reduce_applied": false,
+      "combine_applied": false,
+      "expand_applied": false,
+      "filtered_at": null,
+      "current_step_id": null,
       "created_at": "2026-01-05T10:00:00.000Z",
       "updated_at": "2026-01-05T10:00:00.000Z"
     }
@@ -412,69 +449,102 @@ Authorization: Bearer <access_token>
 
 ---
 
-#### Trip Event (real-time updates)
+#### Trips Batch Event (real-time updates, default mode)
 
-**Insert Event:**
+The server sends batched events by default (`SEND_WS_BATCH = True`). Each batch contains one or more trip events:
+
 ```json
 {
-  "type": "trip_event",
-  "event_type": "insert",
+  "type": "trips_batch",
   "location_id": "550e8400-e29b-41d4-a716-446655440000",
-  "trip_id": "trip-uuid",
-  "trip": {
-    "id": "trip-uuid",
-    "location_id": "location-uuid",
-    "pick_up_date": "2026-01-05",
-    "pick_up_time": "14:30:00+00:00",
-    "pick_up_location": "Hotel Name",
-    "drop_off_location": "SDF",
-    "airline": "Southwest Airlines",
-    "flight_number": "WN 1234",
-    "riders": 4,
-    "started_at": null,
-    "picked_up_at": null,
-    "dropped_off_at": null,
-    "created_at": "2026-01-05T10:00:00.000Z",
-    "updated_at": "2026-01-05T10:00:00.000Z"
-  }
+  "events": [
+    {
+      "event_type": "insert",
+      "trip_id": "trip-uuid-1",
+      "trip": {
+        "id": "trip-uuid-1",
+        "assigned_driver": null,
+        "location_id": "location-uuid",
+        "trip_hash": "abc123",
+        "pick_up_date": "2026-01-05",
+        "pick_up_time": "14:30:00-05:00",
+        "pick_up_location": "Hotel Name",
+        "drop_off_location": "SDF",
+        "airline": "Southwest Airlines",
+        "flight_number": "WN 1234",
+        "trip_type": "outbound",
+        "riders": {"pilots": 2, "flight_attendants": 2},
+        "status": "scheduled",
+        "started_at": null,
+        "picked_up_at": null,
+        "dropped_off_at": null,
+        "arrived_pickup_at": null,
+        "arrived_dropoff_at": null,
+        "original_pick_up_time": null,
+        "reduce_applied": false,
+        "combine_applied": false,
+        "expand_applied": false,
+        "filtered_at": null,
+        "current_step_id": null,
+        "created_at": "2026-01-05T10:00:00.000Z",
+        "updated_at": "2026-01-05T10:00:00.000Z"
+      }
+    },
+    {
+      "event_type": "update",
+      "trip_id": "trip-uuid-2",
+      "trip": { "...": "full trip object with updated fields" }
+    },
+    {
+      "event_type": "delete",
+      "trip_id": "trip-uuid-3",
+      "trip": {
+        "id": "trip-uuid-3",
+        "pick_up_location": "Hotel Name",
+        "drop_off_location": "SDF",
+        "airline": "Southwest Airlines",
+        "flight_number": "WN 1234"
+      }
+    }
+  ]
 }
 ```
 
-**Update Event:**
-```json
-{
-  "type": "trip_event",
-  "event_type": "update",
-  "location_id": "550e8400-e29b-41d4-a716-446655440000",
-  "trip_id": "trip-uuid",
-  "trip": {
-    "id": "trip-uuid",
-    "...": "updated fields",
-    "updated_at": "2026-01-05T12:00:00.000Z"
-  }
-}
-```
+**Event types inside `events` array:**
 
-**Delete Event:**
-```json
-{
-  "type": "trip_event",
-  "event_type": "delete",
-  "location_id": "550e8400-e29b-41d4-a716-446655440000",
-  "trip_id": "trip-uuid",
-  "trip": {
-    "id": "trip-uuid",
-    "pick_up_location": "Hotel Name",
-    "drop_off_location": "SDF",
-    "airline": "Southwest Airlines",
-    "flight_number": "WN 1234"
-  }
-}
-```
+| event_type | Description | `trip` contains |
+|------------|-------------|-----------------|
+| `insert` | Trip created | Full trip object |
+| `update` | Trip modified | Full trip object with updated fields |
+| `delete` | Trip deleted | Partial trip (for UI notification) |
 
 **Note:** Delete events include trip data so you can show useful notifications like:
 ```
 "Deleted: Hotel Name -> SDF (WN 1234)"
+```
+
+---
+
+#### Filter Step Events
+
+When a ground filter step is applied or reverted, the server forwards these events:
+
+**Step Applied:**
+```json
+{
+  "type": "step_applied",
+  "location_id": "550e8400-e29b-41d4-a716-446655440000",
+  "filter_type": "reduce"
+}
+```
+
+**Step Reverted:**
+```json
+{
+  "type": "step_reverted",
+  "location_id": "550e8400-e29b-41d4-a716-446655440000",
+  "filter_type": "reduce"
+}
 ```
 
 ---
@@ -584,19 +654,222 @@ Authorization: Bearer <access_token>
 
 ---
 
-## 5. Ping/Pong & Token Revalidation
+## 5. Trip Data Model & Real-Time Updates
 
-### 5.1 Why Ping/Pong is Important
+### 5.1 How Updates Work
+
+When trip data changes (through driver actions, manager updates, or system operations), the changes are automatically propagated via WebSocket:
+
+**Flow:**
+```
+1. Trip data modified in database (via REST API or system operation)
+2. Database trigger sends NOTIFY
+3. Webhook receives notification
+4. Redis cache updated
+5. WebSocket broadcasts trips_batch event with updated trip
+6. All connected clients receive the update
+```
+
+### 5.2 Complete Trip Schema
+
+The complete trip object received in WebSocket events includes:
+
+```typescript
+interface Trip {
+  // Basic info
+  id: string;
+  location_id: string;
+  trip_hash: string;
+  pick_up_date: string;      // "YYYY-MM-DD"
+  pick_up_time: string;      // "HH:MM:SS±HH:MM" (with timezone offset, e.g., "14:30:00-05:00")
+  pick_up_location: string;
+  drop_off_location: string;
+  airline: string;
+  flight_number: string;
+  trip_type: string | null;  // "inbound" | "outbound" | "ground"
+  riders: Record<string, number> | null;
+
+  // Assignment & Status
+  assigned_driver: string | null;
+  status: string | null;     // "scheduled" | "en_route" | "completed" | "canceled"
+
+  // Lifecycle timestamps (all ISO 8601 UTC)
+  started_at: string | null;           // Trip started (e.g., "2026-02-11T14:25:00.000Z")
+  arrived_pickup_at: string | null;    // Driver arrived at pickup location
+  picked_up_at: string | null;         // Passengers picked up
+  arrived_dropoff_at: string | null;   // Driver arrived at dropoff location
+  dropped_off_at: string | null;       // Passengers dropped off
+
+  // Ground filters
+  original_pick_up_time: string | null; // "HH:MM:SS±HH:MM" (if trip was modified by filters)
+  reduce_applied: boolean;
+  combine_applied: boolean;
+  expand_applied: boolean;
+  filtered_at: string | null;          // ISO 8601 UTC
+  current_step_id: string | null;
+
+  // Metadata
+  created_at: string;        // ISO 8601 UTC
+  updated_at: string;        // ISO 8601 UTC
+}
+```
+
+**Status Values:**
+- `scheduled`: Trip created, not started
+- `en_route`: Trip started or picked up, in progress
+- `completed`: Trip completed with drop-off
+- `canceled`: Trip canceled
+
+---
+
+### 5.3 Timezone Handling
+
+**IMPORTANT:** Trip times are timezone-aware and reflect the location's local timezone.
+
+#### Time Field Formats
+
+| Field | Format | Timezone | Example |
+|-------|--------|----------|---------|
+| `pick_up_time` | `HH:MM:SS±HH:MM` | Location local | `"14:30:00-05:00"` |
+| `original_pick_up_time` | `HH:MM:SS±HH:MM` | Location local | `"14:00:00-05:00"` |
+| `started_at` | ISO 8601 | UTC | `"2026-02-11T19:25:00.000Z"` |
+| `picked_up_at` | ISO 8601 | UTC | `"2026-02-11T19:35:00.000Z"` |
+| `dropped_off_at` | ISO 8601 | UTC | `"2026-02-11T20:10:00.000Z"` |
+| `created_at` | ISO 8601 | UTC | `"2026-02-11T10:00:00.000Z"` |
+
+#### Understanding pick_up_time
+
+The `pick_up_time` field includes timezone offset information:
+
+```json
+{
+  "pick_up_date": "2026-02-15",
+  "pick_up_time": "14:30:00-05:00",
+  "location_info": {
+    "timezone": "America/New_York"
+  }
+}
+```
+
+This means:
+- **Local time:** 2:30 PM Eastern Time (EST/EDT depending on date)
+- **Offset:** `-05:00` (EST) or `-04:00` (EDT during daylight saving)
+- **UTC equivalent:** 7:30 PM UTC (during EST)
+
+#### Displaying Times in UI
+
+```typescript
+// Example trip data from WebSocket
+const trip = {
+  pick_up_date: "2026-02-15",
+  pick_up_time: "14:30:00-05:00",
+  started_at: "2026-02-15T19:25:00.000Z",
+  ...
+};
+
+const locationInfo = {
+  timezone: "America/New_York"
+};
+
+// Option 1: Parse pick_up_time with Luxon
+import { DateTime } from 'luxon';
+
+const pickupDateTime = DateTime.fromISO(
+  `${trip.pick_up_date}T${trip.pick_up_time}`
+);
+
+console.log(pickupDateTime.toLocaleString(DateTime.TIME_SIMPLE));
+// Output: "2:30 PM"
+
+console.log(pickupDateTime.zoneName);
+// Output: "America/New_York"
+
+// Option 2: Display lifecycle timestamps in location's timezone
+const startedAt = DateTime.fromISO(trip.started_at, { zone: 'utc' })
+  .setZone(locationInfo.timezone);
+
+console.log(startedAt.toLocaleString(DateTime.DATETIME_SHORT));
+// Output: "2/15/2026, 2:25 PM" (converted from UTC to location timezone)
+
+// Option 3: Simple string parsing (if you just need the time)
+const timeOnly = trip.pick_up_time.split(/[+-]/)[0]; // "14:30:00"
+const [hours, minutes] = timeOnly.split(':');
+console.log(`${hours}:${minutes}`); // "14:30"
+```
+
+#### Timezone Offset Changes (DST)
+
+The timezone offset in `pick_up_time` changes based on Daylight Saving Time:
+
+```typescript
+// Winter trip (EST)
+{
+  "pick_up_date": "2026-01-15",
+  "pick_up_time": "14:30:00-05:00"  // EST (UTC-5)
+}
+
+// Summer trip (EDT)
+{
+  "pick_up_date": "2026-07-15",
+  "pick_up_time": "14:30:00-04:00"  // EDT (UTC-4)
+}
+```
+
+Both represent 2:30 PM local time, but the UTC equivalent differs:
+- Winter: `19:30:00 UTC`
+- Summer: `18:30:00 UTC`
+
+**Best Practice:** Always use the `location_info.timezone` field from the snapshot to properly interpret times. Don't rely solely on the offset.
+
+---
+
+### 5.4 Lifecycle Timestamp Progression
+```
+created_at
+    ↓
+started_at (status → "en_route")
+    ↓
+arrived_pickup_at
+    ↓
+picked_up_at (status → "en_route")
+    ↓
+arrived_dropoff_at
+    ↓
+dropped_off_at (status → "completed")
+```
+
+### 5.5 Common Update Scenarios
+
+When you receive a `trips_batch` event with `event_type: "update"`, here are the most common field changes:
+
+| Scenario | Fields Updated | New Status |
+|----------|---------------|------------|
+| Driver starts trip | `started_at`, `assigned_driver` | `en_route` |
+| Driver arrives at pickup | `arrived_pickup_at` | (unchanged) |
+| Driver picks up passengers | `picked_up_at` | `en_route` |
+| Driver arrives at destination | `arrived_dropoff_at` | (unchanged) |
+| Driver completes drop-off | `dropped_off_at` | `completed` |
+| Manager assigns driver | `assigned_driver` | (unchanged) |
+| Manager cancels trip | `status` | `canceled` |
+| Ground filter applied | `reduce_applied`, `combine_applied`, or `expand_applied`, `filtered_at`, `current_step_id` | (unchanged) |
+
+**Note:** All timestamp fields are in ISO 8601 UTC format.
+
+---
+
+## 6. Ping/Pong & Token Revalidation
+
+### 6.1 Why Ping/Pong is Important
 
 1. **Keep-alive:** Prevents connection timeout
 2. **Token validation:** Server validates the token on each ping
 3. **Early detection:** Catches expired tokens before they cause issues
 
-### 5.2 Recommended Interval
+### 6.2 Recommended Interval
 
 Send a ping every **30-60 seconds** with the current access token.
 
-### 5.3 Flow
+### 6.3 Flow
 
 ```
 Client                                    Server
@@ -610,7 +883,7 @@ Client                                    Server
    |                                         |
 ```
 
-### 5.4 Token Expiration During Connection
+### 6.4 Token Expiration During Connection
 
 If the token expires and the client sends a ping with the expired token:
 
@@ -630,7 +903,7 @@ Client                                    Server
    |                                         |
 ```
 
-### 5.5 Implementation Pattern
+### 6.5 Implementation Pattern
 
 ```typescript
 // Send ping every 30 seconds
@@ -658,9 +931,9 @@ function stopPingInterval() {
 
 ---
 
-## 6. Token Refresh Flow
+## 7. Token Refresh Flow
 
-### 6.1 When to Refresh
+### 7.1 When to Refresh
 
 Refresh the token **before it expires**. Recommended: 5 minutes before expiration.
 
@@ -672,7 +945,7 @@ function shouldRefreshToken(expiresAt: number): boolean {
 }
 ```
 
-### 6.2 Refresh Flow with WebSocket
+### 7.2 Refresh Flow with WebSocket
 
 ```
 1. Check token expiration before sending ping
@@ -684,7 +957,7 @@ function shouldRefreshToken(expiresAt: number): boolean {
 4. Continue normal operation
 ```
 
-### 6.3 Implementation Example
+### 7.3 Implementation Example
 
 ```typescript
 async function refreshTokenIfNeeded(
@@ -721,9 +994,9 @@ async function refreshTokenIfNeeded(
 
 ---
 
-## 7. Reconnection Strategy
+## 8. Reconnection Strategy
 
-### 7.1 WebSocket Close Codes
+### 8.1 WebSocket Close Codes
 
 | Code | Meaning | Action |
 |------|---------|--------|
@@ -733,7 +1006,7 @@ async function refreshTokenIfNeeded(
 | 1008 | Policy violation (auth) | Refresh token, then reconnect |
 | 1011 | Server error | Reconnect with backoff |
 
-### 7.2 Reconnection Algorithm
+### 8.2 Reconnection Algorithm
 
 Use exponential backoff with jitter:
 
@@ -747,7 +1020,7 @@ function calculateBackoff(attempt: number): number {
 }
 ```
 
-### 7.3 Reconnection Flow
+### 8.3 Reconnection Flow
 
 ```
 1. WebSocket closes unexpectedly
@@ -761,7 +1034,7 @@ function calculateBackoff(attempt: number): number {
 7. After N failures: Give up, prompt re-login
 ```
 
-### 7.4 Implementation Example
+### 8.4 Implementation Example
 
 ```typescript
 class WebSocketManager {
@@ -819,9 +1092,9 @@ class WebSocketManager {
 
 ---
 
-## 8. Error Codes & Close Codes
+## 9. Error Codes & Close Codes
 
-### 8.1 WebSocket Close Codes
+### 9.1 WebSocket Close Codes
 
 | Code | Name | Description | Client Action |
 |------|------|-------------|---------------|
@@ -831,7 +1104,7 @@ class WebSocketManager {
 | 1008 | Policy Violation | Authentication failed | Refresh token, reconnect |
 | 1011 | Internal Error | Server error | Reconnect with backoff |
 
-### 8.2 HTTP Error Codes (Auth Endpoints)
+### 9.2 HTTP Error Codes (Auth Endpoints)
 
 | Code | Endpoint | Meaning |
 |------|----------|---------|
@@ -843,7 +1116,7 @@ class WebSocketManager {
 | 403 | change-password | Incorrect current password |
 | 409 | register | Email/phone already in use |
 
-### 8.3 WebSocket Error Messages
+### 9.3 WebSocket Error Messages
 
 ```json
 {
@@ -870,42 +1143,71 @@ class WebSocketManager {
 
 ---
 
-## 9. TypeScript Implementation Examples
+## 10. TypeScript Implementation Examples
 
-### 9.1 useWebSocketTrips Hook
+### 10.1 useWebSocketTrips Hook
 
 ```typescript
 import { useEffect, useRef, useCallback, useState } from 'react';
 
+interface LocationInfo {
+  id: string;
+  name: string;       // Airport code (e.g., "SDF")
+  timezone: string;   // e.g., "America/New_York"
+}
+
 interface Trip {
   id: string;
+  assigned_driver: string | null;
   location_id: string;
-  pick_up_date: string;
-  pick_up_time: string;
+  trip_hash: string;
+  pick_up_date: string;      // "YYYY-MM-DD"
+  pick_up_time: string;      // "HH:MM:SS±HH:MM" (e.g., "14:30:00-05:00")
   pick_up_location: string;
   drop_off_location: string;
   airline: string;
   flight_number: string;
-  riders: number;
-  started_at: string | null;
-  picked_up_at: string | null;
-  dropped_off_at: string | null;
-  created_at: string;
-  updated_at: string;
+  trip_type: string | null;  // "inbound" | "outbound" | "ground"
+  riders: Record<string, number> | null;  // e.g., {"pilots": 2, "flight_attendants": 2}
+  status: string | null;     // "scheduled" | "canceled" | "en_route" | "completed"
+  started_at: string | null;           // ISO 8601 UTC
+  picked_up_at: string | null;         // ISO 8601 UTC
+  dropped_off_at: string | null;       // ISO 8601 UTC
+  arrived_pickup_at: string | null;    // ISO 8601 UTC
+  arrived_dropoff_at: string | null;   // ISO 8601 UTC
+  original_pick_up_time: string | null; // "HH:MM:SS±HH:MM" (if modified by filters)
+  reduce_applied: boolean;
+  combine_applied: boolean;
+  expand_applied: boolean;
+  filtered_at: string | null;          // ISO 8601 UTC
+  current_step_id: string | null;
+  created_at: string;        // ISO 8601 UTC
+  updated_at: string;        // ISO 8601 UTC
 }
 
-interface TripEvent {
-  type: 'trip_event';
+interface TripBatchEvent {
   event_type: 'insert' | 'update' | 'delete';
-  location_id: string;
   trip_id: string;
   trip: Trip;
+}
+
+interface TripsBatchMessage {
+  type: 'trips_batch';
+  location_id: string;
+  events: TripBatchEvent[];
 }
 
 interface SnapshotEvent {
   type: 'snapshot';
   location_id: string;
+  location_info: LocationInfo | null;
   trips: Trip[];
+}
+
+interface StepEvent {
+  type: 'step_applied' | 'step_reverted';
+  location_id: string;
+  filter_type: string;  // "reduce" | "combine" | "expand"
 }
 
 interface UseWebSocketTripsOptions {
@@ -995,24 +1297,34 @@ export function useWebSocketTrips({
 
       switch (data.type) {
         case 'snapshot':
+          const snapshot = data as SnapshotEvent;
           const snapshotTrips = new Map<string, Trip>();
-          (data as SnapshotEvent).trips.forEach(trip => {
+          snapshot.trips.forEach(trip => {
             snapshotTrips.set(trip.id, trip);
           });
           setTrips(snapshotTrips);
+          // snapshot.location_info has timezone, name (airport code)
           break;
 
-        case 'trip_event':
-          const tripEvent = data as TripEvent;
+        case 'trips_batch':
+          const batch = data as TripsBatchMessage;
           setTrips(prev => {
             const newMap = new Map(prev);
-            if (tripEvent.event_type === 'delete') {
-              newMap.delete(tripEvent.trip_id);
-            } else {
-              newMap.set(tripEvent.trip_id, tripEvent.trip);
+            for (const ev of batch.events) {
+              if (ev.event_type === 'delete') {
+                newMap.delete(ev.trip_id);
+              } else {
+                newMap.set(ev.trip_id, ev.trip);
+              }
             }
             return newMap;
           });
+          break;
+
+        case 'step_applied':
+        case 'step_reverted':
+          // Filter step changed - you may want to refresh UI
+          // data.filter_type = "reduce" | "combine" | "expand"
           break;
 
         case 'pong':
@@ -1117,7 +1429,7 @@ export function useWebSocketTrips({
 
 ---
 
-### 9.2 useWebSocketOrg Hook
+### 10.2 useWebSocketOrg Hook
 
 ```typescript
 import { useEffect, useRef, useCallback, useState } from 'react';
@@ -1318,7 +1630,7 @@ export function useWebSocketOrg({
 
 ---
 
-### 9.3 Usage Example
+### 10.3 Usage Example
 
 ```typescript
 // In your component
@@ -1381,9 +1693,9 @@ function TripsPage({ locationId }: { locationId: string }) {
 
 ---
 
-## 10. Best Practices
+## 11. Best Practices
 
-### 10.1 Token Storage
+### 11.1 Token Storage
 
 | Storage | Recommendation |
 |---------|----------------|
@@ -1391,25 +1703,25 @@ function TripsPage({ locationId }: { locationId: string }) {
 | Refresh Token | Cookie only (httpOnly, set by server) |
 | localStorage | **NEVER** store tokens here |
 
-### 10.2 Connection Management
+### 11.2 Connection Management
 
 1. **Single connection per location:** Don't create multiple WebSocket connections to the same location
 2. **Cleanup on unmount:** Always close WebSocket when component unmounts
 3. **Debounce reconnection:** Use exponential backoff to avoid overwhelming the server
 
-### 10.3 Token Refresh
+### 11.3 Token Refresh
 
 1. **Proactive refresh:** Refresh token before it expires (5 min buffer)
 2. **Update ping token:** Always use the latest token in ping messages
 3. **Handle refresh failures:** Redirect to login if refresh fails
 
-### 10.4 Error Handling
+### 11.4 Error Handling
 
 1. **Graceful degradation:** Show appropriate UI when disconnected
 2. **Retry limits:** Set maximum reconnection attempts
 3. **User feedback:** Inform user of connection status
 
-### 10.5 Performance
+### 11.5 Performance
 
 1. **Use Map for trips:** O(1) lookup/update vs O(n) for arrays
 2. **Memoize callbacks:** Prevent unnecessary re-renders
@@ -1417,9 +1729,9 @@ function TripsPage({ locationId }: { locationId: string }) {
 
 ---
 
-## 11. Troubleshooting
+## 12. Troubleshooting
 
-### 11.1 Connection Fails Immediately (Code 1008)
+### 12.1 Connection Fails Immediately (Code 1008)
 
 **Possible Causes:**
 - Token is expired
@@ -1432,7 +1744,7 @@ function TripsPage({ locationId }: { locationId: string }) {
 2. Verify organization_id in token metadata
 3. Try refreshing the token first
 
-### 11.2 No Events Received
+### 12.2 No Events Received
 
 **Possible Causes:**
 - Subscribed to wrong location_id
@@ -1444,7 +1756,7 @@ function TripsPage({ locationId }: { locationId: string }) {
 2. Check browser Network tab for WebSocket messages
 3. Verify snapshot was received on connect
 
-### 11.3 Frequent Disconnections
+### 12.3 Frequent Disconnections
 
 **Possible Causes:**
 - Token expiring without refresh
@@ -1456,7 +1768,7 @@ function TripsPage({ locationId }: { locationId: string }) {
 2. Implement reconnection with backoff
 3. Check server logs for errors
 
-### 11.4 "Token required" Error on Ping
+### 12.4 "Token required" Error on Ping
 
 **Cause:** Sending ping without token field
 
@@ -1469,7 +1781,7 @@ function TripsPage({ locationId }: { locationId: string }) {
 {"action": "ping", "token": "eyJhbGc..."}
 ```
 
-### 11.5 Getting Old Data After Reconnect
+### 12.5 Getting Old Data After Reconnect
 
 **Cause:** Snapshot data is cached in Redis (5 min TTL)
 
@@ -1481,18 +1793,19 @@ function TripsPage({ locationId }: { locationId: string }) {
 
 ### Server -> Client
 
-| type | event_type | When | Fields |
-|------|------------|------|--------|
-| snapshot | - | On connect (/ws/trips) | location_id, trips[] |
-| trip_event | insert | Trip created | location_id, trip_id, trip |
-| trip_event | update | Trip modified | location_id, trip_id, trip |
-| trip_event | delete | Trip deleted | location_id, trip_id, trip |
-| connected | - | On connect (/ws/org) | organization_id, message |
-| location_deleted | - | Location deleted | location_id, location_name, message, hotels[], hotels_count |
-| pong | - | Response to ping | - |
-| subscribed | - | Response to subscribe | location_id |
-| unsubscribed | - | Response to unsubscribe | location_id |
-| error | - | Error occurred | code, detail |
+| type | When | Fields |
+|------|------|--------|
+| snapshot | On connect (/ws/trips) | location_id, location_info, trips[] |
+| trips_batch | Trip(s) created/updated/deleted | location_id, events[] (each with event_type, trip_id, trip) |
+| step_applied | Filter step applied | location_id, filter_type |
+| step_reverted | Filter step reverted | location_id, filter_type |
+| connected | On connect (/ws/org) | organization_id, message |
+| location_delete_started | Location deletion in progress | location_id |
+| location_deleted | Location deleted | location_id, location_name, message, hotels[], hotels_count |
+| pong | Response to ping | - |
+| subscribed | Response to subscribe | location_id |
+| unsubscribed | Response to unsubscribe | location_id |
+| error | Error occurred | code, detail |
 
 ### Client -> Server
 
@@ -1525,6 +1838,14 @@ function TripsPage({ locationId }: { locationId: string }) {
 | Max Reconnect Attempts | 10 |
 | Reconnect Base Delay | 1 second |
 | Reconnect Max Delay | 30 seconds |
+
+---
+
+## Related Documentation
+
+- **[Trips CRUD Timezone Guide](./TRIPS_CRUD_TIMEZONE_GUIDE.md)** - Detailed guide on creating and updating trips with proper timezone handling
+- **[Trip Type Classification](./TRIP_TYPE_CLASSIFICATION.md)** - How trip types (inbound/outbound/ground) are determined
+- **[Trip Filters Frontend Guide](./TRIP_FILTERS_FRONTEND_GUIDE.md)** - Ground filtering system documentation
 
 ---
 

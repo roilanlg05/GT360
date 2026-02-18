@@ -1,5 +1,5 @@
 from psqlmodel import PSQLModel, table, Column
-from psqlmodel.orm.types import jsonb, uuid
+from psqlmodel.orm.types import jsonb, uuid, decimal, varchar, time
 
 
 class PayType:
@@ -7,6 +7,13 @@ class PayType:
     DAY = "day"
     HOUR = "hour"
     TRIP = "trip"
+
+
+class PayFrequency:
+    """Pay frequency constants for drivers."""
+    DAILY = "daily"
+    WEEKLY = "weekly"
+    BIWEEKLY = "biweekly"
 
 
 @table("drivers", schema="entities")
@@ -52,4 +59,31 @@ class Driver(PSQLModel):
         index=True,
     )
 
+    pay_frequency: varchar = Column(
+        max_len=20,
+        default=None,
+        nullable=True,
+        index=True,
+    )
+
+    rate: decimal = Column(
+        default=None,
+        nullable=True,
+    )
+
     profile_pic_url: str = Column(unique=True)
+
+    shift_start_time: time = Column(
+        default=None,
+        nullable=True,
+    )
+
+    shift_end_time: time = Column(
+        default=None,
+        nullable=True,
+    )
+
+    work_days: jsonb = Column(
+        default=None,
+        nullable=True,
+    )

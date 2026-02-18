@@ -20,6 +20,8 @@ from features.profile.models import (
     ProfilePhotoUploadResponse,
 )
 from features.profile.services.manager_profile_service import ManagerProfileService
+from features.profile.services.driver_profile_service import get_driver_profile
+from features.profile.models.driver_profile_models import DriverProfileResponse
 from shared.services.file_storage_service import file_storage_service
 from features.profile.websockets.profile_websocket import publish_profile_update
 from datetime import datetime, timezone
@@ -268,6 +270,44 @@ async def delete_account(
     await session.commit()
 
     return {"status": "ok", "message": "Cuenta eliminada correctamente"}
+
+
+# =============================================================================
+# DRIVER PROFILE ENDPOINT
+# =============================================================================
+
+@router.get("/v1/profile/driver", response_model=DriverProfileResponse)
+async def get_driver_profile_endpoint(
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["driver"]))
+):
+    """
+    Obtiene el perfil completo del driver autenticado.
+
+    Retorna:
+    - Datos personales (nombre, email, telefono, foto)
+    - Datos de pago (pay_type, pay_frequency, rate)
+    - Location asignada (nombre, direccion, timezone)
+    - Organizacion (id, nombre)
+    """
+    user_data = request.state.user_data
+    user_id = user_data.get("id")
+
+    try:
+        user_uuid = UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de usuario invalido")
+
+    profile = await get_driver_profile(session, user_uuid)
+
+    if not profile:
+        raise HTTPException(
+            status_code=404,
+            detail="Perfil de driver no encontrado"
+        )
+
+    return profile
 
 
 # =============================================================================

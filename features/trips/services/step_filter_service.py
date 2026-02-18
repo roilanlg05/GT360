@@ -249,6 +249,11 @@ class StepFilterService:
 
             trip.filtered_at = now
 
+            # Build filter_order string for frontend display
+            trip.filter_order = await self._build_filter_order_string(
+                trip, location_id, airline, pick_up_date
+            )
+
             self.session.add(trip)
 
         # Calculate independent trip count (trips newly affected by THIS filter)
@@ -395,6 +400,12 @@ class StepFilterService:
                     trip.expand_applied = True
 
                 trip.filtered_at = now
+
+                # Update filter_order for frontend display
+                trip.filter_order = await self._build_filter_order_string(
+                    trip, location_id, airline, pick_up_date
+                )
+
                 self.session.add(trip)
 
             total_modified += len(self.changes)
@@ -622,8 +633,10 @@ class StepFilterService:
                     processed_trips.add(trip.id)
                     continue
 
-                # Use original if exists, otherwise current
-                base_time = trip.original_pick_up_time or trip.pick_up_time
+                # ✅ FIX CASCADA: Usar tiempo efectivo (actual) para cascada verdadera
+                # Esto permite que REDUCE funcione en cascada con EXPAND/COMBINE
+                # Consistente con _get_effective_time usado por Combine y Expand
+                base_time = self._get_effective_time(trip)
 
                 # Check if time is in this specific window
                 if not self._is_time_in_window(base_time, window):
@@ -844,6 +857,7 @@ class StepFilterService:
                 # Identify chains within this location group
                 chains = self._identify_expand_chains(
                     group_trips,
+                    min_gap=window.min_gap,
                     max_gap=window.max_gap,
                     max_shift=window.max_shift
                 )
@@ -868,7 +882,28 @@ class StepFilterService:
                         )
                         continue
 
-                    # Apply shifts from pattern
+                    # ✅ NEIGHBOR VALIDATION: Validar que no creamos gaps problemáticos con trips externos
+                    chain_valid, neighbors_to_move = self._validate_and_adjust_neighbors(
+                        chain, pattern, group_trips, window
+                    )
+
+                    if not chain_valid:
+                        # OPCIÓN B: Cancelar expansión de esta cadena
+                        self._record_exclusion(
+                            f"expand_chain({len(chain)} trips)",
+                            [t.id for t in chain],
+                            "Neighbor collision unresolvable - would create gap in problem range",
+                            0,
+                            0,
+                            trips=chain,
+                        )
+                        logger.warning(
+                            f"[NEIGHBOR_COLLISION] Excluded chain of {len(chain)} trips at {pickup_loc} "
+                            f"(cannot resolve neighbor collision)"
+                        )
+                        continue
+
+                    # Apply shifts from pattern to chain
                     for i, trip in enumerate(chain):
                         shift = pattern[i]
                         if shift != 0:
@@ -876,31 +911,48 @@ class StepFilterService:
                             new_time = self._add_minutes(old_time, shift)
                             self._record_change(trip, old_time, new_time, "expand")
 
+                    # Apply shifts to external neighbors (OPCIÓN A succeeded)
+                    for neighbor_trip, neighbor_shift in neighbors_to_move:
+                        old_time = self._get_effective_time(neighbor_trip)
+                        new_time = self._add_minutes(old_time, neighbor_shift)
+                        self._record_change(neighbor_trip, old_time, new_time, "expand")
+
+                        # CRITICAL: Mark neighbor as modified by expand
+                        # This prevents other chains from trying to move it (trip between two chains case)
+                        self.modified_by_combine_expand.add(neighbor_trip.id)
+
                     logger.debug(
                         f"[EXPAND_CHAIN] Applied pattern {pattern} to chain of {len(chain)} trips "
                         f"at {pickup_loc}→{dropoff_loc}"
+                        + (f" (adjusted {len(neighbors_to_move)} neighbors)" if neighbors_to_move else "")
                     )
 
     def _identify_expand_chains(
         self,
         trips: list[Trip],
+        min_gap: int,
         max_gap: int,
         max_shift: int
     ) -> list[list[Trip]]:
         """
-        Identifica cadenas de trips con gaps pequeños.
+        Identifica cadenas de trips con gaps EN EL RANGO [min_gap, max_gap].
 
-        Umbral de cadena = max_gap
+        Solo agrupa trips consecutivos si su gap está dentro del rango configurado.
+        Trips con gap < min_gap: ya están muy juntos, NO expandir
+        Trips con gap > max_gap: ya están suficientemente separados, NO expandir
 
-        Si gap entre trips consecutivos <= umbral, están en la misma cadena.
-        Si gap > umbral, son cadenas diferentes.
+        Args:
+            trips: Lista de trips ordenados por pickup time
+            min_gap: Gap mínimo para considerar trips en la misma cadena
+            max_gap: Gap máximo para considerar trips en la misma cadena
+            max_shift: Máximo desplazamiento permitido por trip
 
-        Returns: Lista de cadenas (cada cadena es una lista de trips).
+        Returns:
+            Lista de cadenas (cada cadena es una lista de trips con gaps en rango)
         """
         if not trips:
             return []
 
-        threshold = max_gap
         chains = []
         current_chain = [trips[0]]
 
@@ -909,10 +961,12 @@ class StepFilterService:
             curr_time = self._get_effective_time(trips[i])
             gap = self._minutes_between(prev_time, curr_time)
 
-            if gap <= threshold:  # Gap pequeño → misma cadena (consistente con Combine)
+            # ✅ FIX: Verificar que gap esté EN EL RANGO [min_gap, max_gap]
+            if min_gap <= gap <= max_gap:
+                # Gap dentro del rango → misma cadena
                 current_chain.append(trips[i])
             else:
-                # Gap grande → nueva cadena
+                # Gap fuera del rango → nueva cadena
                 if len(current_chain) >= 2:
                     chains.append(current_chain)
                 current_chain = [trips[i]]
@@ -956,6 +1010,200 @@ class StepFilterService:
             return [-max_shift, -half_shift, -quarter_shift, +quarter_shift, +half_shift, +max_shift]
 
         return None
+
+    def _calculate_neighbor_shift(
+        self,
+        time_a: time,
+        time_b: time,
+        max_gap: int,
+        max_shift: int,
+        direction: str
+    ) -> Optional[int]:
+        """
+        Calcula el shift necesario para mover un neighbor y evitar gap problemático.
+
+        Intenta progresivamente: mitad del max_shift, luego max_shift completo.
+
+        Args:
+            time_a: Tiempo del primer trip (ya ajustado por expand)
+            time_b: Tiempo del segundo trip (neighbor a mover)
+            max_gap: Gap máximo del rango problemático
+            max_shift: Máximo desplazamiento permitido
+            direction: "backward" (neighbor antes de cadena) o "forward" (neighbor después)
+
+        Returns:
+            Shift a aplicar al neighbor (negativo o positivo), o None si no se resuelve
+        """
+        # Intentos progresivos: mitad primero, luego completo
+        attempts = [max_shift // 2, max_shift]
+
+        for shift_magnitude in attempts:
+            # Calcular shift con dirección correcta
+            if direction == "backward":
+                # Neighbor está ANTES, moverlo hacia atrás (restar minutos)
+                shift = -shift_magnitude
+                neighbor_time = time_a
+            else:
+                # Neighbor está DESPUÉS, moverlo hacia adelante (sumar minutos)
+                shift = shift_magnitude
+                neighbor_time = time_b
+
+            # Calcular nuevo tiempo del neighbor
+            try:
+                new_neighbor_time = self._add_minutes(neighbor_time, shift)
+            except ValueError:
+                # Tiempo fuera de rango del día
+                logger.debug(
+                    f"[NEIGHBOR_SHIFT] Attempt {shift}min: out of day range ❌"
+                )
+                continue
+
+            # Calcular nuevo gap
+            if direction == "backward":
+                new_gap = self._minutes_between(new_neighbor_time, time_b)
+            else:
+                new_gap = self._minutes_between(time_a, new_neighbor_time)
+
+            # ✅ Si el gap queda FUERA del rango problemático, funciona
+            if new_gap > max_gap:
+                logger.debug(
+                    f"[NEIGHBOR_SHIFT] Attempt {shift}min: gap={new_gap}min > {max_gap} ✅"
+                )
+                return shift
+
+            logger.debug(
+                f"[NEIGHBOR_SHIFT] Attempt {shift}min: gap={new_gap}min still in range ❌"
+            )
+
+        # No se pudo resolver con max_shift
+        return None
+
+    def _validate_and_adjust_neighbors(
+        self,
+        chain: list[Trip],
+        pattern: list[int],
+        all_trips: list[Trip],
+        window: TimeWindow
+    ) -> tuple[bool, list[tuple[Trip, int]]]:
+        """
+        Valida que expandir la cadena no cree gaps problemáticos con neighbors externos.
+
+        Si detecta colisión, intenta mover el neighbor externo progresivamente.
+
+        Args:
+            chain: Cadena de trips a expandir
+            pattern: Patrón de shifts
+            all_trips: Todos los trips del grupo (ordenados por tiempo)
+            window: Configuración de ventana
+
+        Returns:
+            (chain_valid, neighbors_to_move)
+        """
+        neighbors_to_move = []
+
+        # Encontrar índices de la cadena en all_trips
+        first_chain_idx = all_trips.index(chain[0])
+        last_chain_idx = all_trips.index(chain[-1])
+
+        # VALIDAR BORDE IZQUIERDO
+        if first_chain_idx > 0 and pattern[0] != 0:
+            neighbor_prev = all_trips[first_chain_idx - 1]
+
+            # VALIDACIONES DE BLOQUEO
+            if neighbor_prev.combine_applied:
+                logger.warning(
+                    "[NEIGHBOR_COLLISION] Cannot move prev neighbor (has combine_applied). "
+                    "Canceling chain expansion."
+                )
+                return False, []
+
+            if neighbor_prev.expand_applied:
+                logger.warning(
+                    "[NEIGHBOR_COLLISION] Cannot move prev neighbor (already expanded). "
+                    "Canceling chain expansion."
+                )
+                return False, []
+
+            # Calcular gap que quedaría
+            neighbor_time = self._get_effective_time(neighbor_prev)
+            first_trip_old = self._get_effective_time(chain[0])
+            first_trip_new = self._add_minutes(first_trip_old, pattern[0])
+
+            gap_after_expand = self._minutes_between(neighbor_time, first_trip_new)
+
+            # Si gap cae en rango problemático, intentar mover neighbor
+            if window.min_gap <= gap_after_expand <= window.max_gap:
+                neighbor_shift = self._calculate_neighbor_shift(
+                    neighbor_time,
+                    first_trip_new,
+                    window.max_gap,
+                    window.max_shift,
+                    direction="backward"
+                )
+
+                if neighbor_shift is None:
+                    logger.warning(
+                        f"[NEIGHBOR_COLLISION] Cannot resolve collision with prev neighbor "
+                        f"(tried up to max_shift={window.max_shift}). Canceling chain expansion."
+                    )
+                    return False, []
+
+                neighbors_to_move.append((neighbor_prev, neighbor_shift))
+                logger.info(
+                    f"[NEIGHBOR_ADJUST] Moving prev neighbor by {neighbor_shift}min "
+                    f"to avoid collision (gap will be > {window.max_gap})"
+                )
+
+        # VALIDAR BORDE DERECHO
+        if last_chain_idx < len(all_trips) - 1 and pattern[-1] != 0:
+            neighbor_next = all_trips[last_chain_idx + 1]
+
+            # VALIDACIONES DE BLOQUEO
+            if neighbor_next.combine_applied:
+                logger.warning(
+                    "[NEIGHBOR_COLLISION] Cannot move next neighbor (has combine_applied). "
+                    "Canceling chain expansion."
+                )
+                return False, []
+
+            if neighbor_next.expand_applied:
+                logger.warning(
+                    "[NEIGHBOR_COLLISION] Cannot move next neighbor (already expanded). "
+                    "Canceling chain expansion."
+                )
+                return False, []
+
+            # Calcular gap que quedaría
+            neighbor_time = self._get_effective_time(neighbor_next)
+            last_trip_old = self._get_effective_time(chain[-1])
+            last_trip_new = self._add_minutes(last_trip_old, pattern[-1])
+
+            gap_after_expand = self._minutes_between(last_trip_new, neighbor_time)
+
+            # Si gap cae en rango problemático, intentar mover neighbor
+            if window.min_gap <= gap_after_expand <= window.max_gap:
+                neighbor_shift = self._calculate_neighbor_shift(
+                    last_trip_new,
+                    neighbor_time,
+                    window.max_gap,
+                    window.max_shift,
+                    direction="forward"
+                )
+
+                if neighbor_shift is None:
+                    logger.warning(
+                        f"[NEIGHBOR_COLLISION] Cannot resolve collision with next neighbor "
+                        f"(tried up to max_shift={window.max_shift}). Canceling chain expansion."
+                    )
+                    return False, []
+
+                neighbors_to_move.append((neighbor_next, neighbor_shift))
+                logger.info(
+                    f"[NEIGHBOR_ADJUST] Moving next neighbor by {neighbor_shift}min "
+                    f"to avoid collision (gap will be > {window.max_gap})"
+                )
+
+        return True, neighbors_to_move
 
     # =========================================================================
     # Internal Revert Logic
@@ -1009,6 +1257,7 @@ class StepFilterService:
                 trip.expand_applied = False
                 trip.current_step_id = None
                 trip.filtered_at = None
+                trip.filter_order = None  # Reset filter order
                 self.session.add(trip)
 
         # Get remaining active steps (excluding the one being reverted)
@@ -1065,6 +1314,11 @@ class StepFilterService:
                             trip.combine_applied = True
                         elif config.filter_type == "expand":
                             trip.expand_applied = True
+
+                        # Update filter_order for this trip
+                        trip.filter_order = await self._build_filter_order_string(
+                            trip, location_id, airline, pick_up_date
+                        )
 
                         self.session.add(trip)
                         trips_recalculated += 1
@@ -1197,6 +1451,63 @@ class StepFilterService:
             step_order = result[0] if hasattr(result, '__getitem__') else result
             return step_order + 1
         return 1
+
+    async def _build_filter_order_string(
+        self,
+        trip: Trip,
+        location_id: UUID,
+        airline: str,
+        pick_up_date: date,
+    ) -> Optional[str]:
+        """
+        Construye string con el orden cronológico de filtros aplicados (sin duplicados).
+
+        Ejemplo: "expand,reduce" significa expand se aplicó primero, reduce después.
+
+        Maneja correctamente casos con múltiples steps del mismo tipo activos
+        (solo incluye cada tipo UNA vez, usando el step_order más bajo).
+
+        Args:
+            trip: Trip con flags actualizados
+            location_id, airline, pick_up_date: Para buscar steps activos
+
+        Returns:
+            String como "expand,reduce" o "reduce,combine,expand" o None si no hay filtros
+        """
+        # Obtener steps activos para este día
+        steps_query = (
+            Select(FilterStep)
+            .Where(FilterStep.location_id == location_id)
+            .Where(FilterStep.airline == airline)
+            .Where(FilterStep.pick_up_date == pick_up_date)
+            .Where(FilterStep.is_active == True)
+            .OrderBy(FilterStep.step_order.Asc())
+        )
+        active_steps = await self.session.exec(steps_query).all()
+
+        if not active_steps:
+            return None
+
+        # Construir mapa: filter_type -> step_order más bajo (sin duplicados)
+        filter_step_map = {}
+        for step in active_steps:
+            # Solo agregar si el trip tiene ese filtro Y no lo hemos agregado antes
+            if step.filter_type == "reduce" and trip.reduce_applied:
+                if "reduce" not in filter_step_map:
+                    filter_step_map["reduce"] = step.step_order
+            elif step.filter_type == "combine" and trip.combine_applied:
+                if "combine" not in filter_step_map:
+                    filter_step_map["combine"] = step.step_order
+            elif step.filter_type == "expand" and trip.expand_applied:
+                if "expand" not in filter_step_map:
+                    filter_step_map["expand"] = step.step_order
+
+        if not filter_step_map:
+            return None
+
+        # Ordenar por step_order y crear string (sin duplicados)
+        filters_ordered = sorted(filter_step_map.items(), key=lambda x: x[1])
+        return ",".join(f[0] for f in filters_ordered)
 
     def _filter_by_options(
         self,

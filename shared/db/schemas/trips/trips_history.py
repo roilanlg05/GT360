@@ -72,7 +72,19 @@ class TripHistory(PSQLModel):
 
     dropped_off_at: timestamptz = Column(
         default=None,
-        nullable=True, 
+        nullable=True,
+        index=True
+    )
+
+    arrived_pickup_at: timestamptz = Column(
+        default=None,
+        nullable=True,
+        index=True
+    )
+
+    arrived_dropoff_at: timestamptz = Column(
+        default=None,
+        nullable=True,
         index=True
     )
 
@@ -125,6 +137,12 @@ class TripHistory(PSQLModel):
         on_delete="SET NULL",
         nullable=True,
         index=True
+    )
+
+    # Chronological order of filters applied (e.g., "expand,reduce")
+    filter_order: str = Column(
+        default=None,
+        nullable=True
     )
 
     status: str = Column(

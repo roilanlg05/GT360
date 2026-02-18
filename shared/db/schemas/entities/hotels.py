@@ -27,6 +27,8 @@ class Hotel(PSQLModel):
 
     name: str = Column(max_len=250, nullable=False)
 
+    short_name: str = Column(max_len=250, nullable=True)
+
     location_id: uuid = Column(foreign_key='entities.locations.id', nullable=False, on_delete='CASCADE')
 
     address: str = Column(max_len=250, nullable=True)

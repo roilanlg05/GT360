@@ -30,7 +30,9 @@ redis>=5.0.0
 openpyxl
 pandas
 xlrd
+pymupdf
 orjson 
 
 timezonefinder
 sqlalchemy
+pytz==2024.1
