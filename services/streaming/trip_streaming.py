@@ -194,49 +194,92 @@ async def main():
     limits = httpx.Limits(max_connections=10, max_keepalive_connections=10)
     timeout = httpx.Timeout(30.0, connect=5.0)
 
+    async def run_subscriber_forever() -> None:
+        """Keep the DB subscriber alive across Postgres restarts.
+
+        When Postgres restarts, LISTEN/NOTIFY connections are dropped.
+        This loop recreates the Subscribe listener (and its connection pool)
+        with exponential backoff.
+        """
+        attempt = 0
+        while True:
+            attempt += 1
+            # Exponential backoff with jitter (cap at 30s)
+            delay = min(2 ** (attempt - 1), 30) + random.random()
+
+            async_engine = create_async_engine(
+                username=settings.POSTGRES_USER,
+                password=settings.POSTGRES_PASSWORD,
+                port=settings.POSTGRES_PORT,
+                host=settings.POSTGRES_SERVER,
+                database=settings.POSTGRES_DB,
+                debug=True,
+                models_path="__main__",
+                pool_close_timeout=10.0,
+            )
+
+            async def on_trip_change(payload):
+                ev = build_event(payload)
+                if ev:
+                    await event_q.put(ev)
+
+            sub = Subscribe.engine(async_engine, use_engine_pool=False)
+
+            try:
+                print(f"[SUBSCRIBER_LOOP] starting (attempt={attempt})", flush=True)
+                await sub(Trip).OnEvent("change").Exec(on_trip_change).StartAsync()
+
+                # If StartAsync returns, it's typically a graceful shutdown.
+                print("[SUBSCRIBER_LOOP] StartAsync returned; exiting subscriber loop", flush=True)
+                return
+
+            except asyncio.CancelledError:
+                raise
+
+            except Exception as e:
+                print(
+                    f"[SUBSCRIBER_LOOP] error={repr(e)}; reconnecting in {delay:.2f}s",
+                    flush=True,
+                )
+
+            finally:
+                try:
+                    await sub.StopAsync()
+                except Exception:
+                    pass
+
+                try:
+                    await async_engine.dispose_async()
+                except Exception:
+                    pass
+
+            await asyncio.sleep(delay)
+
     async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
         composer_task = asyncio.create_task(composer(event_q, batch_q))
         sender_tasks = [asyncio.create_task(sender(batch_q, client)) for _ in range(3)]
         hb_task = asyncio.create_task(heartbeat(event_q, batch_q))
 
-        async_engine = create_async_engine(
-            username=settings.POSTGRES_USER,
-            password=settings.POSTGRES_PASSWORD,
-            port=settings.POSTGRES_PORT,
-            host=settings.POSTGRES_SERVER,
-            database=settings.POSTGRES_DB,
-            debug=True,
-            models_path="__main__",
-            pool_close_timeout=10.0,  # Timeout para cierre del pool
-        )
-
-        async def on_trip_change(payload):
-            ev = build_event(payload)
-            if ev:
-                await event_q.put(ev)
-
-        sub = Subscribe.engine(async_engine, use_engine_pool=False)
+        subscriber_task = asyncio.create_task(run_subscriber_forever())
 
         try:
-            await sub(Trip).OnEvent("change").Exec(on_trip_change).StartAsync()
+            await subscriber_task
         finally:
-            # 1. Detener suscripción
+            # Stop subscriber first
+            subscriber_task.cancel()
+            await asyncio.gather(subscriber_task, return_exceptions=True)
+
+            # Drain queues before stopping workers (best-effort)
             try:
-                await sub.StopAsync()
+                await asyncio.wait_for(event_q.join(), timeout=10.0)
             except Exception:
                 pass
-            
-            # 2. Cerrar el engine (usa el timeout configurado)
             try:
-                await async_engine.dispose_async()
+                await asyncio.wait_for(batch_q.join(), timeout=10.0)
             except Exception:
                 pass
 
-            # 3. Drenar colas antes de salir
-            await event_q.join()
-            await batch_q.join()
-
-            # 4. Cancelar todas las tasks
+            # Cancel all tasks
             all_tasks = [composer_task, *sender_tasks, hb_task]
             for t in all_tasks:
                 t.cancel()

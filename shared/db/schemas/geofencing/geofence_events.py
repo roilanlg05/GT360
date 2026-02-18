@@ -26,11 +26,11 @@ class TargetType:
     "geofence_events",
     schema="geofencing",
     indexes=[
-        Index("idx_geofence_events_actor", "actor_type", "actor_id"),
-        Index("idx_geofence_events_target", "target_type", "target_id"),
-        Index("idx_geofence_events_location", "location_id"),
-        Index("idx_geofence_events_org", "organization_id"),
-        Index("idx_geofence_events_created", "created_at"),
+        Index("actor_type", "actor_id", name="idx_geofence_events_actor"),
+        Index("target_type", "target_id", name="idx_geofence_events_target"),
+        Index("location_id", name="idx_geofence_events_location"),
+        Index("organization_id", name="idx_geofence_events_org"),
+        Index("created_at", name="idx_geofence_events_created"),
     ]
 )
 class GeofenceEvent(PSQLModel):

@@ -1,5 +1,5 @@
 from fastapi import HTTPException, Request
-from shared.db.schemas import User, Manager, Crew, Token
+from shared.db.schemas import User, Manager, Driver, Token
 from psqlmodel import Select
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
@@ -186,7 +186,7 @@ async def get_user_by_email(session, email: str) -> User:
     user = await session.exec(
         Select(User)
         .Include(Manager)
-        .Include(Crew)
+        .Include(Driver)
         .Where(User.email == email)
     ).first()
 

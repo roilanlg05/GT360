@@ -2,10 +2,10 @@
 def get_password_reset_email_template(reset_url: str) -> str:
     """
     Genera el HTML para el email de recuperación de contraseña
-    
+
     Args:
         reset_url: URL con el token para resetear la contraseña
-        
+
     Returns:
         str: HTML del email
     """
@@ -15,195 +15,139 @@ def get_password_reset_email_template(reset_url: str) -> str:
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Reset Your Password</title>
+        <title>Reset Your Password - GT 360</title>
         <style>
             body {{
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                background-color: #f4f4f4;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+                background-color: #f5f5f5;
                 margin: 0;
                 padding: 0;
+                -webkit-font-smoothing: antialiased;
             }}
             .email-container {{
-                max-width: 600px;
+                max-width: 520px;
                 margin: 40px auto;
                 background-color: #ffffff;
-                border-radius: 8px;
+                border-radius: 4px;
                 overflow: hidden;
-                box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
             }}
             .header {{
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                padding: 40px 20px;
+                background-color: #1a365d;
+                padding: 32px 24px;
                 text-align: center;
             }}
             .header h1 {{
                 color: #ffffff;
                 margin: 0;
-                font-size: 28px;
+                font-size: 24px;
                 font-weight: 600;
+                letter-spacing: 1px;
             }}
             .content {{
-                padding: 40px 30px;
+                padding: 40px 32px;
                 color: #333333;
                 line-height: 1.6;
             }}
-            .content h2 {{
-                color: #667eea;
-                font-size: 24px;
-                margin-top: 0;
-                margin-bottom: 20px;
-            }}
             .content p {{
-                margin: 15px 0;
-                font-size: 16px;
+                margin: 0 0 16px 0;
+                font-size: 15px;
+                color: #4a4a4a;
             }}
             .button-container {{
                 text-align: center;
-                margin: 35px 0;
+                margin: 32px 0;
             }}
             .reset-button {{
                 display: inline-block;
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                background-color: #1a365d;
                 color: #ffffff;
                 text-decoration: none;
-                padding: 15px 40px;
-                border-radius: 6px;
-                font-size: 16px;
-                font-weight: 600;
-                box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
-                transition: transform 0.2s ease;
-            }}
-            .reset-button:hover {{
-                transform: translateY(-2px);
-                box-shadow: 0 6px 20px rgba(102, 126, 234, 0.5);
-            }}
-            .security-notice {{
-                background-color: #fff3cd;
-                border-left: 4px solid #ffc107;
-                padding: 15px;
-                margin: 25px 0;
+                padding: 14px 32px;
                 border-radius: 4px;
+                font-size: 15px;
+                font-weight: 500;
             }}
-            .security-notice p {{
-                margin: 5px 0;
-                font-size: 14px;
-                color: #856404;
+            .divider {{
+                height: 1px;
+                background-color: #e5e5e5;
+                margin: 24px 0;
             }}
             .alternative-link {{
-                background-color: #f8f9fa;
-                padding: 20px;
-                border-radius: 6px;
-                margin: 25px 0;
-                word-break: break-all;
-            }}
-            .alternative-link p {{
-                margin: 5px 0;
                 font-size: 13px;
-                color: #6c757d;
+                color: #666666;
+                word-break: break-all;
             }}
             .alternative-link a {{
-                color: #667eea;
+                color: #1a365d;
                 text-decoration: none;
-                word-break: break-all;
+            }}
+            .note {{
+                font-size: 13px;
+                color: #888888;
+                margin-top: 24px;
+            }}
+            .security-note {{
+                background-color: #f8f8f8;
+                border-left: 3px solid #1a365d;
+                padding: 12px 16px;
+                margin: 24px 0;
+                font-size: 13px;
+                color: #666666;
             }}
             .footer {{
-                background-color: #f8f9fa;
-                padding: 30px;
+                background-color: #fafafa;
+                padding: 24px 32px;
                 text-align: center;
-                border-top: 1px solid #e9ecef;
+                border-top: 1px solid #e5e5e5;
             }}
             .footer p {{
-                margin: 10px 0;
-                font-size: 14px;
-                color: #6c757d;
-            }}
-            .footer a {{
-                color: #667eea;
-                text-decoration: none;
-            }}
-            .expiration {{
-                color: #dc3545;
-                font-weight: 600;
+                margin: 0;
+                font-size: 12px;
+                color: #999999;
             }}
             @media only screen and (max-width: 600px) {{
                 .email-container {{
-                    margin: 20px 10px;
+                    margin: 0;
+                    border-radius: 0;
                 }}
                 .content {{
-                    padding: 30px 20px;
-                }}
-                .reset-button {{
-                    padding: 12px 30px;
-                    font-size: 14px;
+                    padding: 32px 24px;
                 }}
             }}
         </style>
     </head>
     <body>
         <div class="email-container">
-            <!-- Header -->
             <div class="header">
-                <h1>🔐 Api360</h1>
+                <h1>GT 360</h1>
             </div>
 
-            <!-- Content -->
             <div class="content">
-                <h2>Reset Your Password</h2>
-                <p>Hello,</p>
-                <p>
-                    We received a request to reset your password for your Api360 account. 
-                    If you made this request, click the button below to create a new password:
-                </p>
+                <p>We received a request to reset your password.</p>
+                <p>Click the button below to create a new password:</p>
 
-                <!-- Reset Button -->
                 <div class="button-container">
-                    <a href="{reset_url}" class="reset-button">Reset My Password</a>
+                    <a href="{reset_url}" class="reset-button">Reset Password</a>
                 </div>
 
-                <!-- Security Notice -->
-                <div class="security-notice">
-                    <p><strong>⚠️ Security Notice:</strong></p>
-                    <p>
-                        This link will <span class="expiration">expire in 30 minutes</span> for security reasons. 
-                        After using this link once, it will become invalid.
-                    </p>
+                <div class="security-note">
+                    This link expires in 30 minutes and can only be used once.
                 </div>
 
-                <!-- Alternative Link -->
-                <div class="alternative-link">
-                    <p><strong>Button not working?</strong> Copy and paste this link into your browser:</p>
-                    <p><a href="{reset_url}">{reset_url}</a></p>
-                </div>
+                <div class="divider"></div>
 
-                <p>
-                    If you didn't request a password reset, please ignore this email. 
-                    Your password will remain unchanged, and your account is secure.
+                <p class="alternative-link">
+                    If the button doesn't work, copy and paste this link into your browser:<br>
+                    <a href="{reset_url}">{reset_url}</a>
                 </p>
 
-                <p>
-                    If you're concerned about your account's security, please contact our support team immediately.
-                </p>
-
-                <p style="margin-top: 30px;">
-                    Best regards,<br>
-                    <strong>The Api360 Team</strong>
+                <p class="note">
+                    If you didn't request a password reset, you can safely ignore this email. Your password will remain unchanged.
                 </p>
             </div>
 
-            <!-- Footer -->
             <div class="footer">
-                <p>
-                    This is an automated message from Api360.<br>
-                    Please do not reply to this email.
-                </p>
-                <p>
-                    Need help? <a href="https://www.optionstriker.com/support">Contact Support</a>
-                </p>
-                <p style="margin-top: 20px; font-size: 12px; color: #999;">
-                    © 2025 Api360. All rights reserved.<br>
-                    <a href="https://www.optionstriker.com/privacy">Privacy Policy</a> | 
-                    <a href="https://www.optionstriker.com/terms">Terms of Service</a>
-                </p>
+                <p>GT 360 - Ground Transportation Management</p>
             </div>
         </div>
     </body>

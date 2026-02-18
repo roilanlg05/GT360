@@ -21,11 +21,11 @@
 ## 1. Resumen Ejecutivo
 
 ### Objetivo
-Permitir al frontend mostrar un **Timeline de trips** en el Dashboard Home, agrupando los viajes por día según el timezone de la ubicación (aeropuerto) y distinguiendo entre **inbound** (llegadas) y **outbound** (salidas).
+Permitir al App developer mostrar un **Timeline de trips** en la pestaña trips , agrupando los viajes por día según el timezone de la ubicación (aeropuerto) y distinguiendo entre **inbound** (llegadas) y **outbound** (salidas).
 
 ### Cambios Realizados
 - El snapshot de WebSocket ahora incluye `location_info` con el timezone de la ubicación
-- El frontend puede usar esta información para ordenar y agrupar trips correctamente
+- El app developer  puede usar esta información para ordenar y agrupar trips correctamente
 
 ---
 

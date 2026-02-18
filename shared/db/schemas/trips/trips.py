@@ -95,6 +95,18 @@ class Trip(PSQLModel):
         index=True
     )
 
+    arrived_pickup_at: timestamptz = Column(
+        default=None,
+        nullable=True,
+        index=True
+    )
+
+    arrived_dropoff_at: timestamptz = Column(
+        default=None,
+        nullable=True,
+        index=True
+    )
+
     created_at: timestamptz = Column(
         default=now,
         nullable=False,
@@ -148,6 +160,13 @@ class Trip(PSQLModel):
         on_delete="SET NULL",
         nullable=True,
         index=True
+    )
+
+    # Chronological order of filters applied (e.g., "expand,reduce" or "reduce,combine,expand")
+    # Used by frontend to display filter icons in the correct order
+    filter_order: str = Column(
+        default=None,
+        nullable=True
     )
 
     status: str = Column(

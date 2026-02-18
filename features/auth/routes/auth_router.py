@@ -1,8 +1,8 @@
-from fastapi import APIRouter, HTTPException, Depends, Response, Cookie, Request
+from fastapi import APIRouter, HTTPException, Depends, Response, Cookie, Request, Body
 from fastapi.responses import JSONResponse
 from psqlmodel import Select, AsyncSession
 from features.auth.models.user_model import CreateCrewMember, UserData, CreateManager, CreateDriver
-from features.auth.models.auth_model import EmailPasswordRequestForm, PasswordUpdate, NewPassword
+from features.auth.models.auth_model import EmailPasswordRequestForm, PasswordUpdate, NewPassword, RefreshTokenRequest
 from shared.db.schemas import User, Crew, Manager, Driver, Organization
 from shared.db.db_config import get_db
 from shared.settings import settings
@@ -22,7 +22,7 @@ from ..utils.validators import validators
 
 router = APIRouter(prefix="/v1/auth", tags=["Auth"])
 
-@router.post("/register/crew-member", status_code=201)
+'''@router.post("/register/crew-member", status_code=201)
 async def register_crew_member(
     user_data: CreateCrewMember, 
     session: AsyncSession = Depends(get_db)
@@ -74,7 +74,7 @@ async def register_crew_member(
         return {"message": "User registred succefull. Check  your email for  confirmation!"}
     except Exception as e:
         await session.rollback()
-        raise HTTPException(status_code=400, detail=f"Registration failed: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Registration failed: {str(e)}")'''
 
 @router.post("/register/manager", status_code=201)
 async def register_manager(
@@ -189,6 +189,7 @@ async def register_driver(
             id=user.id,
             organization_id=user_data.organization_id,
             location_id=user_data.location_id,
+            pay_frequency=org.pay_frequency or "weekly",
         )
         session.add(driver)
 
@@ -261,7 +262,10 @@ async def sign_in(
     metadata = {
         "email": user.email,
         "phone": user.phone,
-        "role": user.role
+        "role": user.role,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "profile_pic": user.profile_pic
     }
 
 
@@ -270,10 +274,6 @@ async def sign_in(
             org_row = await session.exec(Select(Manager.organization_id).Where(Manager.id == user.id)).first()
             if org_row and org_row.organization_id:
                 metadata["organization_id"] = str(org_row.organization_id)
-        case "crew":
-            airline_row = await session.exec(Select(Crew.airline).Where(Crew.id == user.id)).first()
-            if airline_row and airline_row.airline:
-                metadata["airline"] = airline_row.airline
         case "driver":
             driver_row = await session.exec(Select(Driver.organization_id, Driver.location_id).Where(Driver.id == user.id)).first()
             if driver_row and driver_row.organization_id:
@@ -335,10 +335,16 @@ async def sign_out(
 async def refresh_token(
     response: Response,
     session: AsyncSession = Depends(get_db),
-    refresh_token: str | None = Cookie(default=None, alias="refresh_token")
+    refresh_token_cookie: str | None = Cookie(default=None, alias="refresh_token"),
+    refresh_body: RefreshTokenRequest | None = Body(default=None),
     ) -> dict:
 
-    if not refresh_token:                          
+    refresh_token = None
+    if refresh_body:
+        refresh_token = refresh_body.refresh_token or refresh_body.refresh or refresh_body.token
+    refresh_token = refresh_token or refresh_token_cookie
+
+    if not refresh_token:
         raise HTTPException(status_code=401, detail="Missing refresh token")
 
     refresh = await validate_refresh(session, refresh_token)
@@ -353,7 +359,10 @@ async def refresh_token(
     metadata = {
         "email": user.email,
         "phone": user.phone,
-        "role": user.role
+        "role": user.role,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "profile_pic": user.profile_pic
     }
 
     # Agregar campos específicos del rol
@@ -362,10 +371,6 @@ async def refresh_token(
             org_row = await session.exec(Select(Manager.organization_id).Where(Manager.id == user.id)).first()
             if org_row and org_row.organization_id:
                 metadata["organization_id"] = str(org_row.organization_id)
-        case "crew":
-            airline_row = await session.exec(Select(Crew.airline).Where(Crew.id == user.id)).first()
-            if airline_row and airline_row.airline:
-                metadata["airline"] = airline_row.airline
         case "driver":
             driver_row = await session.exec(Select(Driver.organization_id, Driver.location_id).Where(Driver.id == user.id)).first()
             if driver_row and driver_row.organization_id:

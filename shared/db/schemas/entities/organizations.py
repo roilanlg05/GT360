@@ -1,5 +1,5 @@
 from psqlmodel import PSQLModel, table, Column
-from psqlmodel.orm.types import timestamptz, uuid
+from psqlmodel.orm.types import timestamptz, uuid, varchar
 from psqlmodel.utils import gen_default_uuid, now
 
 
@@ -25,6 +25,13 @@ class Organization(PSQLModel):
     address: str = Column(default=None, nullable=False)
 
     website: str | None = Column(default=None)
+
+    pay_frequency: varchar = Column(
+        max_len=20,
+        default="weekly",
+        nullable=False,
+        index=True,
+    )
 
     plan: str = Column(default="freemium", nullable=False, index=True)
 

@@ -1,48 +1,106 @@
-from fastapi import  Request, FastAPI, Response
-from fastapi.responses import JSONResponse
+import json
+from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.requests import Request
+from starlette.datastructures import State
 from shared.settings import settings
-from starlette.middleware.base import BaseHTTPMiddleware
+from shared.redis.redis_client import redis_client
+from shared.redis.redis_safe import safe_redis_call
 
 from features.auth.utils import get_token, decode_token
 
-class VerifyToken(BaseHTTPMiddleware):
-    def __init__(self, app: FastAPI) -> None:
-        super().__init__(app)
 
-    async def dispatch(self, request: Request, call_next) -> Response | JSONResponse:
-        # Skip for WebSocket - they handle auth in the endpoint
-        if request.scope.get("type") == "websocket":
-            return await call_next(request)
+class VerifyToken:
+    """
+    Pure ASGI middleware for JWT token verification.
 
-        if request.method == "OPTIONS":
-            return await call_next(request)
+    Uses ASGI directly instead of BaseHTTPMiddleware to avoid
+    issues with file uploads and streaming request bodies.
+    """
 
-        if not request.url.path.startswith(tuple(settings.PUBLIC_PATHS)):
+    ALLOWED_ORIGINS = [
+        "https://www.gt360.com",
+        "https://gt360.com",
+        "https://web.gt360.app",
+        "https://dev.gt360.app",
+        "https://charmaine-leadless-ryleigh.ngrok-free.dev"
+    ]
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        # Skip non-HTTP requests (websockets, lifespan, etc.)
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        # Always initialize state dict for HTTP requests
+        if "state" not in scope:
+            scope["state"] = {}
+
+        method = scope.get("method", "")
+        path = scope.get("path", "")
+
+        # Skip OPTIONS requests
+        if method == "OPTIONS":
+            await self.app(scope, receive, send)
+            return
+
+        # Check if path is public
+        is_public = path.startswith(tuple(settings.PUBLIC_PATHS))
+
+        if not is_public:
+            # Create a minimal request object to extract token
+            request = Request(scope)
+
             try:
                 token = get_token(request)
                 payload = decode_token(token)
+
+                # Check if token has been blacklisted (e.g. after sign-out)
+                blacklisted = await safe_redis_call(
+                    redis_client.exists,
+                    f"blacklist:{token}",
+                    context="blacklist check",
+                    default=False,
+                )
+                if blacklisted:
+                    raise ValueError("Token revoked")
             except ValueError as e:
-                # Crear respuesta 401 con headers CORS
-                response = JSONResponse(status_code=401, content={"detail":str(e)})
+                # Send 401 response with CORS headers
+                await self._send_error_response(scope, send, 401, str(e))
+                return
 
-                # Agregar headers CORS si el origin está permitido
-                origin = request.headers.get("origin")
-                allowed_origins = [
-                    "https://www.gt360.com",
-                    "https://gt360.com",
-                    "https://web.gt360.app",
-                    "https://charmaine-leadless-ryleigh.ngrok-free.dev"
-                ]
-                if origin in allowed_origins:
-                    response.headers["Access-Control-Allow-Origin"] = origin
-                    response.headers["Access-Control-Allow-Credentials"] = "true"
+            # Store user data in scope state
+            user_data = payload.get("metadata") or {}
+            user_data["id"] = payload.get("sub")
+            scope["state"]["user_data"] = user_data
 
-                return response
+        await self.app(scope, receive, send)
 
-            request.state.user_data = payload.get("metadata") or {}
-            request.state.user_data.update({"id": payload.get("sub")})
-            print(request.state.user_data)
+    async def _send_error_response(self, scope: Scope, send: Send, status: int, detail: str):
+        """Send an error response with CORS headers."""
+        headers = dict(scope.get("headers", []))
+        origin = headers.get(b"origin", b"").decode("utf-8", errors="ignore")
 
+        response_headers = [
+            (b"content-type", b"application/json"),
+        ]
 
-        response = await call_next(request)
-        return response
+        if origin in self.ALLOWED_ORIGINS:
+            response_headers.extend([
+                (b"access-control-allow-origin", origin.encode()),
+                (b"access-control-allow-credentials", b"true"),
+            ])
+
+        body = json.dumps({"detail": detail}).encode()
+
+        await send({
+            "type": "http.response.start",
+            "status": status,
+            "headers": response_headers,
+        })
+        await send({
+            "type": "http.response.body",
+            "body": body,
+        })

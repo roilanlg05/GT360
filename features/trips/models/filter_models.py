@@ -341,6 +341,7 @@ class AutoApplyResult(BaseModel):
     days_skipped: int = 0
     trips_affected: int = 0
     stack_cloned_from_preset: bool = False
+    days_with_existing_stack: int = 0  # Days where we applied existing stack to new trips
 
 
 # =============================================================================
@@ -431,14 +432,17 @@ class BulkEligibilityResult(BaseModel):
     airline: str
     date_from: str
     date_to: Optional[str]
+    filter_type: Optional[str] = None  # If provided, shows filter-specific counts
 
     # Summary
     total_days: int
     total_trips: int
     total_eligible: int
+    trips_with_filter: Optional[int] = None  # Total trips with this filter applied (across all days)
+    trips_new: Optional[int] = None  # Total trips WITHOUT this filter (available for filtering)
 
     # Per-day breakdown
-    by_date: list[dict] = Field(default_factory=list)  # [{pick_up_date, eligible, by_hotel}]
+    by_date: list[dict] = Field(default_factory=list)  # [{pick_up_date, eligible, trips_with_filter, trips_new, by_hotel}]
 
 
 class BulkRevertConfig(BaseModel):

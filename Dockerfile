@@ -7,7 +7,7 @@ WORKDIR /app
 
 # system deps for building some Python packages if needed
 RUN apt-get update \
-	&& apt-get install -y --no-install-recommends gcc build-essential \
+	&& apt-get install -y --no-install-recommends gcc build-essential cron \
 	&& rm -rf /var/lib/apt/lists/*
 
 # copy requirements and install first (layer caching)
@@ -19,17 +19,27 @@ RUN python -m pip install --upgrade pip \
 # copy app source
 COPY . /app
 
-# create a non-root user and use it
+# create upload directories for earnings system
+RUN mkdir -p /app/uploads/receipts /app/uploads/w9 \
+	&& chmod -R 755 /app/uploads
+
+# create a non-root user
 RUN useradd -m appuser && chown -R appuser /app
-USER appuser
+
+# setup cron job for auto-closing shifts
+RUN echo "*/30 * * * * cd /app && /usr/local/bin/python /app/shared/utils/auto_close_shifts_job.py >> /var/log/auto_close_shifts.log 2>&1" | crontab - \
+	&& touch /var/log/auto_close_shifts.log
+
+# Copy and set entrypoint script
+COPY docker-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 RUN python -m psqlmodel profile save 'dev' \
     --username gt360 --password Rlg*020305 \
 	-db gt360 --host postgres \
-	--models-path 'shared/db/schemas/auth/' 'shared/db/schemas/entities/' 'shared/db/schemas/trips/' --default
+	--models-path 'shared/db/schemas/auth/' 'shared/db/schemas/entities/' 'shared/db/schemas/trips/' 'shared/db/schemas/drivers/' --default
 
 EXPOSE 8000
 
-# default command to run FastAPI with uvicorn
-
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "127.0.0.1"]
+# Use entrypoint script to start cron and uvicorn
+ENTRYPOINT ["docker-entrypoint.sh"]

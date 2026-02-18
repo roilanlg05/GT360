@@ -346,6 +346,7 @@ async def get_bulk_eligibility(
     airline: str,
     date_from: str = Query(..., description="Start date in YYYY-MM-DD format"),
     date_to: Optional[str] = Query(None, description="End date in YYYY-MM-DD format (optional)"),
+    filter_type: Optional[str] = Query(None, description="Filter type to check: reduce, combine, or expand"),
     session: AsyncSession = Depends(get_db),
     _role=Depends(verify_role(["manager"]))
 ) -> BulkEligibilityResult:
@@ -358,6 +359,7 @@ async def get_bulk_eligibility(
     - **airline**: Airline code (e.g., "WN", "AA")
     - **date_from**: Start date (YYYY-MM-DD)
     - **date_to**: End date (optional, YYYY-MM-DD). If not provided, checks all future.
+    - **filter_type**: Optional filter type ("reduce", "combine", "expand"). If provided, returns trips_with_filter and trips_new counts.
 
     Useful for showing users how many trips will be affected before applying filters.
     """
@@ -369,7 +371,7 @@ async def get_bulk_eligibility(
     service = StepFilterService(session)
 
     try:
-        result = await service.get_bulk_eligibility(location_uuid, airline, date_from, date_to)
+        result = await service.get_bulk_eligibility(location_uuid, airline, date_from, date_to, filter_type)
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

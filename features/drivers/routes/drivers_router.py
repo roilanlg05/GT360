@@ -1,13 +1,88 @@
 from fastapi import APIRouter, HTTPException, Depends, Query, Request
 from psqlmodel import Select, AsyncSession
 from shared.db.db_config import get_db
-from shared.db.schemas import Driver, User, Organization
+from shared.db.schemas import Driver, User, Organization, Location, Trip as TripDB, TripStatus
 from features.auth.utils import verify_role
+from features.drivers.models.driver_models import DriverActiveUpdate, DriverDetailsUpdate, DriverResponse, DriverStatusResponse
 from typing import Optional
 from uuid import UUID
 
 
 router = APIRouter(tags=["Drivers"])
+
+@router.get("/v1/drivers/me/status", response_model=DriverStatusResponse)
+async def get_my_driver_status(
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["driver"]))
+):
+    user_data = request.state.user_data
+    user_id = user_data.get("id")
+    org_id = user_data.get("organization_id")
+
+    try:
+        driver_uuid = UUID(str(user_id))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de usuario inválido")
+
+    driver = await session.exec(
+        Select(Driver).Where(Driver.id == driver_uuid)
+    ).first()
+    if not driver:
+        raise HTTPException(status_code=404, detail="Driver no encontrado")
+
+    if org_id and driver.organization_id and str(driver.organization_id) != str(org_id):
+        raise HTTPException(status_code=403, detail="Driver no pertenece a esta organización")
+
+    return DriverStatusResponse(id=str(driver.id), is_active=driver.is_active)
+
+
+@router.patch("/v1/drivers/me/active", response_model=DriverStatusResponse)
+async def set_my_driver_active_status(
+    request: Request,
+    data: DriverActiveUpdate,
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["driver"]))
+):
+    user_data = request.state.user_data
+    user_id = user_data.get("id")
+    org_id = user_data.get("organization_id")
+
+    try:
+        driver_uuid = UUID(str(user_id))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID de usuario inválido")
+
+    driver = await session.exec(
+        Select(Driver).Where(Driver.id == driver_uuid)
+    ).first()
+    if not driver:
+        raise HTTPException(status_code=404, detail="Driver no encontrado")
+
+    if org_id and driver.organization_id and str(driver.organization_id) != str(org_id):
+        raise HTTPException(status_code=403, detail="Driver no pertenece a esta organización")
+
+    # Si el driver quiere ponerse offline, validar que no tenga trips activos
+    if not data.is_active:
+        active_trips = await session.exec(
+            Select(TripDB).Where(
+                (TripDB.assigned_driver == driver_uuid) &
+                (TripDB.status == TripStatus.EN_ROUTE)
+            )
+        ).all()
+        
+        if active_trips:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot go offline with {len(active_trips)} active trip(s). Complete all trips before going offline."
+            )
+
+    driver.is_active = data.is_active
+    session.add(driver)
+    await session.commit()
+    await session.refresh(driver)
+
+    return DriverStatusResponse(id=str(driver.id), is_active=driver.is_active)
 
 
 @router.get("/v1/organizations/{organization_id}/drivers")
@@ -64,8 +139,13 @@ async def get_drivers(
             Driver.id,
             Driver.is_active,
             Driver.pay_type,
+            Driver.pay_frequency,
+            Driver.rate,
             Driver.location_id,
             Driver.organization_id,
+            Driver.shift_start_time,
+            Driver.shift_end_time,
+            Driver.work_days,
             User.first_name,
             User.last_name,
             User.email,
@@ -116,8 +196,13 @@ async def get_drivers(
             "profile_pic": row.profile_pic,
             "is_active": row.is_active,
             "pay_type": row.pay_type,
+            "pay_frequency": row.pay_frequency,
+            "rate": float(row.rate) if row.rate is not None else None,
             "location_id": str(row.location_id) if row.location_id else None,
             "organization_id": str(row.organization_id) if row.organization_id else None,
+            "shift_start_time": row.shift_start_time.strftime("%H:%M") if row.shift_start_time else None,
+            "shift_end_time": row.shift_end_time.strftime("%H:%M") if row.shift_end_time else None,
+            "work_days": row.work_days,
             "created_at": row.created_at.isoformat() if row.created_at else None
         })
 
@@ -125,3 +210,135 @@ async def get_drivers(
         "data": drivers,
         "total": len(drivers)
     }
+
+
+@router.patch("/v1/drivers/{driver_id}", response_model=DriverResponse)
+async def update_driver_details(
+    driver_id: UUID,
+    data: DriverDetailsUpdate,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["manager", "driver"]))
+):
+    user_data = request.state.user_data
+    user_id = user_data.get("id")
+    user_role = user_data.get("role")
+    user_org_id = user_data.get("organization_id")
+
+    # Fetch driver
+    driver = await session.exec(
+        Select(Driver).Where(Driver.id == driver_id)
+    ).first()
+    if not driver:
+        raise HTTPException(status_code=404, detail="Driver not found")
+
+    update_dict = data.model_dump(exclude_unset=True)
+
+    if not update_dict:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    # Validate shift_start_time and shift_end_time must both be set or both null
+    has_start = "shift_start_time" in update_dict
+    has_end = "shift_end_time" in update_dict
+    if has_start or has_end:
+        start_val = update_dict.get("shift_start_time")
+        end_val = update_dict.get("shift_end_time")
+        # If only one is provided, check the other from the existing driver record
+        if has_start and not has_end:
+            end_val = driver.shift_end_time
+        elif has_end and not has_start:
+            start_val = driver.shift_start_time
+        # Both must be set or both null
+        if (start_val is None) != (end_val is None):
+            raise HTTPException(
+                status_code=400,
+                detail="shift_start_time and shift_end_time must both be set or both null"
+            )
+
+    # Validate work_days values
+    if "work_days" in update_dict and update_dict["work_days"] is not None:
+        valid_days = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
+        for day in update_dict["work_days"]:
+            if day.lower() not in valid_days:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid work day '{day}'. Must be one of: mon, tue, wed, thu, fri, sat, sun"
+                )
+        # Normalize to lowercase
+        update_dict["work_days"] = [d.lower() for d in update_dict["work_days"]]
+
+    # Permission checks based on role
+    if user_role == "driver":
+        # Drivers can only edit themselves
+        if str(user_id) != str(driver_id):
+            raise HTTPException(status_code=403, detail="You can only edit your own profile")
+        # Drivers can only change profile_pic_url
+        disallowed = set(update_dict.keys()) - {"profile_pic_url"}
+        if disallowed:
+            raise HTTPException(
+                status_code=403,
+                detail="Drivers can only update profile_pic_url"
+            )
+    elif user_role == "manager":
+        # Managers can only edit drivers in their organization
+        if str(driver.organization_id) != str(user_org_id):
+            raise HTTPException(
+                status_code=403,
+                detail="Driver does not belong to your organization"
+            )
+
+    # Validate location_id belongs to the driver's organization
+    if "location_id" in update_dict and update_dict["location_id"] is not None:
+        try:
+            loc_uuid = UUID(update_dict["location_id"])
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid location_id format")
+
+        location = await session.exec(
+            Select(Location).Where(
+                (Location.id == loc_uuid) &
+                (Location.organization_id == driver.organization_id)
+            )
+        ).first()
+        if not location:
+            raise HTTPException(
+                status_code=400,
+                detail="Location not found or does not belong to this organization"
+            )
+
+    # Apply updates
+    for field, value in update_dict.items():
+        if field == "location_id" and value is not None:
+            setattr(driver, field, UUID(value))
+        elif field in ("pay_type", "pay_frequency") and value is not None:
+            setattr(driver, field, value.value if hasattr(value, "value") else value)
+        else:
+            setattr(driver, field, value)
+
+    session.add(driver)
+    await session.commit()
+    await session.refresh(driver)
+
+    # Fetch user info for response
+    user = await session.exec(
+        Select(User).Where(User.id == driver.id)
+    ).first()
+
+    return DriverResponse(
+        id=str(driver.id),
+        first_name=user.first_name if user else None,
+        last_name=user.last_name if user else None,
+        email=user.email if user else "",
+        phone=user.phone if user else None,
+        profile_pic=user.profile_pic if user else None,
+        is_active=driver.is_active,
+        pay_type=driver.pay_type,
+        pay_frequency=driver.pay_frequency,
+        rate=float(driver.rate) if driver.rate is not None else None,
+        location_id=str(driver.location_id) if driver.location_id else None,
+        organization_id=str(driver.organization_id) if driver.organization_id else None,
+        shift_start_time=driver.shift_start_time.strftime("%H:%M") if driver.shift_start_time else None,
+        shift_end_time=driver.shift_end_time.strftime("%H:%M") if driver.shift_end_time else None,
+        work_days=driver.work_days,
+        created_at=user.created_at if user else None
+    )

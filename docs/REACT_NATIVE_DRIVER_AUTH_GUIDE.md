@@ -88,7 +88,10 @@ Content-Type: application/json
       "phone": "+1234567890",
       "role": "driver",
       "organization_id": "660e8400-e29b-41d4-a716-446655440000",
-      "location_id": "770e8400-e29b-41d4-a716-446655440000"
+      "location_id": "770e8400-e29b-41d4-a716-446655440000",
+      "first_name": "John",
+      "last_name": "Doe",
+      "profile_pic": "https://api.gt360.app/uploads/profiles/user-uuid/image.jpg"
     }
   }
 }
@@ -211,7 +214,10 @@ No requiere body. El refresh token se envía automáticamente en las cookies.
       "phone": "+1234567890",
       "role": "driver",
       "organization_id": "660e8400-e29b-41d4-a716-446655440000",
-      "location_id": "770e8400-e29b-41d4-a716-446655440000"
+      "location_id": "770e8400-e29b-41d4-a716-446655440000",
+      "first_name": "John",
+      "last_name": "Doe",
+      "profile_pic": "https://api.gt360.app/uploads/profiles/user-uuid/image.jpg"
     }
   }
 }

@@ -1,106 +1,111 @@
-from starlette.middleware.base import BaseHTTPMiddleware
-from fastapi import Request
-from fastapi.responses import JSONResponse
-import redis.asyncio as redis
-from shared.redis.redis_client import redis_client 
+import json
 import logging
+import redis.asyncio as redis
+from starlette.types import ASGIApp, Receive, Scope, Send
+from shared.redis.redis_client import redis_client
 
 logger = logging.getLogger(__name__)
 
-class RateLimitMiddleware(BaseHTTPMiddleware):
+
+class RateLimitMiddleware:
     """
-    Middleware de rate limiting con Redis.
+    Pure ASGI middleware for rate limiting with Redis.
+
+    Uses ASGI directly instead of BaseHTTPMiddleware to avoid
+    issues with file uploads and streaming request bodies.
     """
-    
+
     def __init__(
         self,
-        app,
-        default_limit: int = 1000,  # Aumentado de 100 a 1000 requests por hora
+        app: ASGIApp,
+        default_limit: int = 1000,
         default_window: int = 3600
     ):
-        super().__init__(app)
+        self.app = app
         self.default_limit = default_limit
         self.default_window = default_window
         self.route_limits = {}
 
-        """
-        
-            "/v1/auth/register/crew-member": (3, 60),
-            "/v1/auth/register/manager": (1000, 60),
-            "/v1/auth/sign-in": (5, 60),
-            "/v1/auth/forgot-password": (1, 60),
-            "/v1/auth/reset-password": (3, 60),
-            "/v1/auth/refresh": (10, 60),
-            "/v1/auth/verify-email": (5, 60),
-            "/v1/auth/verify-data": (3, 60),
-            "/health": (1000, 60),
-        
-        """
-    
     def _get_limit_for_path(self, path: str) -> tuple[int, int]:
-        """Obtiene el límite y ventana para una ruta específica."""
-        if hasattr(self, "route_limits") and path in self.route_limits:
+        """Get rate limit and window for a specific path."""
+        if path in self.route_limits:
             return self.route_limits[path]
-        
-        if hasattr(self, "route_limits"):
-            for route_pattern, limits in self.route_limits.items():
-                if path.startswith(route_pattern.rstrip("/")):
-                    return limits
-        
+
+        for route_pattern, limits in self.route_limits.items():
+            if path.startswith(route_pattern.rstrip("/")):
+                return limits
+
         return self.default_limit, self.default_window
-    
-    def _get_client_ip(self, request: Request) -> str:
-        """Obtiene la IP real del cliente."""
-        forwarded = request.headers.get("x-forwarded-for")
+
+    def _get_client_ip(self, scope: Scope) -> str:
+        """Get real client IP from headers or connection."""
+        headers = dict(scope.get("headers", []))
+
+        forwarded = headers.get(b"x-forwarded-for", b"").decode("utf-8", errors="ignore")
         if forwarded:
             return forwarded.split(",")[0].strip()
-        
-        real_ip = request.headers.get("x-real-ip")
+
+        real_ip = headers.get(b"x-real-ip", b"").decode("utf-8", errors="ignore")
         if real_ip:
             return real_ip
-        
-        return request.client.host if request.client else "unknown"
-    
-    async def dispatch(self, request: Request, call_next):
-        # Skip rate limiting for WebSocket connections
-        if request.scope.get("type") == "websocket":
-            return await call_next(request)
 
-        if request.method == "OPTIONS":
-            return await call_next(request)
+        client = scope.get("client")
+        return client[0] if client else "unknown"
 
-        client_ip = self._get_client_ip(request)
-        path = request.url.path
-        method = request.method
-        
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        # Skip non-HTTP requests
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        method = scope.get("method", "")
+
+        # Skip OPTIONS requests
+        if method == "OPTIONS":
+            await self.app(scope, receive, send)
+            return
+
+        client_ip = self._get_client_ip(scope)
+        path = scope.get("path", "/")
+
         key = f"ratelimit:{client_ip}:{method}:{path}"
         limit, window = self._get_limit_for_path(path)
-        
+
         try:
-            r = redis_client  # Usa la instancia global
+            r = redis_client
             current = await r.incr(key)
-            
+
             if current == 1:
                 await r.expire(key, window)
-            
-            ttl = await r.ttl(key)
-            
-            if current > limit:
-                return JSONResponse(
-                    {
-                        "detail": "Too many requests. Try again later.",
-                        "retry_after": ttl
-                    },
-                    status_code=429
-                )
-            
-            response = await call_next(request)
 
-            return response
-            
+            ttl = await r.ttl(key)
+
+            if current > limit:
+                await self._send_rate_limit_response(send, ttl)
+                return
+
+            await self.app(scope, receive, send)
+
         except redis.ConnectionError:
             logger.warning("Redis unavailable for rate limiting, allowing request")
-            return await call_next(request)
+            await self.app(scope, receive, send)
         except Exception as e:
             logger.error(f"Rate limit error: {e}")
-            return await call_next(request)
+            await self.app(scope, receive, send)
+
+    async def _send_rate_limit_response(self, send: Send, retry_after: int):
+        """Send a 429 Too Many Requests response."""
+        body = json.dumps({
+            "detail": "Too many requests. Try again later.",
+            "retry_after": retry_after
+        }).encode()
+
+        await send({
+            "type": "http.response.start",
+            "status": 429,
+            "headers": [(b"content-type", b"application/json")],
+        })
+        await send({
+            "type": "http.response.body",
+            "body": body,
+        })
