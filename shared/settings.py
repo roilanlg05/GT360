@@ -7,8 +7,8 @@ load_dotenv()
 
 
 class BaseAppSettings(BaseSettings):
-    BASE_URL: str = "https://dev.gt360.app"
-    BACKEND_URL: str = "http://app:8000"
+    BASE_URL: str = os.getenv("BASE_URL")
+    BACKEND_URL: str = os.getenv("BACKEND_URL")
 
     # File uploads configuration
     UPLOAD_DIR: str = os.getenv("UPLOAD_DIR", "/var/www/gt360/uploads")
