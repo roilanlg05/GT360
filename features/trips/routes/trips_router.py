@@ -2519,12 +2519,16 @@ async def search_trips(
     except ValueError:
         raise HTTPException(status_code=400, detail="Formato de fecha inválido. Use YYYY-MM-DD")
 
+    # Normalize flight number: pad numeric values to 4 digits (e.g. "30" -> "0030")
+    flight_stripped = flight.strip()
+    flight_normalized = flight_stripped.zfill(4) if flight_stripped.isdigit() else flight_stripped
+
     # Construir filtros
     filters = [
         TripDB.location_id == location_uuid,
         TripDB.airline.ilike(airline.strip()),
         TripDB.pick_up_date == pick_up_date_obj,
-        TripDB.flight_number == flight.strip(),
+        TripDB.flight_number == flight_normalized,
         TripDB.trip_type == type.lower()
     ]
 
@@ -2638,8 +2642,12 @@ async def search_trips_by_flight_org_wide(
     # Construir filtros base
     filters = []
 
+    # Normalize flight number: pad numeric values to 4 digits (e.g. "30" -> "0030")
+    fn_stripped = flight_number.strip()
+    fn_normalized = fn_stripped.zfill(4) if fn_stripped.isdigit() else fn_stripped
+
     # Filtro por flight_number (requerido, exact match)
-    filters.append(TripDB.flight_number == flight_number.strip())
+    filters.append(TripDB.flight_number == fn_normalized)
 
     # Filtro por airline (opcional, case-insensitive)
     if airline:
@@ -2984,7 +2992,9 @@ async def search_trip_qr(
 
     # Normalize airline and flight number
     airline_normalized = airline.strip().upper()
-    flight_normalized = flight.strip()
+    flight_stripped = flight.strip()
+    # Pad numeric flight numbers to 4 digits (e.g. "30" -> "0030", "130" -> "0130")
+    flight_normalized = flight_stripped.zfill(4) if flight_stripped.isdigit() else flight_stripped
 
     # Get location info first (needed for timezone)
     location = await session.exec(

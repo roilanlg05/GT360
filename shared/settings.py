@@ -26,6 +26,7 @@ class BaseAppSettings(BaseSettings):
     PEPPER: Optional[str] = os.getenv("PEPPER")
     WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET")
     GROQ_API_KEY: Optional[str] = os.getenv("GROQ_API_KEY")
+    AIRLABS_API_KEY: Optional[str] = os.getenv("AIRLABS_API_KEY")
     PUBLIC_PATHS: list[str] = [
         "/v1/auth/register",
         "/v1/auth/sign-in",
@@ -43,7 +44,6 @@ class BaseAppSettings(BaseSettings):
         "/v1/auth/verify-data",
         "/v1/webhooks/trips",
         "/v1/webhooks/flights",  # AeroDataBox push notifications
-        "/v1/flights/",
         "/v1/crew-lookup/config",  # QR code config (public)
         "/v1/crew-lookup/health",  # QR code health check (public)
         "/v1/trips/search/qr",  # QR code trip search (public)

@@ -220,6 +220,7 @@ class StepFilterService:
             is_active=True,
         )
         self.session.add(filter_step)
+        await self.session.flush()
 
         # Build trip lookup and persist changes
         trip_lookup = {t.id: t for t in trips}
@@ -1022,7 +1023,9 @@ class StepFilterService:
         """
         Calcula el shift necesario para mover un neighbor y evitar gap problemático.
 
-        Intenta progresivamente: mitad del max_shift, luego max_shift completo.
+        Aplica directamente max_shift al vecino. Esto restaura el gap original
+        que existía antes de la expansión de la cadena, el cual por definición
+        era > max_gap (de lo contrario el vecino habría sido parte de la cadena).
 
         Args:
             time_a: Tiempo del primer trip (ya ajustado por expand)
@@ -1032,51 +1035,33 @@ class StepFilterService:
             direction: "backward" (neighbor antes de cadena) o "forward" (neighbor después)
 
         Returns:
-            Shift a aplicar al neighbor (negativo o positivo), o None si no se resuelve
+            Shift a aplicar al neighbor (negativo o positivo), o None si el tiempo
+            resultante cae fuera del rango del día
         """
-        # Intentos progresivos: mitad primero, luego completo
-        attempts = [max_shift // 2, max_shift]
+        if direction == "backward":
+            shift = -max_shift
+            neighbor_time = time_a
+        else:
+            shift = max_shift
+            neighbor_time = time_b
 
-        for shift_magnitude in attempts:
-            # Calcular shift con dirección correcta
-            if direction == "backward":
-                # Neighbor está ANTES, moverlo hacia atrás (restar minutos)
-                shift = -shift_magnitude
-                neighbor_time = time_a
-            else:
-                # Neighbor está DESPUÉS, moverlo hacia adelante (sumar minutos)
-                shift = shift_magnitude
-                neighbor_time = time_b
-
-            # Calcular nuevo tiempo del neighbor
-            try:
-                new_neighbor_time = self._add_minutes(neighbor_time, shift)
-            except ValueError:
-                # Tiempo fuera de rango del día
-                logger.debug(
-                    f"[NEIGHBOR_SHIFT] Attempt {shift}min: out of day range ❌"
-                )
-                continue
-
-            # Calcular nuevo gap
-            if direction == "backward":
-                new_gap = self._minutes_between(new_neighbor_time, time_b)
-            else:
-                new_gap = self._minutes_between(time_a, new_neighbor_time)
-
-            # ✅ Si el gap queda FUERA del rango problemático, funciona
-            if new_gap > max_gap:
-                logger.debug(
-                    f"[NEIGHBOR_SHIFT] Attempt {shift}min: gap={new_gap}min > {max_gap} ✅"
-                )
-                return shift
-
+        try:
+            new_neighbor_time = self._add_minutes(neighbor_time, shift)
+        except ValueError:
             logger.debug(
-                f"[NEIGHBOR_SHIFT] Attempt {shift}min: gap={new_gap}min still in range ❌"
+                f"[NEIGHBOR_SHIFT] {shift}min: out of day range ❌"
             )
+            return None
 
-        # No se pudo resolver con max_shift
-        return None
+        if direction == "backward":
+            new_gap = self._minutes_between(new_neighbor_time, time_b)
+        else:
+            new_gap = self._minutes_between(time_a, new_neighbor_time)
+
+        logger.debug(
+            f"[NEIGHBOR_SHIFT] {shift}min: gap={new_gap}min > {max_gap} ✅"
+        )
+        return shift
 
     def _validate_and_adjust_neighbors(
         self,

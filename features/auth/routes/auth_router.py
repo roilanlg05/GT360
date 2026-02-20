@@ -19,6 +19,18 @@ import secrets
 from pydantic import EmailStr
 from ..utils.validators import validators
 
+# --- BETA: Manager email whitelist (remove after beta) ---
+# Only emails in this set can register as managers.
+# To disable: delete this set and the check in register_manager().
+# To add more emails: add them below in lowercase.
+_MANAGER_EMAIL_WHITELIST: set[str] = {
+    "carlitoleo10@gmail.com",
+    "landgbnb@gmail.com",
+    "moradshopllc@gmail.com",
+    "roilan.lambert5@gmail.com",
+}
+# --- END BETA ---
+
 
 router = APIRouter(prefix="/v1/auth", tags=["Auth"])
 
@@ -82,8 +94,12 @@ async def register_manager(
     session: AsyncSession = Depends(get_db)
     ) -> dict:
 
-    hashed_pass = hash_pwd(user_data.password)
+    # --- BETA: Manager email whitelist check (remove after beta) ---
+    if user_data.email.lower() not in _MANAGER_EMAIL_WHITELIST:
+        raise HTTPException(status_code=403, detail="Email not allowed for manager registration")
+    # --- END BETA ---
 
+    hashed_pass = hash_pwd(user_data.password)
     try:
         user = User(
             email=user_data.email.lower(),
@@ -379,12 +395,15 @@ async def refresh_token(
                
 
     access_token = encode_token(str(user.id), metadata)
-    access_token.update({"type": "bearer"})
 
     metadata.update({"id": user.id})
 
-    resp = {"data":{ 
-                "session": access_token,
+    resp = {"data":{
+                "session": {
+                    "access_token": access_token["access_token"],
+                    "expires_at": access_token["exp"],
+                    "type": "Bearer"
+                },
                 "user_data": metadata,
                 "refresh_token": {
                     "refresh": new_raw,

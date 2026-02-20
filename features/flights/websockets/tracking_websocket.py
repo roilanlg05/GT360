@@ -36,6 +36,7 @@ async def _poll_position(
     trip_id: str,
     origin_icao: Optional[str],
     destination_icao: Optional[str],
+    initial_interval: int = 0,
 ):
     """
     Poll flight position at adaptive intervals.
@@ -46,10 +47,17 @@ async def _poll_position(
     - 20-30 min: every 2.5 minutes
     - 10-20 min: every 1 minute
     - <10 min: every 1 second (real-time)
+
+    If initial_interval > 0, the first poll is delayed by that amount
+    (because a snapshot was already sent before this task was created).
     """
     cache = await get_tracking_cache()
 
     try:
+        # If a snapshot was already sent, respect its interval before the next fetch
+        if initial_interval > 0:
+            await asyncio.sleep(initial_interval)
+
         while True:
             # Get position (uses cache with singleflight pattern)
             position = await cache.get_or_fetch_position(
@@ -108,6 +116,7 @@ async def ws_flight_tracking(ws: WebSocket, token: str):
         - {"action": "ping", "token": "..."} - keep-alive with token validation
         - {"action": "track", "flight_number": "...", "trip_id": "...",
            "origin_icao": "...", "destination_icao": "..."} - start tracking
+           (origin_icao and destination_icao are optional — auto-detected via routeset)
         - {"action": "stop", "flight_number": "...", "trip_id": "..."} - stop tracking
     """
     # Validate token
@@ -187,23 +196,49 @@ async def ws_flight_tracking(ws: WebSocket, token: str):
                     })
                     continue
 
-                # Start polling task
-                task = asyncio.create_task(
-                    _poll_position(
-                        ws, flight_number, trip_id,
-                        origin_icao, destination_icao
-                    )
-                )
-                _tracking_tasks[ws][task_key] = task
-
-                # Also join the room for pub/sub updates
-                await manager.subscribe_tracking(ws, flight_number, trip_id)
-
                 await ws.send_json({
                     "type": "tracking_started",
                     "flight_number": flight_number,
                     "trip_id": trip_id,
                 })
+
+                # Fetch and send snapshot immediately so the client gets
+                # current data right away, regardless of the polling interval.
+                initial_interval = 0
+                try:
+                    cache = await get_tracking_cache()
+                    logger.info(f"[TRACKING] Fetching snapshot for {flight_number} (trip={trip_id}, origin={origin_icao}, dest={destination_icao})")
+                    snapshot = await cache.get_or_fetch_position(
+                        flight_number=flight_number,
+                        trip_id=trip_id,
+                        origin_icao=origin_icao,
+                        destination_icao=destination_icao,
+                    )
+                    logger.info(f"[TRACKING] Snapshot result for {flight_number}: {'found' if snapshot else 'None (flight not found in ADSB.lol)'}")
+
+                    if snapshot:
+                        await ws.send_json({
+                            "type": "position_update",
+                            "position": snapshot.model_dump(),
+                        })
+                        # Polling task starts sleeping from this interval so it
+                        # doesn't double-fetch right after the snapshot.
+                        initial_interval = snapshot.interval_seconds
+                except Exception as e:
+                    logger.error(f"[TRACKING] Error fetching snapshot for {flight_number}: {type(e).__name__}: {e}", exc_info=True)
+
+                # Also join the room for pub/sub updates
+                await manager.subscribe_tracking(ws, flight_number, trip_id)
+
+                # Start polling task
+                task = asyncio.create_task(
+                    _poll_position(
+                        ws, flight_number, trip_id,
+                        origin_icao, destination_icao,
+                        initial_interval=initial_interval,
+                    )
+                )
+                _tracking_tasks[ws][task_key] = task
                 continue
 
             # Stop tracking a flight
@@ -245,8 +280,8 @@ async def ws_flight_tracking(ws: WebSocket, token: str):
         pass  # Normal disconnection
     except (ConnectionClosedError, ConnectionClosedOK):
         pass  # Connection closed by client
-    except Exception:
-        pass  # Suppress all WS errors (client disconnected)
+    except Exception as e:
+        logger.error(f"[WS] Unhandled exception — closing connection: {type(e).__name__}: {e}", exc_info=True)
     finally:
         # Cleanup: cancel all tracking tasks
         if ws in _tracking_tasks:
