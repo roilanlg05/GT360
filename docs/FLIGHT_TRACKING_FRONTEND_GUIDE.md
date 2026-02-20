@@ -19,12 +19,13 @@ El sistema de tracking de vuelos en tiempo real tiene dos componentes principale
 │  │   (React)    │   WS    │   (FastAPI)  │  Cache  │   Pub/Sub    │        │
 │  └──────────────┘         └──────────────┘         └──────────────┘        │
 │                                  │                                          │
-│                    ┌─────────────┼─────────────┐                           │
-│                    ▼             ▼             ▼                           │
-│           ┌──────────────┐ ┌──────────┐ ┌──────────────┐                   │
-│           │ AeroDataBox  │ │ ADSB.lol │ │   Webhook    │                   │
-│           │ (Push API)   │ │ (Pos API)│ │   Handler    │                   │
-│           └──────────────┘ └──────────┘ └──────────────┘                   │
+│             ┌────────────────────┼──────────────────────┐                  │
+│             ▼                    ▼                       ▼                  │
+│  ┌──────────────┐       ┌──────────────┐       ┌──────────────┐            │
+│  │ AeroDataBox  │       │   ADSB.lol   │       │   Airlabs    │            │
+│  │ (Push API)   │       │ /v2/callsign │       │ (IATA→ICAO)  │            │
+│  │ (Webhook)    │       │ /api/0/route │       │  cache mem.  │            │
+│  └──────────────┘       └──────────────┘       └──────────────┘            │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -38,28 +39,36 @@ El sistema de tracking de vuelos en tiempo real tiene dos componentes principale
 │                                                                              │
 │  1. Frontend envía lista de vuelos a trackear (para AeroDataBox)            │
 │     POST /v1/flights/tracking/subscribe                                      │
+│     Body: [{ flight_number: "WN1036", trip_id, date_local }]                │
 │                                                                              │
 │  2. Frontend conecta a WebSocket de push notifications                       │
-│     WS /ws/flights/push?location_id=xxx&flight_numbers=WN1036,AA123&token=JWT│
+│     WS /ws/flights/push?location_id=xxx&flight_numbers=WN1036,AA123&token=  │
 │                                                                              │
 │     ⚠️ El location_id determina el aeropuerto de destino (IATA)             │
 │     Solo se reciben notificaciones de vuelos que llegan a ese aeropuerto    │
+│     Al conectar se recibe un snapshot de notificaciones recientes           │
 │                                                                              │
 │  3. Cuando el vuelo despega (status: "Departed"):                           │
 │     - Frontend recibe: {"message": "Flight WN1036 has departed at 11:52"}   │
-│     - Frontend conecta al WS de tracking para posición en tiempo real       │
-│     WS /ws/flights/tracking?token=JWT                                        │
+│     - Frontend envía action "track" al WS de tracking:                      │
+│       { action: "track", flight_number: "WN1036", trip_id: "..." }          │
+│     ⚠️ NO es necesario enviar origin_icao ni destination_icao:             │
+│        el backend los detecta automáticamente vía ADSB.lol /routeset        │
 │                                                                              │
-│  4. Frontend recibe posiciones en tiempo real con intervalos adaptativos:   │
-│     - >60 min ETA: cada 20 min                                              │
+│  4. Al recibir "track" el backend responde inmediatamente con:              │
+│     a) tracking_started                                                      │
+│     b) position_update (snapshot con posición actual — sin esperar intervalo)│
+│                                                                              │
+│  5. Frontend recibe posiciones con intervalos adaptativos según ETA:        │
+│     - >60 min: cada 20 min                                                  │
 │     - 30-60 min: cada 5 min                                                 │
 │     - 20-30 min: cada 2.5 min                                               │
 │     - 10-20 min: cada 1 min                                                 │
 │     - <10 min: cada 1 segundo                                               │
 │                                                                              │
-│  5. Cuando el vuelo aterriza (status: "Arrived"):                           │
-│     - Frontend recibe: {"message": "Flight WN1036 has arrived at 13:28"}    │
-│     - Frontend puede desconectar el WS de tracking                          │
+│  6. Cuando el vuelo aterriza (status: "Arrived"):                           │
+│     - Frontend recibe flight_update en el WS push                           │
+│     - Frontend envía action "stop" al WS de tracking                        │
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -298,8 +307,10 @@ interface FlightTrackingState {
 
 Obtiene la posición actual del avión. Usa cache de 2 segundos con patrón singleflight.
 
+El backend detecta automáticamente origen y destino vía ADSB.lol `/api/0/routeset`. Los parámetros `origin_icao` y `destination_icao` son opcionales y solo se usan como fallback si el routeset no devuelve aeropuertos.
+
 ```http
-GET /v1/flights/tracking/position/{flight_number}?trip_id={trip_id}&destination_icao={icao}
+GET /v1/flights/tracking/position/{flight_number}?trip_id={trip_id}
 Authorization: Bearer {jwt_token}
 ```
 
@@ -307,12 +318,12 @@ Authorization: Bearer {jwt_token}
 | Param | Required | Description |
 |-------|----------|-------------|
 | trip_id | Yes | ID del trip |
-| origin_icao | No | Código ICAO del aeropuerto de origen |
-| destination_icao | No | Código ICAO del destino (para calcular ETA) |
+| origin_icao | No | Override del aeropuerto de origen (auto-detectado si se omite) |
+| destination_icao | No | Override del destino (auto-detectado si se omite) |
 
 **Ejemplo:**
 ```http
-GET /v1/flights/tracking/position/WN1234?trip_id=uuid&destination_icao=KSDF
+GET /v1/flights/tracking/position/WN1234?trip_id=uuid
 ```
 
 **Response (200 OK):**
@@ -461,7 +472,7 @@ Recibe notificaciones de cambios de estado del vuelo en tiempo real.
 ### Conexión
 
 ```
-wss://api.gt360.app/ws/flights/push?location_id={location_id}&flight_numbers={flight_numbers}&token={jwt_token}
+wss://dev-api.gt360.app/ws/flights/push?location_id={location_id}&flight_numbers={flight_numbers}&token={jwt_token}
 ```
 
 **Parámetros de Query:**
@@ -579,14 +590,36 @@ wss://api.gt360.app/ws/flights/push?location_id=15da8f3a-aa38-44b7-9454-88dea364
 }
 ```
 
-**5. Pong (respuesta a ping):**
+**5. Snapshot de notificaciones recientes:**
+
+Se envía automáticamente al conectar y al suscribirse a un vuelo adicional, para evitar perder notificaciones que llegaron mientras el cliente estaba desconectado.
+
+```json
+{
+  "type": "snapshot",
+  "notifications": [
+    {
+      "type": "flight_update",
+      "flight_number": "WN1036",
+      "status": "Departed",
+      "message": "Flight WN1036 has departed at 11:52",
+      "..."
+    }
+  ],
+  "count": 1
+}
+```
+
+> Al suscribirse a un vuelo adicional, el snapshot incluye además el campo `"flight_number"` con el vuelo recién suscrito.
+
+**6. Pong (respuesta a ping):**
 ```json
 {
   "type": "pong"
 }
 ```
 
-**6. Error:**
+**7. Error:**
 ```json
 {
   "type": "error",
@@ -721,10 +754,19 @@ type FlightStatus =
   | "Diverted"
   | "CanceledUncertain";
 
+// Snapshot de notificaciones recientes (se recibe al conectar y al suscribirse)
+interface SnapshotMessage {
+  type: "snapshot";
+  notifications: FlightUpdateMessage[];
+  count: number;
+  flight_number?: string; // Solo presente al suscribirse a un vuelo adicional
+}
+
 // Mensajes del servidor
 type ServerMessage =
   | ConnectedMessage
   | FlightUpdateMessage
+  | SnapshotMessage
   | { type: "subscribed"; flight_number: string }
   | { type: "unsubscribed"; flight_number: string }
   | { type: "pong" }
@@ -1014,7 +1056,10 @@ wss://api.gt360.app/ws/flights/tracking?token={jwt_token}
 }
 ```
 
-**2. Tracking iniciado:**
+**2. Tracking iniciado + snapshot inmediato:**
+
+Al recibir `tracking_started`, el backend inmediatamente hace fetch de la posición actual y envía un `position_update` sin esperar al siguiente intervalo. Esto garantiza que el cliente tiene datos en pantalla desde el primer momento, independientemente del intervalo adaptativo (que puede ser hasta 20 minutos).
+
 ```json
 {
   "type": "tracking_started",
@@ -1022,6 +1067,8 @@ wss://api.gt360.app/ws/flights/tracking?token={jwt_token}
   "trip_id": "uuid-del-trip"
 }
 ```
+
+> Justo después llega un `position_update` con la posición actual. El polling regular comienza a contar desde ese momento.
 
 **3. Actualización de posición:**
 ```json
@@ -1083,12 +1130,11 @@ wss://api.gt360.app/ws/flights/tracking?token={jwt_token}
 {
   "action": "track",
   "flight_number": "WN1234",
-  "trip_id": "uuid-del-trip",
-  "origin_icao": "KORD",
-  "destination_icao": "KSDF"
+  "trip_id": "uuid-del-trip"
 }
 ```
-> Los campos `origin_icao` y `destination_icao` son opcionales pero recomendados para cálculo de ETA.
+
+> `origin_icao` y `destination_icao` son **opcionales**. El backend los detecta automáticamente usando el endpoint `/api/0/routeset` de ADSB.lol, que devuelve la ruta completa (con coords de origen y destino) a partir del callsign y la posición actual del avión. Solo envíalos si quieres forzar un aeropuerto específico.
 
 **2. Detener tracking:**
 ```json
@@ -1137,10 +1183,10 @@ interface FlightPosition {
 }
 
 interface FlightToTrack {
-  flight_number: string;
+  flight_number: string;  // IATA format (e.g. "WN2105") — backend convierte a ICAO
   trip_id: string;
-  origin_icao?: string;
-  destination_icao?: string;
+  origin_icao?: string;       // Opcional — auto-detectado vía routeset
+  destination_icao?: string;  // Opcional — auto-detectado vía routeset
 }
 
 interface UseFlightTrackingOptions {
@@ -1346,17 +1392,16 @@ const handleFlightUpdate = (update: FlightUpdate) => {
 
   // Si el vuelo despegó, iniciar tracking en tiempo real
   if (['Departed', 'EnRoute'].includes(status)) {
-    // Encontrar el trip correspondiente para obtener trip_id
     const trip = trips.find(t =>
       t.flight_number?.replace(/\s/g, '') === flight_number
     );
 
     if (trip) {
+      // origin_icao y destination_icao son opcionales:
+      // el backend los detecta automáticamente vía ADSB.lol /routeset
       trackingWs.startTracking({
         flight_number,
         trip_id: trip.id,
-        origin_icao: trip.origin_icao,
-        destination_icao: trip.destination_icao,
       });
     }
   }
@@ -1554,6 +1599,11 @@ AERODATABOX_RAPIDAPI_HOST=aerodatabox.p.rapidapi.com
 FLIGHT_WEBHOOK_URL=https://api.gt360.app/v1/webhooks/flights/push
 FLIGHT_SUBSCRIPTION_HOURS=24
 
+# Airlabs (conversión IATA → ICAO de aerolíneas)
+# Usado para convertir "WN2105" → "SWA2105" antes de buscar en ADSB.lol
+# El resultado se cachea en memoria por aerolínea (no hay llamadas repetidas)
+AIRLABS_API_KEY=tu_api_key
+
 # Redis (para pub/sub y cache)
 REDIS_URL=redis://localhost:6379
 ```
@@ -1604,6 +1654,15 @@ Response:
 
 ## Resumen de Cambios Recientes
 
+### Tracking en tiempo real (v3)
+
+| Aspecto | Antes | Ahora |
+|---------|-------|-------|
+| Callsign para ADSB.lol | IATA manual (fallaba) | Auto-convertido IATA→ICAO vía Airlabs |
+| Origen/destino | Frontend enviaba `origin_icao`, `destination_icao` | Auto-detectados vía ADSB.lol `/api/0/routeset` |
+| Snapshot al conectar | No existía | Inmediato al enviar `track`, antes del primer intervalo |
+| Llamadas HTTP por ciclo | 3 (callsign + 2× airport) | 2 (callsign + routeset) |
+
 ### Nuevo formato de Push WebSocket (v2)
 
 | Aspecto | Antes | Ahora |
@@ -1612,10 +1671,12 @@ Response:
 | Filtrado | Por trip_id | Por arrival_iata (del location) + flight_number |
 | Mensajes | `push_notification` con raw data | `flight_update` con mensaje formateado |
 | Suscripción dinámica | Por trip_id | Por flight_number |
+| Snapshot al conectar | No existía | Se envía automáticamente con historial reciente |
 
 ### Normalización de Flight Numbers
 
-⚠️ **IMPORTANTE**: Los flight numbers deben normalizarse sin espacios:
-- AeroDataBox envía: `"WN 1036"` (con espacio)
-- Frontend debe enviar: `"WN1036"` (sin espacio)
-- Backend normaliza ambos a uppercase sin espacios para matching
+⚠️ **IMPORTANTE**: Los flight numbers se manejan en formato IATA (`"WN1036"`), sin espacios:
+- AeroDataBox envía: `"WN 1036"` (con espacio) → backend normaliza
+- Frontend envía: `"WN1036"` (sin espacio, uppercase)
+- Backend convierte internamente: `"WN1036"` → `"SWA1036"` (ICAO) para ADSB.lol
+- El frontend nunca necesita conocer el callsign ICAO
