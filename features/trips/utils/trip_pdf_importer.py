@@ -267,17 +267,18 @@ def _process_pdf_sync(
                 location_airport_code=location,
             )
 
-            # --- Trip hash ---
-            trip_hash = hash((
-                pick_up_date,
-                pick_up_time,
-                pick_up_location,
-                drop_off_location,
-                airline,
-                flight_number,
-                tuple(sorted(riders.items())),
-                trip_type,
-            ))
+            # --- Trip hash (deterministic SHA-256) ---
+            from features.trips.utils.trip_hash import compute_trip_hash
+            trip_hash = compute_trip_hash(
+                pick_up_date=pick_up_date,
+                pick_up_time=pick_up_time,
+                pick_up_location=pick_up_location,
+                drop_off_location=drop_off_location,
+                airline=airline,
+                flight_number=flight_number,
+                riders=riders,
+                trip_type=trip_type,
+            )
 
             trips.append(
                 Trip(
@@ -289,7 +290,7 @@ def _process_pdf_sync(
                     flight_number=flight_number,
                     riders=riders,
                     trip_type=trip_type,
-                    trip_hash=str(trip_hash),
+                    trip_hash=trip_hash,
                 )
             )
 

@@ -81,7 +81,7 @@ class RateLimitMiddleware:
             ttl = await r.ttl(key)
 
             if current > limit:
-                await self._send_rate_limit_response(send, ttl)
+                await self._send_rate_limit_response(send, ttl, scope)
                 return
 
             await self.app(scope, receive, send)
@@ -93,17 +93,37 @@ class RateLimitMiddleware:
             logger.error(f"Rate limit error: {e}")
             await self.app(scope, receive, send)
 
-    async def _send_rate_limit_response(self, send: Send, retry_after: int):
-        """Send a 429 Too Many Requests response."""
+    async def _send_rate_limit_response(self, send: Send, retry_after: int, scope: Scope = None):
+        """Send a 429 Too Many Requests response with CORS headers."""
         body = json.dumps({
             "detail": "Too many requests. Try again later.",
             "retry_after": retry_after
         }).encode()
 
+        headers = [
+            (b"content-type", b"application/json"),
+            (b"retry-after", str(retry_after).encode()),
+        ]
+
+        # Add CORS headers so the browser can read the 429 response
+        if scope:
+            request_headers = dict(scope.get("headers", []))
+            origin = request_headers.get(b"origin", b"").decode("utf-8", errors="ignore")
+            allowed_origins = [
+                "https://www.gt360.com",
+                "https://dev.gt360.app",
+                "https://gt360.app",
+            ]
+            if origin in allowed_origins:
+                headers.extend([
+                    (b"access-control-allow-origin", origin.encode()),
+                    (b"access-control-allow-credentials", b"true"),
+                ])
+
         await send({
             "type": "http.response.start",
             "status": 429,
-            "headers": [(b"content-type", b"application/json")],
+            "headers": headers,
         })
         await send({
             "type": "http.response.body",

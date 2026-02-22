@@ -3,7 +3,8 @@ from psqlmodel import Select, AsyncSession
 from shared.db.db_config import get_db
 from shared.db.schemas import Driver, User, Organization, Location, Trip as TripDB, TripStatus
 from features.auth.utils import verify_role
-from features.drivers.models.driver_models import DriverActiveUpdate, DriverDetailsUpdate, DriverResponse, DriverStatusResponse
+from features.drivers.models.driver_models import DriverActiveUpdate, DriverDetailsUpdate, DriverResponse, DriverStatusResponse, DriverLocationSharingUpdate
+from features.drivers.utils.location_ws_manager import driver_location_manager
 from typing import Optional
 from uuid import UUID
 
@@ -342,3 +343,71 @@ async def update_driver_details(
         work_days=driver.work_days,
         created_at=user.created_at if user else None
     )
+
+
+# ─── Driver Location Sharing Settings ──────────────────────────────────────
+
+@router.get("/v1/organizations/{organization_id}/settings/driver-location-sharing")
+async def get_driver_location_sharing(
+    organization_id: UUID,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["manager"]))
+):
+    """Get the driver location sharing setting for an organization."""
+    user_data = request.state.user_data
+    user_org_id = user_data.get("organization_id")
+
+    if str(user_org_id) != str(organization_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this organization")
+
+    org = await session.exec(
+        Select(Organization).Where(Organization.id == organization_id)
+    ).first()
+
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    return {
+        "driver_location_sharing": org.driver_location_sharing,
+        "organization_id": str(org.id),
+    }
+
+
+@router.patch("/v1/organizations/{organization_id}/settings/driver-location-sharing")
+async def update_driver_location_sharing(
+    organization_id: UUID,
+    data: DriverLocationSharingUpdate,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["manager"]))
+):
+    """Toggle driver-to-driver location sharing for an organization."""
+    user_data = request.state.user_data
+    user_org_id = user_data.get("organization_id")
+
+    if str(user_org_id) != str(organization_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this organization")
+
+    org = await session.exec(
+        Select(Organization).Where(Organization.id == organization_id)
+    ).first()
+
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    org.driver_location_sharing = data.driver_location_sharing
+    session.add(org)
+    await session.commit()
+    await session.refresh(org)
+
+    # Publish toggle event so all WebSocket connections react immediately
+    await driver_location_manager.publish_sharing_toggle(
+        str(organization_id),
+        data.driver_location_sharing,
+    )
+
+    return {
+        "driver_location_sharing": org.driver_location_sharing,
+        "organization_id": str(org.id),
+    }

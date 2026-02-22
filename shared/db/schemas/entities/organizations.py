@@ -37,6 +37,8 @@ class Organization(PSQLModel):
 
     status: str = Column(default=None, index=True)
 
+    driver_location_sharing: bool = Column(default=False, nullable=False)
+
     created_at: timestamptz = Column(
         default=now, 
         nullable=False, 

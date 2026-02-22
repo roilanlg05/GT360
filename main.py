@@ -26,12 +26,15 @@ from features.drivers.routes.manager_shifts_router import router as manager_shif
 from features.drivers.routes.manager_expenses_router import router as manager_expenses_router
 from features.drivers.routes.manager_1099_router import router as manager_1099_router
 from features.drivers.routes.rating_router import router as rating_router
+from features.drivers.websockets.location_websocket import router as driver_location_ws_router
 from features.trips.routes.step_filter_router import router as step_filter_router
 from features.trips.routes.filter_preset_router import router as filter_preset_router
 from features.trips.routes.test_filter_router import router as test_filter_router
 from features.support.routes.support_router import router as support_router
 from features.trips.routes.review_router import router as review_router
 from features.trips.routes.alarm_router import router as alarm_router
+from features.billing.routes.billing_router import router as billing_router, admin_router as billing_admin_router
+from features.billing.webhooks.stripe_webhook import router as stripe_webhook_router
 from shared.settings import settings
 """from features.geofencing.routes.validation_router import router as validation_router
 from features.geofencing.routes.geofence_router import router as geofence_router
@@ -202,6 +205,10 @@ app.include_router(support_router)
 app.include_router(review_router)
 app.include_router(alarm_router)
 app.include_router(rating_router)
+app.include_router(driver_location_ws_router)
+app.include_router(billing_router)
+app.include_router(billing_admin_router)
+app.include_router(stripe_webhook_router)
 #app.include_router(validation_router)
 #app.include_router(geofence_router)
 

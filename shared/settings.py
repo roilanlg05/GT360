@@ -27,6 +27,13 @@ class BaseAppSettings(BaseSettings):
     WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET")
     GROQ_API_KEY: Optional[str] = os.getenv("GROQ_API_KEY")
     AIRLABS_API_KEY: Optional[str] = os.getenv("AIRLABS_API_KEY")
+    # Stripe billing
+    STRIPE_SECRET_KEY: str = os.getenv("STRIPE_SECRET_KEY", "")
+    STRIPE_WEBHOOK_SECRET: str = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+    STRIPE_BASIC_PRICE_ID: str = os.getenv("STRIPE_BASIC_PRICE_ID", "")
+    STRIPE_PRO_PRICE_ID: str = os.getenv("STRIPE_PRO_PRICE_ID", "")
+    FREE_TRIAL_DAYS: int = int(os.getenv("FREE_TRIAL_DAYS", "30"))
+    ADMIN_SECRET_KEY: str = os.getenv("ADMIN_SECRET_KEY", "")
     PUBLIC_PATHS: list[str] = [
         "/v1/auth/register",
         "/v1/auth/sign-in",
@@ -48,6 +55,7 @@ class BaseAppSettings(BaseSettings):
         "/v1/crew-lookup/health",  # QR code health check (public)
         "/v1/trips/search/qr",  # QR code trip search (public)
         "/v1/support/contact",  # Support contact form (public)
+        "/v1/webhooks/stripe",  # Stripe webhook (signature verified internally)
         "/uploads",  # Static file uploads (public)
     ]
 
