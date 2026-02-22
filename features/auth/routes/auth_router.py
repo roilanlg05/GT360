@@ -3,7 +3,8 @@ from fastapi.responses import JSONResponse
 from psqlmodel import Select, AsyncSession
 from features.auth.models.user_model import CreateCrewMember, UserData, CreateManager, CreateDriver
 from features.auth.models.auth_model import EmailPasswordRequestForm, PasswordUpdate, NewPassword, RefreshTokenRequest
-from shared.db.schemas import User, Crew, Manager, Driver, Organization
+from shared.db.schemas import User, Crew, Manager, Driver, Organization, Subscription
+from shared.db.schemas.billing.subscriptions import SubscriptionStatus
 from shared.db.db_config import get_db
 from shared.settings import settings
 from datetime import timedelta
@@ -28,6 +29,10 @@ _MANAGER_EMAIL_WHITELIST: set[str] = {
     "landgbnb@gmail.com",
     "moradshopllc@gmail.com",
     "roilan.lambert5@gmail.com",
+    "albertestalltime@gmail.com",
+    "enmausa93@icloud.com",
+    "dparra574@gmail.com",
+    "gtbeta00@gmail.com",
 }
 # --- END BETA ---
 
@@ -137,6 +142,18 @@ async def register_manager(
         manager.organization_id = organization.id
         session.add(manager)
 
+        # Create free trial subscription (starts immediately, lasts FREE_TRIAL_DAYS days)
+        from datetime import timezone
+        trial_start = now()
+        trial_end = trial_start + timedelta(days=settings.FREE_TRIAL_DAYS)
+        subscription = Subscription(
+            organization_id=organization.id,
+            status=SubscriptionStatus.TRIALING,
+            trial_start=trial_start,
+            trial_end=trial_end,
+        )
+        session.add(subscription)
+
         # Rotar nonce
         user.password_reset_nonce = secrets.token_urlsafe(16)
         session.add(user)
@@ -189,6 +206,10 @@ async def register_driver(
 
         if not org:
             raise HTTPException(status_code=404, detail="Organization not found")
+
+        # Check subscription allows adding drivers
+        from features.billing.utils.subscription_guard import check_can_add_driver
+        await check_can_add_driver(session, str(user_data.organization_id))
 
         user = User(
             email=user_data.email.lower(),

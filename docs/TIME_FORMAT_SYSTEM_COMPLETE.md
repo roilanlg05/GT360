@@ -537,21 +537,13 @@ time_format = await get_user_time_format(request, session)
 trip = model_dump_with_time_format(trip, time_format)
 ```
 
-#### 5. POST .../filters/preview (línea ~1151)
-```python
-time_format = await get_user_time_format(request, session)
-service = TripFilterService(session)
-result = await service.preview(location_uuid, airline, filters, time_format)
-```
+#### 5. POST .../filters/preview
+> **Nota:** Este endpoint NO aplica formato de hora. El servicio `StepFilterService.preview_step()` no recibe parámetro `time_format`. Las horas en la respuesta se devuelven sin formatear.
 
-#### 6. POST .../filters/apply (línea ~1207)
-```python
-time_format = await get_user_time_format(request, session)
-service = TripFilterService(session)
-result = await service.apply(location_uuid, airline, filters, time_format)
-```
+#### 6. POST .../filters/apply
+> **Nota:** Este endpoint NO aplica formato de hora. El servicio `StepFilterService.apply_step()` no recibe parámetro `time_format`. Las horas en la respuesta se devuelven sin formatear.
 
-#### 7. PATCH .../trips/{trip_id}/assign (línea ~1466)
+#### 7. PATCH .../trips/{trip_id}/assign
 ```python
 time_format = await get_user_time_format(request, session)
 return {
@@ -571,65 +563,9 @@ return {
 
 ### Servicio de Filtros
 
-El archivo `features/trips/services/trip_filter_service.py` integra el formateo:
+El archivo `features/trips/services/step_filter_service.py` contiene la clase `StepFilterService`.
 
-#### Import (línea 49)
-```python
-from shared.utils.time_formatter import format_time
-```
-
-#### Método preview() (línea 83-158)
-```python
-async def preview(
-    self,
-    location_id: UUID,
-    airline: str,
-    config: FilterRequest,
-    time_format: str = "24h",  # Nuevo parámetro
-) -> FilterPreviewResult:
-    # ... lógica existente ...
-
-    # Format time fields according to user preference
-    formatted_changes = self._format_changes(self.changes, time_format)
-
-    return FilterPreviewResult(
-        changes=formatted_changes,  # Cambios formateados
-        # ...
-    )
-```
-
-#### Método apply() (línea 160-277)
-```python
-async def apply(
-    self,
-    location_id: UUID,
-    airline: str,
-    config: FilterRequest,
-    time_format: str = "24h",  # Nuevo parámetro
-) -> FilterApplyResult:
-    # ... lógica existente ...
-```
-
-#### Método _format_changes() (línea 830-854)
-```python
-def _format_changes(self, changes: list[TripChange], time_format: str) -> list[TripChange]:
-    """
-    Format time fields in TripChange objects according to user preference.
-    """
-    formatted_changes = []
-    for change in changes:
-        formatted_change = TripChange(
-            trip_id=change.trip_id,
-            original_time=format_time(change.original_time, time_format),
-            new_time=format_time(change.new_time, time_format),
-            filter_applied=change.filter_applied,
-            hotel_name=change.hotel_name,
-            pick_up_date=change.pick_up_date,
-            airline=change.airline,
-        )
-        formatted_changes.append(formatted_change)
-    return formatted_changes
-```
+> **Nota:** Este servicio NO integra formato de hora. Los métodos `preview_step()` y `apply_step()` no reciben parámetro `time_format` ni formatean campos de hora en sus respuestas. Las horas se devuelven como objetos time serializados por defecto.
 
 ---
 
@@ -991,11 +927,7 @@ El sistema usa `"24h"` como fallback seguro en cualquier caso de error.
 
 ### ¿Los endpoints de filtros también formatean las horas?
 
-**SÍ.** Los endpoints `/preview` y `/apply` formatean los campos `original_time` y `new_time` según la preferencia del usuario.
-
-### ¿Cómo afecta a los logs del endpoint /apply?
-
-Los logs internos almacenan las horas sin formato (como strings de los objetos time). Solo la respuesta al cliente se formatea.
+**NO.** Los endpoints `/preview` y `/apply` del servicio `StepFilterService` no integran formato de hora. Las horas en sus respuestas se devuelven sin formatear (como objetos time serializados por defecto).
 
 ### ¿Puedo forzar un formato específico en un request?
 
@@ -1036,7 +968,7 @@ GT360/
 │       ├── routes/
 │       │   └── trips_router.py      # Integración de formateo
 │       └── services/
-│           └── trip_filter_service.py # Formateo en preview/apply
+│           └── step_filter_service.py # Servicio de filtros (sin formateo de hora)
 │
 └── docs/
     ├── FRONTEND_GROUND_FILTERS_TIME_FORMAT_UPDATE.md
@@ -1047,5 +979,5 @@ GT360/
 ---
 
 **Fecha de Creación**: 2026-01-17
-**Última Actualización**: 2026-01-18
-**Versión**: 1.0.0
+**Última Actualización**: 2026-02-22
+**Versión**: 1.1.0

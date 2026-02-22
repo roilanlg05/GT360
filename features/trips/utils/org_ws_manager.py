@@ -70,6 +70,25 @@ class OrgWSManager:
         for ws in dead:
             await self.disconnect(ws)
 
+    async def broadcast_to_managers(self, org_id: str, payload: dict) -> None:
+        """Send payload only to manager connections in the org room."""
+        org_id = str(org_id)
+
+        async with self._lock:
+            all_ws = set(self.rooms.get(org_id, set()))
+            targets = {
+                ws for ws in all_ws
+                if self.ws_meta.get(ws, {}).get("role") == "manager"
+            }
+
+        dead = []
+        for ws in targets:
+            if not await self._safe_send(ws, payload):
+                dead.append(ws)
+
+        for ws in dead:
+            await self.disconnect(ws)
+
     async def ensure_org_listener(self, org_id: str) -> None:
         async with self._lock:
             if org_id in self.org_listener_tasks:
@@ -116,8 +135,11 @@ class OrgWSManager:
                 if not ev:
                     continue
 
-                # Forward the event directly to all connected clients
-                await self.broadcast_to_org(org_id, ev)
+                # Billing events go only to managers
+                if ev.get("type") == "billing_event":
+                    await self.broadcast_to_managers(org_id, ev)
+                else:
+                    await self.broadcast_to_org(org_id, ev)
 
         except asyncio.CancelledError:
             pass

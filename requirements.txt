@@ -36,3 +36,6 @@ orjson
 timezonefinder
 sqlalchemy
 pytz==2024.1
+
+# Payments
+stripe>=10.0.0

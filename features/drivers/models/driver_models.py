@@ -61,3 +61,7 @@ class DriverDetailsUpdate(BaseModel):
     shift_start_time: Optional[time] = None
     shift_end_time: Optional[time] = None
     work_days: Optional[List[str]] = None
+
+
+class DriverLocationSharingUpdate(BaseModel):
+    driver_location_sharing: bool

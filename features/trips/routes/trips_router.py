@@ -3,8 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, UploadFile, File, HTTPException, Query, Depends, Request, Response
 from fastapi.responses import JSONResponse
 from shared.db.db_config import get_db
-from psqlmodel import Select, Count, Delete, AsyncSession, With, RawExpression, NotExists, Func
-from psqlmodel.utils import unnest, Array
+from psqlmodel import Select, Count, Delete, AsyncSession, RawExpression, Func
 from shared.db.schemas import Trip as TripDB, TripHistory as TripHistoryDB, Location, Airport, Organization, Hotel, Driver, User, FilterStep
 from features.trips.utils.trip_importer import load_trips_from_bytes
 from features.trips.utils.trip_pdf_importer import load_trips_from_pdf_bytes
@@ -142,6 +141,10 @@ async def upload_trips(
     radio = 0.0
 
     if not location:
+        # Validate subscription before creating a new location
+        from features.billing.utils.subscription_guard import check_can_add_location
+        await check_can_add_location(session, str(org_id))
+
         # Crear Location con timezone basado en coordenadas del aeropuerto
         location = Location(
             organization_id=organization.id,
@@ -162,54 +165,33 @@ async def upload_trips(
     await session.flush()
     await session.refresh(location)
 
-    # Check for duplicate trips using CTE
-    trip_hashes = [str(t.trip_hash) for t in trips_import]
+    # --- Deduplication: filter out trips that already exist in DB ---
+    trip_hashes = [t.trip_hash for t in trips_import]
     total_trips = len(trip_hashes)
+    existing_hashes: set[str] = set()
 
     if total_trips > 0:
-        # CTE query to count how many trips from the uploaded file don't exist in the database
-        cte_query = (
-            With(
-                "file_trips",
-                Select(unnest(Array(trip_hashes)).As("trip_hash"))
-            )
-            .Then(
-                Select(Count(RawExpression("*")))
-                .From("file_trips")
-                .Where(
-                    NotExists(
-                        Select(RawExpression("1"))
-                        .From(TripDB)
-                        .Where(TripDB.trip_hash == RawExpression("file_trips.trip_hash"))
-                        .And(TripDB.location_id == location.id)
-                    )
-                )
-            )
+        # Query which hashes already exist for this location
+        existing_query = (
+            Select(TripDB.trip_hash)
+            .Where(TripDB.location_id == location.id)
+            .Where(TripDB.trip_hash.In(trip_hashes))
         )
+        existing_rows = await session.exec(existing_query).all()
+        existing_hashes = {str(r) for r in existing_rows}
 
-        result = await session.exec(cte_query).first()
+        # Filter out duplicates — keep only genuinely new trips
+        trips_import = [t for t in trips_import if t.trip_hash not in existing_hashes]
+        duplicate_count = total_trips - len(trips_import)
 
-        # Extraer el valor del COUNT - psqlmodel devuelve un Row con la clave 'count'
-        if hasattr(result, 'count') and not callable(result.count):
-            new_trips_count = int(result.count)
-        elif isinstance(result, dict):
-            new_trips_count = int(result.get('count', 0))
-        elif hasattr(result, '__getitem__'):
-            try:
-                new_trips_count = int(result['count'])
-            except (KeyError, TypeError):
-                new_trips_count = int(list(result.values())[0]) if hasattr(result, 'values') else 0
-        else:
-            new_trips_count = int(result) if result else 0
-
-        # If less than 90% of trips are new, the file was likely already uploaded
-        new_trips_percentage = (new_trips_count / total_trips) * 100
-
-        if new_trips_percentage < 90:
+        if len(trips_import) == 0:
             raise HTTPException(
                 status_code=409,
-                detail="This file has already been uploaded. Most trips in this file already exist in the database."
+                detail="This file has already been uploaded. All trips in this file already exist in the database."
             )
+
+        if duplicate_count > 0:
+            print(f"[DEDUP] Skipped {duplicate_count}/{total_trips} duplicate trips for location {location.id}")
 
     # Crear los trips
 
@@ -537,18 +519,18 @@ async def create_trip(
                 location_airport_code=location.name  # location.name contiene el código
             )
 
-        # Calcular trip_hash con los mismos campos que trip_importer
-        trip_hash = hash((
-            trip_payload["pick_up_date"],
-            trip_payload["pick_up_time"],
-            trip_payload["pick_up_location"],
-            trip_payload["drop_off_location"],
-            trip_payload["airline"],
-            trip_payload["flight_number"],
-            tuple(sorted(trip_payload["riders"].items())),
-            trip_payload["trip_type"]
-        ))
-        trip_payload["trip_hash"] = str(trip_hash)
+        # Calcular trip_hash (deterministic SHA-256)
+        from features.trips.utils.trip_hash import compute_trip_hash
+        trip_payload["trip_hash"] = compute_trip_hash(
+            pick_up_date=trip_payload["pick_up_date"],
+            pick_up_time=trip_payload["pick_up_time"],
+            pick_up_location=trip_payload["pick_up_location"],
+            drop_off_location=trip_payload["drop_off_location"],
+            airline=trip_payload["airline"],
+            flight_number=trip_payload["flight_number"],
+            riders=trip_payload["riders"],
+            trip_type=trip_payload["trip_type"],
+        )
 
         trip = TripDB(location_id=location_uuid, **trip_payload)
         session.add(trip)
@@ -1308,6 +1290,23 @@ async def edit_trip(
             location_airport_code=location.name
         )
 
+    # Recalcular trip_hash si cambiaron campos que forman parte del hash
+    hash_fields = {"pick_up_date", "pick_up_time", "pick_up_location",
+                   "drop_off_location", "airline", "flight_number",
+                   "riders", "trip_type"}
+    if hash_fields & set(update_data.keys()):
+        from features.trips.utils.trip_hash import compute_trip_hash
+        update_data["trip_hash"] = compute_trip_hash(
+            pick_up_date=update_data.get("pick_up_date", trip.pick_up_date),
+            pick_up_time=update_data.get("pick_up_time", trip.pick_up_time),
+            pick_up_location=update_data.get("pick_up_location", trip.pick_up_location),
+            drop_off_location=update_data.get("drop_off_location", trip.drop_off_location),
+            airline=update_data.get("airline", trip.airline),
+            flight_number=update_data.get("flight_number", trip.flight_number),
+            riders=update_data.get("riders", trip.riders),
+            trip_type=update_data.get("trip_type", trip.trip_type),
+        )
+
     for key, value in update_data.items():
         setattr(trip, key, value)
 
@@ -1319,9 +1318,7 @@ async def edit_trip(
     time_format = await get_user_time_format(request, session)
     trip = model_dump_with_time_format(trip, time_format)
 
-    print("TRIP UPDATED: ", trip)
-
-    return JSONResponse(content={"status": "ok", "trip": trip})
+    return JSONResponse(content=trip)
 
 
 

@@ -27,3 +27,4 @@ from .drivers.driver_expenses import DriverExpense, ExpenseType, ExpenseStatus
 from .drivers.driver_tax_information import DriverTaxInformation, TINType
 from .drivers.form_1099_archive import Form1099Archive, DeliveryMethod
 from .ratings.driver_ratings import DriverRating, RatingStamp
+from .billing.subscriptions import Subscription, PlanType, SubscriptionStatus
