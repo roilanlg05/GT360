@@ -2,9 +2,12 @@ from fastapi import WebSocket
 from typing import Dict, Set, Optional, Any
 import asyncio
 import json
+import logging
 from datetime import datetime, timezone
 
 from shared.redis.redis_client import redis_client as redis
+
+logger = logging.getLogger(__name__)
 
 
 class DriverLocationWSManager:
@@ -84,9 +87,28 @@ class DriverLocationWSManager:
         location_id: str,
         driver_info: dict,
     ) -> None:
-        """Register a driver WebSocket in the location-scoped room."""
+        """Register a driver WebSocket in the location-scoped room.
+
+        If the same driver_id already has an active connection, the old
+        one is evicted (session takeover) to prevent duplicate broadcasts
+        and race conditions on disconnect cleanup.
+        """
         room_key = f"{org_id}:{location_id}"
+        old_ws: Optional[WebSocket] = None
+
         async with self._lock:
+            # Evict previous connection for the same driver_id
+            for existing_ws, meta in list(self.driver_ws_meta.items()):
+                if meta.get("driver_id") == driver_id:
+                    old_ws = existing_ws
+                    old_room_key = f"{meta['org_id']}:{meta['location_id']}"
+                    self.driver_rooms.get(old_room_key, set()).discard(existing_ws)
+                    if old_room_key in self.driver_rooms and not self.driver_rooms[old_room_key]:
+                        self.driver_rooms.pop(old_room_key, None)
+                    self.driver_ws_meta.pop(existing_ws, None)
+                    break
+
+            # Register new connection
             self.driver_rooms.setdefault(room_key, set()).add(ws)
             self.driver_ws_meta[ws] = {
                 "org_id": org_id,
@@ -94,6 +116,13 @@ class DriverLocationWSManager:
                 "location_id": location_id,
                 "driver_info": driver_info,
             }
+
+        # Close old connection outside the lock to avoid deadlocks
+        if old_ws:
+            try:
+                await old_ws.close(code=4001, reason="New connection established")
+            except Exception:
+                pass
 
     async def disconnect_driver(self, ws: WebSocket) -> None:
         """Remove a driver WebSocket from its room."""
@@ -214,9 +243,16 @@ class DriverLocationWSManager:
         await redis.publish(channel, serialized)
 
     async def remove_driver_location(self, org_id: str, driver_id: str) -> None:
-        """Remove a driver's location from the Redis hash on disconnect."""
+        """Remove a driver's location from the Redis hash and notify managers."""
         hash_key = f"driver_locations:{org_id}"
-        await redis.hdel(hash_key, driver_id)
+        removed = await redis.hdel(hash_key, driver_id)
+        if removed:
+            channel = f"driver_locations:{org_id}"
+            offline_payload = json.dumps({
+                "type": "driver_offline",
+                "driver_id": driver_id,
+            })
+            await redis.publish(channel, offline_payload)
 
     async def get_all_driver_locations(
         self,
@@ -411,6 +447,89 @@ class DriverLocationWSManager:
                 await pubsub.close()
             except Exception:
                 pass
+
+    # ─── Stale driver cleanup ────────────────────────────────────────────
+
+    _STALE_THRESHOLD_SECONDS = 180  # 3 minutes
+
+    def start_cleanup_task(self) -> None:
+        """Start the periodic task that removes stale driver locations."""
+        if hasattr(self, "_cleanup_task") and self._cleanup_task and not self._cleanup_task.done():
+            return
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+
+    def stop_cleanup_task(self) -> None:
+        """Cancel the cleanup task."""
+        task = getattr(self, "_cleanup_task", None)
+        if task and not task.done():
+            task.cancel()
+
+    async def _cleanup_loop(self) -> None:
+        """Run cleanup every 60 seconds."""
+        try:
+            while True:
+                await asyncio.sleep(60)
+                await self._remove_stale_locations()
+        except asyncio.CancelledError:
+            pass
+
+    async def _remove_stale_locations(self) -> None:
+        """Scan all driver_locations:* hashes, remove entries older than threshold."""
+        now = datetime.now(timezone.utc)
+        cursor = None
+        while cursor != 0:
+            cursor, keys = await redis.scan(
+                cursor=cursor or 0,
+                match="driver_locations:*",
+                count=100,
+            )
+            for key in keys:
+                if isinstance(key, (bytes, bytearray)):
+                    key = key.decode("utf-8")
+
+                # Extract org_id from key pattern "driver_locations:{org_id}"
+                org_id = key.split(":", 1)[1] if ":" in key else None
+                if not org_id:
+                    continue
+
+                raw = await redis.hgetall(key)
+                for driver_id, value in raw.items():
+                    if isinstance(driver_id, (bytes, bytearray)):
+                        driver_id = driver_id.decode("utf-8")
+                    if isinstance(value, (bytes, bytearray)):
+                        value = value.decode("utf-8")
+
+                    try:
+                        entry = json.loads(value)
+                    except Exception:
+                        await redis.hdel(key, driver_id)
+                        continue
+
+                    updated_at_str = entry.get("updated_at")
+                    if not updated_at_str:
+                        await redis.hdel(key, driver_id)
+                        continue
+
+                    try:
+                        updated_at = datetime.fromisoformat(updated_at_str)
+                    except (ValueError, TypeError):
+                        await redis.hdel(key, driver_id)
+                        continue
+
+                    age = (now - updated_at).total_seconds()
+                    if age > self._STALE_THRESHOLD_SECONDS:
+                        await redis.hdel(key, driver_id)
+                        # Notify managers so the driver disappears from Mapbox
+                        channel = f"driver_locations:{org_id}"
+                        offline_payload = json.dumps({
+                            "type": "driver_offline",
+                            "driver_id": driver_id,
+                        })
+                        await redis.publish(channel, offline_payload)
+                        logger.info(
+                            "Removed stale location for driver %s in org %s (age: %.0fs)",
+                            driver_id, org_id, age,
+                        )
 
 
 driver_location_manager = DriverLocationWSManager()

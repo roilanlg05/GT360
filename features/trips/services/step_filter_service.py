@@ -2188,6 +2188,48 @@ class StepFilterService:
                 ))
                 days_skipped += 1
 
+        # Apply to dates OUTSIDE the requested range that don't have this filter
+        # This handles "orphan" dates (e.g., Jan 31 in a Feb upload)
+        processed_dates = set(d.date() if hasattr(d, 'date') else d for d in dates)
+        all_location_dates = await self._get_dates_with_eligible_trips(
+            location_id, airline, date(2000, 1, 1), None
+        )
+
+        for pick_up_date in all_location_dates:
+            if pick_up_date in processed_dates:
+                continue
+
+            has_this_filter = await self._day_has_active_stack(
+                location_id, airline, pick_up_date,
+                filter_type=config.filter_type
+            )
+            if has_this_filter:
+                continue
+
+            day_config = FilterStepConfig(
+                filter_type=config.filter_type,
+                pick_up_date=str(pick_up_date),
+                windows=config.windows,
+            )
+
+            try:
+                result = await self.apply_step(location_id, airline, day_config)
+                by_date.append(DayResult(
+                    pick_up_date=str(pick_up_date),
+                    trips_modified=result.trips_modified,
+                    exclusions_count=len(result.exclusions),
+                    step_id=result.step_id,
+                    skipped=False,
+                ))
+                all_changes.extend(result.changes)
+                days_processed += 1
+
+                logger.info(
+                    f"[BULK_FILTER] Orphan date {pick_up_date}: applied {config.filter_type}"
+                )
+            except Exception as e:
+                logger.error(f"[BULK_FILTER] Error on orphan {pick_up_date}: {e}")
+
         logger.info(
             f"[BULK_FILTER] Completed: {days_processed} days processed, "
             f"{days_skipped} skipped, {sum(d.trips_modified for d in by_date)} trips modified"

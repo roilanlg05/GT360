@@ -148,6 +148,11 @@ class WSManager:
                     await self.route_location_event(location_id, ev)
                     continue
 
+                # Handle trips_deleted and batch_delete_started events - forward to clients
+                if event_type in ("trips_deleted", "batch_delete_started"):
+                    await self.route_location_event(location_id, ev)
+                    continue
+
                 # Handle trips_batch events
                 if event_type != "trips_batch":
                     continue

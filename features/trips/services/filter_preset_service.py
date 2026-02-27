@@ -55,24 +55,24 @@ class FilterPresetService:
         existing = await self.get_preset(location_id, airline)
 
         if existing:
-            # Update existing - Get the actual object and modify it
-            query = (
-                Select(FilterPresetDB)
+            # Update existing using raw UPDATE to avoid ORM JSONB dirty tracking issues
+            update_stmt = (
+                Update(FilterPresetDB)
                 .Where(FilterPresetDB.location_id == location_id)
                 .Where(FilterPresetDB.airline == airline)
+                .Set(
+                    stack_template=stack_template,
+                    updated_at=datetime.utcnow(),
+                )
             )
-            preset_obj = await self.session.exec(query).first()
-
-            if preset_obj:
-                preset_obj.stack_template = stack_template
-                preset_obj.updated_at = datetime.utcnow()
-                self.session.add(preset_obj)
-                await self.session.commit()
+            await self.session.exec(update_stmt)
+            await self.session.commit()
 
             # Fetch updated
             preset = await self.get_preset(location_id, airline)
             logger.info(
-                f"[PRESET] Updated preset for location={location_id}, airline={airline}"
+                f"[PRESET] Updated preset for location={location_id}, airline={airline}: "
+                f"{[t['filter_type'] for t in stack_template]}"
             )
             return preset
 
@@ -88,6 +88,7 @@ class FilterPresetService:
             )
             self.session.add(preset)
             await self.session.commit()
+            await self.session.refresh(preset)
 
             logger.info(
                 f"[PRESET] Created preset {preset_id} for location={location_id}, airline={airline}"
@@ -404,7 +405,7 @@ class FilterPresetService:
         return AutoApplyResult(
             applied=True,
             days_processed=days_processed,
-            days_skipped=0,  # We don't skip anymore - we apply to existing stacks
+            days_skipped=0,
             trips_affected=total_trips_affected,
             stack_cloned_from_preset=days_processed > 0,
             days_with_existing_stack=days_with_existing_stack,
