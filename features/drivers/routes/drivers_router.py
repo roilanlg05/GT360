@@ -1,12 +1,16 @@
 from fastapi import APIRouter, HTTPException, Depends, Query, Request
-from psqlmodel import Select, AsyncSession
+from psqlmodel import Select, Delete, AsyncSession
 from shared.db.db_config import get_db
 from shared.db.schemas import Driver, User, Organization, Location, Trip as TripDB, TripStatus
-from features.auth.utils import verify_role
-from features.drivers.models.driver_models import DriverActiveUpdate, DriverDetailsUpdate, DriverResponse, DriverStatusResponse, DriverLocationSharingUpdate
+from features.auth.utils import verify_role, encode_token, revoke_all_user_refresh
+from features.auth.utils.smtp import send_email, get_confirmation_email_template
+from features.drivers.models.driver_models import DriverActiveUpdate, DriverDetailsUpdate, DriverResponse, DriverStatusResponse, DriverLocationSharingUpdate, DriverLocationUpdate
 from features.drivers.utils.location_ws_manager import driver_location_manager
+from shared.settings import settings
 from typing import Optional
 from uuid import UUID
+from datetime import timedelta
+import secrets
 
 
 router = APIRouter(tags=["Drivers"])
@@ -36,6 +40,47 @@ async def get_my_driver_status(
         raise HTTPException(status_code=403, detail="Driver no pertenece a esta organización")
 
     return DriverStatusResponse(id=str(driver.id), is_active=driver.is_active)
+
+
+@router.post("/v1/drivers/me/location", status_code=204)
+async def update_my_location(
+    request: Request,
+    data: DriverLocationUpdate,
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["driver"]))
+):
+    """
+    HTTP endpoint for driver location updates (used by background tasks
+    when WebSocket is unavailable, e.g. iOS background mode).
+
+    Writes to the same Redis hash and publishes to the same channel as the
+    WebSocket handler, so managers on Mapbox see updates identically.
+    """
+    user_data = request.state.user_data
+    driver_id = str(user_data.get("id"))
+    org_id = str(user_data.get("organization_id"))
+
+    driver_uuid = UUID(driver_id)
+    row = await session.exec(
+        Select(Driver.location_id, User.first_name, User.last_name)
+        .From(Driver)
+        .Join(User).On(Driver.id == User.id)
+        .Where(Driver.id == driver_uuid)
+    ).first()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Driver not found")
+
+    location_data = {
+        "driver_id": driver_id,
+        "first_name": row.first_name,
+        "last_name": row.last_name,
+        "location_id": str(row.location_id) if row.location_id else None,
+        "lat": data.lat,
+        "lng": data.lng,
+    }
+
+    await driver_location_manager.store_driver_location(org_id, driver_id, location_data)
 
 
 @router.patch("/v1/drivers/me/active", response_model=DriverStatusResponse)
@@ -82,6 +127,11 @@ async def set_my_driver_active_status(
     session.add(driver)
     await session.commit()
     await session.refresh(driver)
+
+    # When going offline, remove location from Redis so driver
+    # disappears from the manager's Mapbox map immediately.
+    if not data.is_active and org_id:
+        await driver_location_manager.remove_driver_location(str(org_id), str(user_id))
 
     return DriverStatusResponse(id=str(driver.id), is_active=driver.is_active)
 
@@ -152,7 +202,8 @@ async def get_drivers(
             User.email,
             User.phone,
             User.profile_pic,
-            User.created_at
+            User.created_at,
+            User.email_verified_at
         )
         .From(Driver)
         .Join(User).On(Driver.id == User.id)
@@ -204,7 +255,8 @@ async def get_drivers(
             "shift_start_time": row.shift_start_time.strftime("%H:%M") if row.shift_start_time else None,
             "shift_end_time": row.shift_end_time.strftime("%H:%M") if row.shift_end_time else None,
             "work_days": row.work_days,
-            "created_at": row.created_at.isoformat() if row.created_at else None
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "email_verified_at": row.email_verified_at.isoformat() if row.email_verified_at else None
         })
 
     return {
@@ -411,3 +463,125 @@ async def update_driver_location_sharing(
         "driver_location_sharing": org.driver_location_sharing,
         "organization_id": str(org.id),
     }
+
+
+# ─── Resend Verification Email ─────────────────────────────────────────────
+
+@router.post("/v1/organizations/{organization_id}/drivers/{driver_id}/resend-verification")
+async def resend_driver_verification_email(
+    organization_id: UUID,
+    driver_id: UUID,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["manager"]))
+):
+    """Resend the verification email to a driver who hasn't verified yet."""
+    user_data = request.state.user_data
+    user_org_id = user_data.get("organization_id")
+
+    if str(user_org_id) != str(organization_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this organization")
+
+    # Fetch driver and verify it belongs to the org
+    driver = await session.exec(
+        Select(Driver).Where(Driver.id == driver_id)
+    ).first()
+
+    if not driver:
+        raise HTTPException(status_code=404, detail="Driver not found")
+
+    if str(driver.organization_id) != str(organization_id):
+        raise HTTPException(status_code=403, detail="Driver does not belong to your organization")
+
+    # Fetch user record
+    user = await session.exec(
+        Select(User).Where(User.id == driver_id)
+    ).first()
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if user.email_verified_at:
+        raise HTTPException(status_code=400, detail="Email already verified")
+
+    # Generate new nonce and verification token
+    user.password_reset_nonce = secrets.token_urlsafe(16)
+    session.add(user)
+    await session.commit()
+
+    metadata = {
+        "email": user.email,
+        "purpose": "email_verification",
+        "nonce": user.password_reset_nonce
+    }
+
+    token = encode_token(str(user.id), metadata, expires_in=timedelta(hours=24))
+    confirmation_url = f"{settings.BASE_URL}/auth/verify-email/?token={token['access_token']}"
+    html_content = get_confirmation_email_template(confirmation_url)
+
+    await send_email(
+        user.email,
+        "Confirm Your Api360 Account",
+        html_content,
+        confirmation_url
+    )
+
+    return {"message": "Verification email resent successfully"}
+
+
+# ─── Delete Driver from Organization ───────────────────────────────────────
+
+@router.delete("/v1/organizations/{organization_id}/drivers/{driver_id}")
+async def delete_driver_from_organization(
+    organization_id: UUID,
+    driver_id: UUID,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+    _role=Depends(verify_role(["manager"]))
+):
+    """Remove a driver from the organization. This permanently deletes the driver's account."""
+    user_data = request.state.user_data
+    user_org_id = user_data.get("organization_id")
+
+    if str(user_org_id) != str(organization_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this organization")
+
+    # Fetch driver and verify it belongs to the org
+    driver = await session.exec(
+        Select(Driver).Where(Driver.id == driver_id)
+    ).first()
+
+    if not driver:
+        raise HTTPException(status_code=404, detail="Driver not found")
+
+    if str(driver.organization_id) != str(organization_id):
+        raise HTTPException(status_code=403, detail="Driver does not belong to your organization")
+
+    # Check driver has no active trips
+    active_trips = await session.exec(
+        Select(TripDB).Where(
+            (TripDB.assigned_driver == driver_id) &
+            (TripDB.status == TripStatus.EN_ROUTE)
+        )
+    ).all()
+
+    if active_trips:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot delete driver with {len(active_trips)} active trip(s). Complete all trips first."
+        )
+
+    # Revoke all refresh tokens
+    await revoke_all_user_refresh(session, str(driver_id))
+
+    # Delete driver record first (FK constraint), then user
+    await session.exec(
+        Delete(Driver).Where(Driver.id == driver_id)
+    )
+    await session.exec(
+        Delete(User).Where(User.id == driver_id)
+    )
+
+    await session.commit()
+
+    return {"message": "Driver removed from organization successfully"}

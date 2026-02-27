@@ -171,27 +171,42 @@ async def upload_trips(
     existing_hashes: set[str] = set()
 
     if total_trips > 0:
-        # Query which hashes already exist for this location
+        # Query which hashes already exist for this location.
+        # NOTE: r[0] is required — RowResult.__repr__ returns "('hash',)" not "hash",
+        # so str(r) would never match the plain hash string.
         existing_query = (
             Select(TripDB.trip_hash)
             .Where(TripDB.location_id == location.id)
             .Where(TripDB.trip_hash.In(trip_hashes))
         )
         existing_rows = await session.exec(existing_query).all()
-        existing_hashes = {str(r) for r in existing_rows}
+        existing_hashes = {r[0] for r in existing_rows}
 
-        # Filter out duplicates — keep only genuinely new trips
+        # Filter out trips that already exist in the DB for this location
         trips_import = [t for t in trips_import if t.trip_hash not in existing_hashes]
         duplicate_count = total_trips - len(trips_import)
-
-        if len(trips_import) == 0:
-            raise HTTPException(
-                status_code=409,
-                detail="This file has already been uploaded. All trips in this file already exist in the database."
-            )
-
         if duplicate_count > 0:
             print(f"[DEDUP] Skipped {duplicate_count}/{total_trips} duplicate trips for location {location.id}")
+
+    # Deduplicate within the file itself (same hash appearing multiple times in the
+    # Excel). This is separate from the DB check above because on a first upload the
+    # DB has no rows yet, so intra-file twins both pass the DB check.
+    seen_in_file: set[str] = set()
+    deduped: list = []
+    for t in trips_import:
+        if t.trip_hash not in seen_in_file:
+            seen_in_file.add(t.trip_hash)
+            deduped.append(t)
+    intra_file_dups = len(trips_import) - len(deduped)
+    if intra_file_dups:
+        print(f"[DEDUP] Skipped {intra_file_dups} intra-file duplicate trips")
+    trips_import = deduped
+
+    if len(trips_import) == 0:
+        raise HTTPException(
+            status_code=409,
+            detail="This file has already been uploaded. All trips in this file already exist in the database."
+        )
 
     # Crear los trips
 
@@ -531,6 +546,15 @@ async def create_trip(
             riders=trip_payload["riders"],
             trip_type=trip_payload["trip_type"],
         )
+
+        # Duplicate check: reject if this exact trip already exists in this location
+        existing_trip = await session.exec(
+            Select(TripDB.id)
+            .Where(TripDB.location_id == location_uuid)
+            .Where(TripDB.trip_hash == trip_payload["trip_hash"])
+        ).first()
+        if existing_trip:
+            raise HTTPException(status_code=409, detail="Este trip ya existe en esta location.")
 
         trip = TripDB(location_id=location_uuid, **trip_payload)
         session.add(trip)
@@ -1032,10 +1056,43 @@ async def delete_all_trips(
     if not location:
         raise HTTPException(status_code=404, detail="Location not found")
 
+    # Publicar batch_delete_started ANTES del DELETE para que el frontend suprima notificaciones WAL
+    await safe_redis_call(
+        redis.publish,
+        f"loc:{location_id}",
+        json.dumps({"type": "batch_delete_started", "location_id": location_id, "airline": None}),
+        context=f"publish loc:{location_id} batch_delete_started",
+    )
+
     # Eliminar todos los trips de la location y commitear
     del_stmt = Delete(TripDB).Where(TripDB.location_id == uuid_location_id)
     await session.exec(del_stmt)
     await session.commit()
+
+    # Fix #1: Limpiar Redis cache para evitar snapshots stale post-reconexión
+    idx_key = f"loc:{location_id}:trips"
+    cached_ids = await redis.smembers(idx_key)
+    if cached_ids:
+        pipe = redis.pipeline()
+        for raw_id in cached_ids:
+            tid = raw_id.decode("utf-8", errors="ignore") if isinstance(raw_id, (bytes, bytearray)) else str(raw_id)
+            pipe.delete(f"trip:{tid}")
+        pipe.delete(idx_key)
+        await pipe.execute()
+        print(f"[DELETE_ALL] Cleared {len(cached_ids)} trip keys from Redis for loc:{location_id}")
+
+    # Fix #2: Notificar via WebSocket que todos los trips fueron borrados
+    await safe_redis_call(
+        redis.publish,
+        f"loc:{location_id}",
+        json.dumps({
+            "type": "trips_deleted",
+            "location_id": location_id,
+            "trips_deleted_count": len(cached_ids) if cached_ids else 0,
+            "airline": None
+        }),
+        context=f"publish loc:{location_id} trips_deleted",
+    )
 
     return Response(status_code=204)
 
@@ -1189,6 +1246,14 @@ async def delete_trips_by_airline(
             }
         }
 
+    # Publicar batch_delete_started ANTES del DELETE para que el frontend suprima notificaciones WAL
+    await safe_redis_call(
+        redis.publish,
+        f"loc:{location_id}",
+        json.dumps({"type": "batch_delete_started", "location_id": location_id, "airline": airline}),
+        context=f"publish loc:{location_id} batch_delete_started",
+    )
+
     # Construir DELETE statement con los mismos filtros
     del_stmt = (
         Delete(TripDB)
@@ -1205,6 +1270,31 @@ async def delete_trips_by_airline(
     # Ejecutar DELETE
     await session.exec(del_stmt)
     await session.commit()
+
+    # Fix #1: Limpiar Redis cache para los trips borrados
+    trip_id_strings = [str(row[0]) for row in trips_to_delete]
+    pipe = redis.pipeline()
+    idx_key = f"loc:{location_id}:trips"
+    for tid in trip_id_strings:
+        pipe.delete(f"trip:{tid}")
+        pipe.srem(idx_key, tid)
+    await pipe.execute()
+    print(f"[DELETE_AIRLINE] Cleared {trips_count} trip keys from Redis for loc:{location_id}/airline:{airline}")
+
+    # Fix #2: Notificar via WebSocket que los trips fueron borrados
+    await safe_redis_call(
+        redis.publish,
+        f"loc:{location_id}",
+        json.dumps({
+            "type": "trips_deleted",
+            "location_id": location_id,
+            "trips_deleted_count": trips_count,
+            "airline": airline,
+            "pick_up_date": pick_up_date,
+            "status": status
+        }),
+        context=f"publish loc:{location_id} trips_deleted",
+    )
 
     return {
         "status": "ok",
@@ -1387,6 +1477,7 @@ async def edit_location(
 @router.delete("/v1/locations/{location_id}")
 async def delete_location(
     location_id: str,
+    request: Request,
     session: AsyncSession = Depends(get_db),
     _role=Depends(verify_role(["manager"]))
 ):
@@ -1409,6 +1500,8 @@ async def delete_location(
     # Guardar datos antes de eliminar para el mensaje WebSocket
     location_name = location.name
     org_id = str(location.organization_id)
+    user_data = request.state.user_data
+    deleted_by = user_data.get("id")
 
     # Contar trips y hotels antes de eliminar
     trips_count_result = await session.exec(
@@ -1421,71 +1514,51 @@ async def delete_location(
     ).first()
     hotels_count = hotels_count_result[0] if hotels_count_result else 0
 
-    # 1. Publicar evento "location_delete_started" para que el frontend ignore los batches del streaming
-    #    Publicamos a AMBOS canales para que llegue a usuarios conectados a /ws/trips y /ws/org
-    start_event = {
-        "type": "location_delete_started",
-        "location_id": location_id,
-        "location_name": location_name,
-        "trips_count": trips_count,
-        "hotels_count": hotels_count
-    }
-    start_event_json = json.dumps(start_event)
-    await safe_redis_call(
-        redis.publish,
-        f"org:{org_id}",
-        start_event_json,
-        context=f"publish org:{org_id}",
-    )
-    await safe_redis_call(
-        redis.publish,
-        f"loc:{location_id}",
-        start_event_json,
-        context=f"publish loc:{location_id}",
-    )
+    # Publicar location_delete_started ANTES del DELETE para que el frontend suprima notificaciones WAL
+    if trips_count > 0:
+        await safe_redis_call(
+            redis.publish,
+            f"loc:{location_uuid}",
+            json.dumps({"type": "location_delete_started", "location_id": location_id, "location_name": location_name}),
+            context=f"publish loc:{location_uuid} location_delete_started",
+        )
 
-    # 2. Eliminar trips manualmente primero
+    # 1. Eliminar trips manualmente primero
     if trips_count > 0:
         await session.exec(
             Delete(TripDB).Where(TripDB.location_id == location_uuid)
         )
 
-    # 3. Eliminar hotels asociados
+    # 2. Eliminar hotels asociados
     if hotels_count > 0:
         await session.exec(
             Delete(Hotel).Where(Hotel.location_id == location_uuid)
         )
 
-    # 4. Eliminar la location
+    # 3. Eliminar la location
     await session.exec(
         Delete(Location).Where(Location.id == location_uuid)
     )
 
     await session.commit()
 
-    # 5. Publicar evento "location_deleted" con resumen final consolidado
-    #    Publicamos a AMBOS canales para que llegue a usuarios conectados a /ws/trips y /ws/org
+    # 4. Publicar UN solo evento "location_deleted" al canal org:{id}
+    #    Incluye deleted_by para que el frontend distinga self-deletions
     deleted_event = {
         "type": "location_deleted",
         "location_id": location_id,
         "location_name": location_name,
         "trips_deleted": trips_count,
         "hotels_deleted": hotels_count,
+        "deleted_by": deleted_by,
         "message": f"Location {location_name} deleted",
         "detail": f"{trips_count} trips and {hotels_count} hotels also deleted"
     }
-    deleted_event_json = json.dumps(deleted_event)
     await safe_redis_call(
         redis.publish,
         f"org:{org_id}",
-        deleted_event_json,
+        json.dumps(deleted_event),
         context=f"publish org:{org_id}",
-    )
-    await safe_redis_call(
-        redis.publish,
-        f"loc:{location_id}",
-        deleted_event_json,
-        context=f"publish loc:{location_id}",
     )
 
     return JSONResponse(status_code=200, content={

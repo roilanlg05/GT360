@@ -154,10 +154,11 @@ async def ws_driver_locations(
             except Exception:
                 pass
         finally:
-            # Clean up driver connection and remove location from Redis
+            # Clean up driver WS connection from in-memory rooms.
+            # Do NOT remove location from Redis — the driver may still be
+            # sending updates via HTTP (background mode). The stale cleanup
+            # task handles removal of truly inactive drivers.
             await driver_location_manager.disconnect_driver(ws)
-            if driver_location_id:
-                await driver_location_manager.remove_driver_location(org_id, driver_id)
 
     # ─── MANAGER flow ─────────────────────────────────────────────────────────
     else:

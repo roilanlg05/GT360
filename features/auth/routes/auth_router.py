@@ -344,7 +344,7 @@ async def sign_in(
         }
     }
     
-@router.post("/sign-out/", status_code=200)
+@router.post("/sign-out", status_code=200)
 async def sign_out(
     request: Request,
     response: Response,

@@ -65,3 +65,8 @@ class DriverDetailsUpdate(BaseModel):
 
 class DriverLocationSharingUpdate(BaseModel):
     driver_location_sharing: bool
+
+
+class DriverLocationUpdate(BaseModel):
+    lat: float
+    lng: float

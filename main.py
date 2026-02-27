@@ -27,6 +27,7 @@ from features.drivers.routes.manager_expenses_router import router as manager_ex
 from features.drivers.routes.manager_1099_router import router as manager_1099_router
 from features.drivers.routes.rating_router import router as rating_router
 from features.drivers.websockets.location_websocket import router as driver_location_ws_router
+from features.drivers.utils.location_ws_manager import driver_location_manager
 from features.trips.routes.step_filter_router import router as step_filter_router
 from features.trips.routes.filter_preset_router import router as filter_preset_router
 from features.trips.routes.test_filter_router import router as test_filter_router
@@ -72,9 +73,12 @@ async def lifespan(app: FastAPI):
         await _s.commit()
     # Start DWELL checker background job (runs every 60 seconds)
     #dwell_checker.start(interval_seconds=60)
+    # Start stale driver location cleanup (removes entries >3 min old)
+    driver_location_manager.start_cleanup_task()
     yield
     # Stop DWELL checker on shutdown
     #await dwell_checker.stop()
+    driver_location_manager.stop_cleanup_task()
     await engine.dispose_async()
 
 app = FastAPI(title="GT360", version="0.1.0", lifespan=lifespan)

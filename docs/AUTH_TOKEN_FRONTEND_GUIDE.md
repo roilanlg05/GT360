@@ -10,7 +10,7 @@ Complete backend reference for implementing token lifecycle management, session 
 
 | Token | Type | Duration | Storage | Transport |
 |-------|------|----------|---------|-----------|
-| **Access Token** | JWT (HS256) | 60 minutes | Client memory (never localStorage) | `Authorization: Bearer <token>` header |
+| **Access Token** | JWT (HS256) | `TOKEN_DURATION` env var (minutes) | Client memory (never localStorage) | `Authorization: Bearer <token>` header |
 | **Refresh Token** | Opaque (`secrets.token_urlsafe(64)`) | 30 days | HTTP-only cookie (auto-sent) + response body | Cookie auto-sent on same-domain requests |
 
 ### Authentication Flow Diagram
@@ -29,7 +29,7 @@ sequenceDiagram
         B-->>C: 200 {data: ...}
     end
 
-    Note over C: Token expires after 60 min
+    Note over C: Token expires after TOKEN_DURATION min
     C->>B: GET /v1/... (Authorization: Bearer <expired_token>)
     B-->>C: 401 {detail: "Invalid token"}
 
@@ -43,10 +43,19 @@ sequenceDiagram
 
 ---
 
-## 2. API Response Formats
+## 2. API Endpoints & Response Formats
 
-### Sign-In Response (`POST /v1/auth/sign-in`)
+### Sign-In (`POST /v1/auth/sign-in`)
 
+**Request Body:**
+```json
+{
+  "email": "user@example.com",
+  "password": "MyP@ssw0rd"
+}
+```
+
+**Response (200):**
 ```json
 {
   "data": {
@@ -57,12 +66,12 @@ sequenceDiagram
     },
     "refresh_token": {
       "refresh": "abc123...",
-      "expires_at": "2026-03-21T15:30:00+00:00"
+      "expires_at": "2026-03-25T15:30:00+00:00"
     },
     "user_data": {
       "id": "uuid-here",
       "email": "user@example.com",
-      "phone": "+1234567890",
+      "phone": "+15551234567",
       "role": "manager",
       "first_name": "John",
       "last_name": "Doe",
@@ -75,10 +84,25 @@ sequenceDiagram
 
 > **Note:** `session.expires_at` is a **Unix timestamp in seconds** (not milliseconds). Convert with `expires_at * 1000` for JavaScript `Date`.
 
-### Refresh Response (`POST /v1/auth/refresh`)
+**Cookies Set:**
+- `refresh_token`: HTTP-only, Secure, SameSite=Lax, Domain=`.gt360.app`, Path=`/`, MaxAge=30 days
+- `expires_at`: HTTP-only, Secure, SameSite=Lax, Domain=`.gt360.app`, Path=`/`, MaxAge=30 days
 
-Identical format to sign-in:
+### Refresh (`POST /v1/auth/refresh`)
 
+The refresh token can be sent via **cookie** (automatic) or **request body**:
+
+```json
+{
+  "refresh_token": "abc123...",
+  "refresh": "abc123...",
+  "token": "abc123..."
+}
+```
+
+Any of the three body fields is accepted. If none provided, the `refresh_token` cookie is used.
+
+**Response (200):** Identical format to sign-in:
 ```json
 {
   "data": {
@@ -87,32 +111,160 @@ Identical format to sign-in:
       "expires_at": 1740003600,
       "type": "Bearer"
     },
-    "refresh_token": {
-      "refresh": "new-token-abc...",
-      "expires_at": "2026-03-21T15:30:00+00:00"
-    },
     "user_data": {
       "id": "uuid-here",
       "email": "user@example.com",
+      "phone": "+15551234567",
       "role": "manager",
-      ...
+      "first_name": "John",
+      "last_name": "Doe",
+      "profile_pic": "url-or-null",
+      "organization_id": "org-uuid"
+    },
+    "refresh_token": {
+      "refresh": "new-token-abc...",
+      "expires_at": "2026-03-25T15:30:00+00:00"
     }
   }
 }
 ```
 
-### Sign-Out Response (`POST /v1/auth/sign-out/`)
+### Sign-Out (`POST /v1/auth/sign-out/`)
 
+> **Note:** Trailing slash required in the path.
+
+**Requires:** Valid Bearer token in Authorization header.
+
+**Response (200):**
 ```json
 {
   "message": "All cookies revoked"
 }
 ```
 
-Effects:
-- Access token blacklisted in Redis for 5 minutes
+**Effects:**
+- Access token blacklisted in Redis for 5 minutes (300 seconds)
 - ALL refresh tokens for the user revoked in database
 - Cookies `refresh_token` and `expires_at` deleted
+
+### Change Password (`PUT /v1/auth/change-password`)
+
+**Requires:** Valid Bearer token + `user_id` query parameter.
+
+**Request Body:**
+```json
+{
+  "current_password": "OldP@ssw0rd",
+  "new_password": "NewP@ssw0rd!"
+}
+```
+
+**Response (200):**
+```json
+{
+  "message": "Password reset successful. Please sign in again with your new password."
+}
+```
+
+**Effects:**
+- All refresh tokens revoked
+- Cookies cleared
+- User must sign in again
+
+**Errors:**
+| Status | `detail` | Cause |
+|--------|----------|-------|
+| 400 | `"The new password must be different from your current password."` | Same password |
+| 403 | `"Incorrect current password"` | Wrong current password |
+| 409 | `"The new password must be different from your current password."` | Same password (double-check) |
+
+### Forgot Password (`POST /v1/auth/forgot-password`)
+
+**Request Body:** Raw email string (not JSON object):
+```json
+"user@example.com"
+```
+
+**Response (200):**
+```json
+"If the email exists, you will receive a password reset link"
+```
+
+> Always returns the same message regardless of whether the email exists (security).
+
+### Reset Password (`POST /v1/auth/reset-password`)
+
+**Query Params:** `?token=<reset_token_from_email>`
+
+**Request Body:**
+```json
+{
+  "new_password": "NewP@ssw0rd!"
+}
+```
+
+**Response (200):**
+```json
+{
+  "message": "Password updated. Sign in again."
+}
+```
+
+**Effects:**
+- All refresh tokens revoked
+- Nonce invalidated (one-time use)
+- Cookies cleared
+
+**Errors:**
+| Status | `detail` | Cause |
+|--------|----------|-------|
+| 403 | `"Invalid or expired token"` | Token expired or invalid JWT |
+| 400 | `"Invalid reset token"` | Token purpose is not "password_reset" |
+| 404 | `"User not found"` | User no longer exists |
+| 400 | `"Token already used or invalid"` | Nonce already consumed |
+| 409 | `"The new password must be different from your current password."` | Same password |
+
+### Verify Email (`GET /v1/auth/verify-email`)
+
+**Query Params:** `?token=<verification_token_from_email>`
+
+**Response (200):**
+```json
+"Email verified successfully"
+```
+
+**Errors:**
+| Status | `detail` | Cause |
+|--------|----------|-------|
+| 304 | `"Email already verified"` | Already verified |
+| 400 | `"Token already used or invalid"` | Nonce consumed |
+| 400 | `"Invalid or expired token: ..."` | Catch-all for bad tokens |
+| 404 | `"User not found"` | User doesn't exist |
+
+### Verify Data (`POST /v1/auth/verify-data`)
+
+Pre-registration validation (check email/phone availability).
+
+**Request Body:**
+```json
+{
+  "email": "user@example.com",
+  "phone": "+15551234567"
+}
+```
+
+**Response (200):**
+```json
+{
+  "message": "Ok"
+}
+```
+
+**Errors:**
+| Status | `detail` | Cause |
+|--------|----------|-------|
+| 409 | `"Email already in use"` | Email taken |
+| 409 | `"Phone already in use"` | Phone taken |
 
 ### Roles in `user_data`
 
@@ -120,7 +272,6 @@ Effects:
 |------|----------------------------|
 | `manager` | `organization_id` |
 | `driver` | `organization_id`, `location_id` |
-| `crew` | (none extra) |
 
 ---
 
@@ -158,23 +309,27 @@ These are returned by the `VerifyToken` middleware when accessing any protected 
 |--------|---------------|-------|
 | **401** | `"Invalid credentials"` | Wrong email/password on sign-in |
 | **401** | `"Email not verified"` | User hasn't verified email |
+| **403** | `"Email not allowed for manager registration"` | Beta: email not in whitelist |
 | **409** | `"Email already in use"` | Registration with existing email |
-| **429** | `"Too many requests. Try again later."` | Rate limit exceeded (1000 req/hour) |
+| **409** | `"Organization name already exist"` | Duplicate org name on registration |
+| **429** | `"Too many requests. Try again later."` | Rate limit exceeded (1000 req/hour per IP+method+path) |
+
+> **Rate limit 429 response** includes a `retry_after` field (seconds) and a `Retry-After` header.
 
 ### Decision Rule
 
 ```
 Is it a 401 from /v1/auth/refresh?
-  YES → Session is dead → Redirect to login
+  YES -> Session is dead -> Redirect to login
 
 Is the detail "Token revoked"?
-  YES → User signed out → Redirect to login immediately
+  YES -> User signed out -> Redirect to login immediately
 
 Is it a 403?
-  YES → Permission error → Show error message, do NOT refresh
+  YES -> Permission error -> Show error message, do NOT refresh
 
 Is it any other 401?
-  YES → Token expired → Attempt silent refresh
+  YES -> Token expired -> Attempt silent refresh
 ```
 
 ---
@@ -348,7 +503,7 @@ async function signIn(email: string, password: string) {
 ```typescript
 async function signOut() {
   try {
-    await api.post('/v1/auth/sign-out/');
+    await api.post('/v1/auth/sign-out/'); // trailing slash required
   } finally {
     clearAuth();
     // Close all WebSocket connections
@@ -427,29 +582,70 @@ Call `scheduleProactiveRefresh(session.expires_at)` after:
 
 ## 6. WebSocket Auth & Reconnection
 
-### Three WebSocket Connections
+### Six WebSocket Connections
 
 | Endpoint | Query Params | Purpose |
 |----------|-------------|---------|
-| `ws/trips` | `location_id`, `token` | Real-time trip updates |
-| `ws/flights/push` | `location_id`, `flight_numbers`, `token` | Flight push notifications |
-| `ws/flights/tracking` | `token` | Live flight position tracking |
+| `ws/trips` | `location_id`, `token` | Real-time trip updates per location |
+| `ws/flights/push` | `location_id`, `flight_numbers`, `token` | Flight status push notifications |
+| `ws/flights/tracking` | `token` | Live flight position tracking (ADSB) |
+| `ws/org` | `organization_id`, `token` | Organization-level events (billing, location deletions) |
+| `ws/driver-locations` | `token`, `location_id` (optional, manager only) | Driver location sharing |
+| `ws/profile` | `token` | Real-time user profile updates |
 
-### Authentication Pattern (identical for all three)
+### Authentication Pattern (identical for all)
 
 1. **Connect:** Token passed as query parameter (NOT header - WebSocket limitation)
-2. **On connect:** Backend validates JWT. If invalid → close code `1008` immediately
+2. **On connect:** Backend validates JWT. If invalid -> close code `1008` immediately
 3. **Keep-alive ping:** Client sends `{"action": "ping", "token": "<current_token>"}` every 30 seconds
 4. **Ping response:**
    - Valid token: `{"type": "pong"}`
-   - Invalid/expired: `{"type": "error", "code": 401, "detail": "Invalid or expired token"}` → then close `1008`
+   - Invalid/expired: `{"type": "error", "code": 401, "detail": "Invalid or expired token"}` -> then close `1008`
 
 ### On Successful Connection
 
-Each WebSocket sends an initial snapshot:
-- **Trips WS:** `{"type": "snapshot", "location_id": "...", "location_info": {...}, "trips": [...]}`
-- **Flight push WS:** Snapshot of recent notifications
-- **Tracking WS:** Requires explicit `{"action": "track", "flights": [...]}` to start receiving positions
+Each WebSocket sends different initial messages:
+
+| WebSocket | Initial Message |
+|-----------|----------------|
+| **Trips** | `{"type": "snapshot", "location_id": "...", "location_info": {...}, "trips": [...]}` |
+| **Flight Push** | `{"type": "connected", "location_id": "...", "location_iata": "...", "flight_numbers": [...]}` + `{"type": "snapshot", "notifications": [...], "count": N}` |
+| **Flight Tracking** | `{"type": "connected"}` (then requires `track` action to start receiving data) |
+| **Org** | `{"type": "connected", "organization_id": "...", "message": "Connected to organization events"}` |
+| **Driver Locations** (manager) | `{"type": "snapshot", "drivers": [...]}` |
+| **Driver Locations** (driver) | `{"type": "driver_snapshot", "drivers": [...]}` (other drivers at same location, if sharing enabled) |
+| **Profile** | `{"type": "snapshot", "data": {profile_fields...}}` |
+
+### WebSocket Client Actions
+
+#### Trips WS
+- `{"action": "ping", "token": "..."}` - keep-alive
+- `{"action": "subscribe"}` - subscribe confirmation
+- `{"action": "unsubscribe"}` - unsubscribe from location
+
+#### Flight Push WS
+- `{"action": "ping", "token": "..."}` - keep-alive
+- `{"action": "subscribe", "flight_number": "WN1036"}` - add flight
+- `{"action": "unsubscribe", "flight_number": "WN1036"}` - remove flight
+
+#### Flight Tracking WS
+- `{"action": "ping", "token": "..."}` - keep-alive
+- `{"action": "track", "flight_number": "WN1036", "trip_id": "uuid", "origin_icao": "KSDF", "destination_icao": "KLAS"}` - start tracking (`origin_icao` and `destination_icao` are optional)
+- `{"action": "stop", "flight_number": "WN1036", "trip_id": "uuid"}` - stop tracking
+
+#### Org WS
+- `{"action": "ping", "token": "..."}` - keep-alive only (receives events passively)
+
+#### Driver Locations WS (driver role)
+- `{"action": "ping", "token": "..."}` - keep-alive
+- `{"action": "location_update", "lat": 38.174, "lng": -85.736}` - send location
+
+#### Driver Locations WS (manager role)
+- `{"action": "ping", "token": "..."}` - keep-alive only (receives driver updates passively)
+
+#### Profile WS
+- `{"action": "ping", "token": "..."}` - keep-alive
+- `{"action": "refresh"}` - request fresh profile snapshot
 
 ### Token Ref Pattern (Critical)
 
@@ -487,7 +683,7 @@ flowchart TD
     C --> D{Refresh succeeded?}
     D -->|YES| E[Reconnect WS with new token in query param]
     E --> F[Resume ping with tokenRef.current]
-    E --> G[WS sends initial snapshot automatically]
+    E --> G[WS sends initial data automatically]
     D -->|NO| H[Redirect to login]
 ```
 
@@ -531,8 +727,11 @@ function onWebSocketClose(event: CloseEvent) {
 | WebSocket | What happens on reconnect |
 |-----------|--------------------------|
 | **Trips** | Automatic snapshot with all current trips - no manual re-subscription needed |
-| **Flight Push** | Automatic snapshot of recent notifications |
-| **Flight Tracking** | Must re-send `{"action": "track", "flights": [...]}` for each tracked flight |
+| **Flight Push** | Automatic connected + snapshot of recent notifications |
+| **Flight Tracking** | Must re-send `{"action": "track", ...}` for each tracked flight |
+| **Org** | Automatic connected confirmation, events resume |
+| **Driver Locations** | Automatic snapshot of driver positions |
+| **Profile** | Automatic snapshot of profile data |
 
 ---
 
@@ -640,8 +839,8 @@ const preset = await api.get(
 ### Problem
 
 If the user has multiple tabs open:
-- Tab A refreshes the token → Tab B still has the old access token
-- Tab A signs out → Tab B doesn't know and keeps making requests
+- Tab A refreshes the token -> Tab B still has the old access token
+- Tab A signs out -> Tab B doesn't know and keeps making requests
 
 ### Solution: localStorage Event Sync
 
@@ -687,28 +886,30 @@ window.addEventListener('storage', (event) => {
 
 ## 10. Public Paths (No Auth Required)
 
-These endpoints do NOT require authentication (the middleware skips them):
+These endpoints do NOT require authentication (the middleware skips them via prefix matching):
 
 ```
+/v1/auth/register          (includes /register/manager and /register/driver)
 /v1/auth/sign-in
 /v1/auth/refresh
-/v1/auth/register
-/v1/auth/register/organization
 /v1/auth/verify-email
 /v1/auth/verify-data
 /v1/auth/forgot-password
 /v1/auth/reset-password
-/docs
-/redoc
-/openapi.json
-/health
-/ready
+/v1/auth/register/organization
 /v1/webhooks/trips
 /v1/webhooks/flights
+/v1/webhooks/stripe
 /v1/crew-lookup/config
 /v1/crew-lookup/health
 /v1/trips/search/qr
 /v1/support/contact
+/docs
+/redoc
+/openapi.json
+/favicon.ico
+/health
+/ready
 /uploads
 ```
 
@@ -718,7 +919,7 @@ The frontend should NOT attach `Authorization` headers or trigger refresh logic 
 
 ## 11. CORS Configuration
 
-### Allowed Origins
+### Allowed Origins (CORSMiddleware)
 
 ```
 https://www.gt360.com
@@ -726,6 +927,10 @@ https://dev.gt360.app
 https://gt360.app
 https://charmaine-leadless-ryleigh.ngrok-free.dev
 ```
+
+### Allowed Origins (Error Handlers)
+
+The HTTP exception handler also allows `https://web.gt360.app` and `http://192.168.1.101:3000/` for CORS on error responses.
 
 ### Cookie Domain
 
@@ -744,24 +949,41 @@ Without `withCredentials: true`, the browser will NOT send the `refresh_token` c
 
 ---
 
-## 12. Testing Checklist
+## 12. Password Requirements
 
-1. **Normal token expiry**: Wait 60 min (or set short `TOKEN_DURATION` in backend) → verify silent refresh works, no visible error
-2. **Refresh token expiry**: Revoke all refresh tokens in DB → verify redirect to login
-3. **Sign-out on another tab**: Sign out in Tab A → verify Tab B redirects to login
-4. **Network interruption during refresh**: Disconnect network briefly during refresh → verify retry, then redirect
-5. **WebSocket close 1008**: Let access token expire → verify WS reconnects with new token after refresh
-6. **WebSocket ping with expired token**: Verify error response → reconnect flow
-7. **Multiple concurrent 401s**: Fire 5+ API calls simultaneously with expired token → verify only ONE refresh call, all requests retry
-8. **Tab backgrounded >60 min**: Background tab, wait, foreground → verify `visibilitychange` triggers refresh
-9. **POST/PUT in-flight**: Start a mutation, let token expire during → verify it completes after refresh
-10. **403 role error**: Access manager endpoint as driver → verify NO redirect, shows permission error
-11. **Filters persist**: Apply filters → let token expire → re-auth → verify filters still present via GET stack
-12. **Post-login redirect**: Navigate to `/dashboard/locations/SDF/WN` → token expires → login → verify redirect back to same page
+All password fields (`password`, `new_password`) must meet:
+
+- Minimum 8 characters
+- At least 1 uppercase letter (A-Z)
+- At least 1 lowercase letter (a-z)
+- At least 1 digit (0-9)
+- At least 1 special character from: `` !@#$%^&*()_=+[]{};:,.<>?/\|~`'"- ``
+
+Validation errors return **422** with Pydantic validation detail.
 
 ---
 
-## 13. JWT Payload Reference
+## 13. Testing Checklist
+
+1. **Normal token expiry**: Wait for `TOKEN_DURATION` to elapse (or set it short in backend) -> verify silent refresh works, no visible error
+2. **Refresh token expiry**: Revoke all refresh tokens in DB -> verify redirect to login
+3. **Sign-out on another tab**: Sign out in Tab A -> verify Tab B redirects to login
+4. **Network interruption during refresh**: Disconnect network briefly during refresh -> verify retry, then redirect
+5. **WebSocket close 1008**: Let access token expire -> verify WS reconnects with new token after refresh
+6. **WebSocket ping with expired token**: Verify error response -> reconnect flow
+7. **Multiple concurrent 401s**: Fire 5+ API calls simultaneously with expired token -> verify only ONE refresh call, all requests retry
+8. **Tab backgrounded**: Background tab, wait past expiry, foreground -> verify `visibilitychange` triggers refresh
+9. **POST/PUT in-flight**: Start a mutation, let token expire during -> verify it completes after refresh
+10. **403 role error**: Access manager endpoint as driver -> verify NO redirect, shows permission error
+11. **Filters persist**: Apply filters -> let token expire -> re-auth -> verify filters still present via GET stack
+12. **Post-login redirect**: Navigate to `/dashboard/locations/SDF/WN` -> token expires -> login -> verify redirect back to same page
+13. **Flight tracking reconnect**: Track a flight -> reconnect WS -> verify must re-send `track` action
+14. **Org WS billing events**: Simulate payment failure -> verify billing event received via org WS
+15. **Driver locations WS**: Connect as driver -> send location_update -> verify manager receives it
+
+---
+
+## 14. JWT Payload Reference
 
 For debugging, the access token JWT payload contains:
 
@@ -772,7 +994,7 @@ For debugging, the access token JWT payload contains:
   "exp": 1740003600,
   "metadata": {
     "email": "user@example.com",
-    "phone": "+1234567890",
+    "phone": "+15551234567",
     "role": "manager",
     "first_name": "John",
     "last_name": "Doe",
@@ -782,5 +1004,7 @@ For debugging, the access token JWT payload contains:
   }
 }
 ```
+
+> **Note:** `location_id` is only present for `driver` role. `organization_id` is present for both `manager` and `driver`.
 
 > **Warning:** Never decode the JWT on the client for auth decisions. Always rely on the `expires_at` field from the API response for expiration timing.
