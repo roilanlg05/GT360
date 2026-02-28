@@ -9,7 +9,7 @@ from shared.db.db_config import get_db
 from shared.settings import settings
 from datetime import timedelta
 from features.auth.utils import(
-    verify_if_exist, hash_pwd, encode_token, 
+    verify_if_exist, hash_pwd, encode_token,
     decode_token, get_user_by_email, verify_password,
     gen_refresh_token, save_refresh_in_db, set_cookies,
     revoke_all_user_refresh, get_current_user, validate_refresh,
@@ -17,23 +17,17 @@ from features.auth.utils import(
 )
 from ..utils.smtp import send_email, get_confirmation_email_template, get_password_reset_email_template
 import secrets
+import json
+from pathlib import Path
 from pydantic import EmailStr
 from ..utils.validators import validators
 
 # --- BETA: Manager email whitelist (remove after beta) ---
-# Only emails in this set can register as managers.
-# To disable: delete this set and the check in register_manager().
-# To add more emails: add them below in lowercase.
-_MANAGER_EMAIL_WHITELIST: set[str] = {
-    "carlitoleo10@gmail.com",
-    "landgbnb@gmail.com",
-    "moradshopllc@gmail.com",
-    "roilan.lambert5@gmail.com",
-    "albertestalltime@gmail.com",
-    "enmausa93@icloud.com",
-    "dparra574@gmail.com",
-    "gtbeta00@gmail.com",
-}
+# Only emails in whitelist.json can register as managers.
+# To add/remove emails: edit features/auth/whitelist.json
+_MANAGER_EMAIL_WHITELIST: set[str] = set(
+    json.loads((Path(__file__).parent.parent / "whitelist.json").read_text())
+)
 # --- END BETA ---
 
 

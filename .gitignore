@@ -44,6 +44,10 @@ Thumbs.db
 .env.*
 *.env
 
+# Beta whitelist & CORS origins
+features/auth/whitelist.json
+features/auth/middlewares/allowed_origins.json
+
 # Cache
 .cache/
 
