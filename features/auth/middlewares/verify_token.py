@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from starlette.types import ASGIApp, Receive, Scope, Send
 from starlette.requests import Request
 from starlette.datastructures import State
@@ -17,13 +18,9 @@ class VerifyToken:
     issues with file uploads and streaming request bodies.
     """
 
-    ALLOWED_ORIGINS = [
-        "https://www.gt360.com",
-        "https://gt360.com",
-        "https://web.gt360.app",
-        "https://dev.gt360.app",
-        "https://charmaine-leadless-ryleigh.ngrok-free.dev"
-    ]
+    ALLOWED_ORIGINS: list[str] = json.loads(
+        (Path(__file__).parent / "allowed_origins.json").read_text()
+    )
 
     def __init__(self, app: ASGIApp):
         self.app = app
