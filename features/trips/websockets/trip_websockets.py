@@ -154,6 +154,58 @@ async def send_snapshot(ws: WebSocket, location_id: str) -> None:
 
 @router.websocket("/ws/trips")
 async def ws_location_trips(ws: WebSocket, location_id: str, token: str):
+    """
+    WebSocket endpoint for real-time trip updates per location.
+
+    Query params:
+      - location_id: UUID of the location to subscribe to
+      - token: JWT token for authentication
+
+    On connect:
+      - Validates JWT and verifies the user has access to the location
+      - Sends a `snapshot` with all current trips + location_info (timezone, airport code)
+      - Subscribes to Redis channel loc:{location_id} for live events
+
+    Server → Client message types:
+      - snapshot          : Initial trip dump on connect
+                            {type, location_id, location_info, trips[]}
+      - trips_batch       : Batch of WAL-triggered CRUD events
+                            {type, location_id, events[{event_type, trip_id, trip?}]}
+      - trip_event        : Single trip event (only when SEND_WS_BATCH=False)
+                            {type, event_type, location_id, trip_id, trip?}
+      - batch_delete_started : Bulk delete in progress (frontend should suppress WAL noise)
+                            {type, location_id, airline}
+      - trips_deleted     : Bulk delete completed
+                            {type, location_id, trips_deleted_count, airline?, pick_up_date?, status?}
+      - location_delete_started : Location deletion in progress
+                            {type, location_id, trips_count}
+      - location_deleted  : Location fully deleted
+                            {type, location_id, trips_deleted}
+      - step_applied      : Ground filter applied
+                            {type, location_id, filter_type, ...}
+      - step_reverted     : Ground filter reverted
+                            {type, location_id, filter_type, ...}
+      - subscribed        : Response to subscribe action
+                            {type, location_id}
+      - unsubscribed      : Response to unsubscribe action
+                            {type, location_id}
+      - pong              : Response to ping
+                            {type: "pong"}
+      - error             : Error details
+                            {type, code?, detail}
+
+    Client → Server actions:
+      - ping              : Keep-alive; revalidates token
+                            {action: "ping", token: "<jwt>"}
+      - subscribe         : Re-confirm subscription (already connected)
+                            {action: "subscribe"}
+      - unsubscribe       : Signal intent to unsubscribe
+                            {action: "unsubscribe"}
+
+    Close codes:
+      - 1008: Auth failure (invalid/expired token, no location access)
+      - 1011: Unexpected server error
+    """
     try:
         claims = decode_token(token)
     except Exception:

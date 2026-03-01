@@ -37,6 +37,7 @@ class BaseAppSettings(BaseSettings):
     STRIPE_PRO_PRICE_ID: str = os.getenv("STRIPE_PRO_PRICE_ID", "")
     FREE_TRIAL_DAYS: int = int(os.getenv("FREE_TRIAL_DAYS", "30"))
     ADMIN_SECRET_KEY: str = os.getenv("ADMIN_SECRET_KEY", "")
+    COOKIE_DOMAIN: str = os.getenv("COOKIE_DOMAIN")
     PUBLIC_PATHS: list[str] = [
         "/v1/auth/register",
         "/v1/auth/sign-in",

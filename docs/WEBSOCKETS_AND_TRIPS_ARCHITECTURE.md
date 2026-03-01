@@ -2,11 +2,12 @@
 
 ## Overview
 
-GT360 implements a real-time architecture using WebSockets for three main domains:
+GT360 implements a real-time architecture using WebSockets for four main domains:
 
-1. **Trips WebSocket** (`/ws/trips`) - Real-time trip updates
-2. **Flight Tracking WebSocket** (`/ws/flights/tracking`) - Aircraft position streaming
-3. **Flight Push WebSocket** (`/ws/flights/push`) - Flight status notifications
+1. **Trips WebSocket** (`/ws/trips`) - Real-time trip updates per location
+2. **Org WebSocket** (`/ws/org`) - Organization-level events (location lifecycle, billing)
+3. **Flight Tracking WebSocket** (`/ws/flights/tracking`) - Aircraft position streaming
+4. **Flight Push WebSocket** (`/ws/flights/push`) - Flight status notifications
 
 All WebSockets share common patterns:
 - JWT authentication via query parameter
@@ -49,20 +50,26 @@ Client                          Backend                         Redis
 
 | Type | Description | Payload |
 |------|-------------|---------|
-| `snapshot` | Initial dump of all trips | `{type, location_id, location_info, trips[]}` |
-| `trips_batch` | Batch of trip events | `{type, location_id, events[]}` |
-| `trip_event` | Single trip event (legacy) | `{type, event_type, location_id, trip_id, trip}` |
+| `snapshot` | Initial dump of all trips on connect | `{type, location_id, location_info, trips[]}` |
+| `trips_batch` | Batch of trip CRUD events (WAL triggers) | `{type, location_id, events[]}` |
+| `trip_event` | Single trip event (fallback, SEND_WS_BATCH=False) | `{type, event_type, location_id, trip_id, trip?}` |
+| `batch_delete_started` | Bulk delete in progress (suppresses WAL noise) | `{type, location_id, airline}` |
+| `trips_deleted` | Bulk delete completed | `{type, location_id, trips_deleted_count, airline?, pick_up_date?, status?}` |
 | `location_delete_started` | Location deletion in progress | `{type, location_id, trips_count}` |
 | `location_deleted` | Location fully deleted | `{type, location_id, trips_deleted}` |
+| `step_applied` | Ground filter applied to trips | `{type, location_id, filter_type, ...}` |
+| `step_reverted` | Ground filter reverted | `{type, location_id, filter_type, ...}` |
+| `subscribed` | Response to `subscribe` action | `{type: "subscribed", location_id}` |
+| `unsubscribed` | Response to `unsubscribe` action | `{type: "unsubscribed", location_id}` |
 | `pong` | Response to ping | `{type: "pong"}` |
-| `error` | Error message | `{type, code, detail}` |
+| `error` | Error message | `{type, code?, detail}` |
 
 #### Client to Server
 
 | Action | Description | Payload |
 |--------|-------------|---------|
 | `ping` | Keep-alive with token validation | `{action: "ping", token: "..."}` |
-| `subscribe` | Confirm subscription | `{action: "subscribe"}` |
+| `subscribe` | Re-confirm subscription to location | `{action: "subscribe"}` |
 | `unsubscribe` | Unsubscribe from location | `{action: "unsubscribe"}` |
 
 ### Event Structure in `trips_batch`
@@ -90,24 +97,82 @@ Client                          Backend                         Redis
 }
 ```
 
-### Redis Channels
+### Redis Pub/Sub Channel
 
 | Channel | Purpose |
 |---------|---------|
-| `loc:{location_id}` | Trip events for a location |
-| `loc:{location_id}:trips` | Trip ID index set |
-| `trip:{trip_id}` | Cached trip data (TTL: 300s) |
+| `loc:{location_id}` | All trip events for a location (pub/sub) |
+
+### Redis Cache Keys (not pub/sub)
+
+| Key | Description | TTL |
+|-----|-------------|-----|
+| `loc:{location_id}:trips` | Set of trip IDs for snapshot | 300s |
+| `trip:{trip_id}` | Cached trip JSON | 300s |
 
 ### Snapshot Flow
 
-1. Check Redis cache (`loc:{id}:trips` set)
-2. If cache hit: fetch trips from Redis
-3. If cache miss: query PostgreSQL, repopulate cache
-4. Send snapshot with `location_info` (timezone, airport code)
+1. Get location metadata (timezone, airport code) from DB
+2. Check Redis cache (`loc:{id}:trips` set)
+3. If cache hit: fetch trips from Redis (`trip:{id}` keys)
+4. If cache miss: query PostgreSQL, repopulate cache (self-healing)
+5. Send `snapshot` with `location_info`
 
 ---
 
-## 2. Flight Tracking WebSocket
+## 2. Org WebSocket
+
+### Endpoint
+```
+ws://host/ws/org?organization_id={uuid}&token={jwt}
+```
+
+### Purpose
+Streams organization-level events. Receives location lifecycle events and billing notifications. Billing events are only sent to manager connections.
+
+### Connection Flow
+
+```
+Client                          Backend                         Redis
+  |                                |                               |
+  |--- WS Connect (token) -------->|                               |
+  |                                |-- Validate JWT                |
+  |                                |-- Verify org_id matches token |
+  |                                |                               |
+  |<-- {"type": "connected"} ------|                               |
+  |                                |-- Subscribe to org:{id}  ---->|
+  |                                |                               |
+  |<-- {"type": "location_deleted"}|<-- Redis pub/sub -------------|
+  |                                |                               |
+```
+
+### Message Types
+
+#### Server to Client
+
+| Type | Description | Audience | Payload |
+|------|-------------|----------|---------|
+| `connected` | Connection established | All | `{type, organization_id, message}` |
+| `location_deleted` | A location was deleted | All | `{type, location_id, location_name, message, hotels[], hotels_count}` |
+| `billing_event` | Billing/payment event | Managers only | `{type, ...}` |
+| `pong` | Response to ping | All | `{type: "pong"}` |
+| `error` | Error message | All | `{type, code?, detail}` |
+
+#### Client to Server
+
+| Action | Description | Payload |
+|--------|-------------|---------|
+| `ping` | Keep-alive with token validation | `{action: "ping", token: "..."}` |
+
+### Redis Channel
+
+| Channel | Purpose |
+|---------|---------|
+| `org:{organization_id}` | Org-level events (location lifecycle, billing) |
+
+---
+
+## 3. Flight Tracking WebSocket
 
 ### Endpoint
 ```
@@ -197,7 +262,7 @@ Client                          Backend                         ADSB.lol
 
 ---
 
-## 3. Flight Push WebSocket
+## 4. Flight Push WebSocket
 
 ### Endpoint
 ```
@@ -265,7 +330,7 @@ AeroDataBox              Backend                    Client
 
 ---
 
-## 4. Trips System
+## 5. Trips System
 
 ### Trip Schema
 
@@ -344,7 +409,7 @@ Only apply to trips with:
 
 ---
 
-## 5. Infrastructure Questions Answered
+## 6. Infrastructure Questions Answered
 
 ### 9. Delivery Guarantee (FIFO by trip_id)
 
@@ -465,7 +530,7 @@ ws.onmessage = (event) => {
 
 ---
 
-## 6. Architecture Diagram
+## 7. Architecture Diagram
 
 ```
                                     ┌─────────────────┐
@@ -515,26 +580,33 @@ ws.onmessage = (event) => {
 
 ---
 
-## 7. Quick Reference
+## 8. Quick Reference
 
 ### WebSocket URLs
 
 | WebSocket | URL | Auth |
 |-----------|-----|------|
 | Trips | `/ws/trips?location_id={uuid}&token={jwt}` | Query param |
+| Org | `/ws/org?organization_id={uuid}&token={jwt}` | Query param |
 | Flight Tracking | `/ws/flights/tracking?token={jwt}` | Query param |
 | Flight Push | `/ws/flights/push?trip_id={uuid}&token={jwt}` | Query param |
 
-### Redis Key Patterns
+### Redis Pub/Sub Channels
+
+| Channel | Subscriber | Events |
+|---------|-----------|--------|
+| `loc:{location_id}` | `/ws/trips` | `trips_batch`, `batch_delete_started`, `trips_deleted`, `location_delete_started`, `location_deleted`, `step_applied`, `step_reverted` |
+| `org:{organization_id}` | `/ws/org` | `location_deleted`, `billing_event` |
+| `flight:track:{trip}` | `/ws/flights/tracking` | position updates |
+| `flight:push:{trip}` | `/ws/flights/push` | flight status notifications |
+
+### Redis Cache Keys
 
 | Pattern | Description | TTL |
 |---------|-------------|-----|
-| `loc:{id}` | Pub/sub channel for location | - |
-| `loc:{id}:trips` | Trip ID set for location | 300s |
+| `loc:{id}:trips` | Trip ID set for snapshot | 300s |
 | `trip:{id}` | Cached trip JSON | 300s |
-| `flight:pos:{flight}:{trip}` | Cached position | 2s |
-| `flight:track:{trip}` | Pub/sub for positions | - |
-| `flight:push:{trip}` | Pub/sub for notifications | - |
+| `flight:pos:{flight}:{trip}` | Cached aircraft position | 2s |
 | `flight:active` | Set of active flight tracks | - |
 
 ### Error Codes
@@ -547,7 +619,7 @@ ws.onmessage = (event) => {
 
 ---
 
-## 8. Security Considerations
+## 9. Security Considerations
 
 1. **Token Validation**: Every ping revalidates the JWT
 2. **Location Access**: Verified against organization membership
@@ -557,7 +629,7 @@ ws.onmessage = (event) => {
 
 ---
 
-## 9. Performance Characteristics
+## 10. Performance Characteristics
 
 | Metric | Value | Notes |
 |--------|-------|-------|

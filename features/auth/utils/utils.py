@@ -290,7 +290,7 @@ def set_cookies(response, data:dict):
             httponly=True,
             secure=True,
             samesite="lax",
-            domain=".gt360.app",
+            domain=settings.COOKIE_DOMAIN,
             path="/",
             max_age=30 * 24 * 60 * 60,  # 30 días
         )
@@ -315,7 +315,7 @@ def delete_cookies(response, cookies:list[str]):
             httponly=True,
             secure=True,
             samesite="lax",
-            domain=".gt360.app",
+            domain=settings.COOKIE_DOMAIN,
         )
 
 
