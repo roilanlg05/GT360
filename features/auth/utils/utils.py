@@ -1,6 +1,6 @@
 from fastapi import HTTPException, Request
 from shared.db.schemas import User, Manager, Driver, Token
-from psqlmodel import Select
+from psqlmodel import Select, Update
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from datetime import timedelta, datetime, timezone
@@ -331,21 +331,16 @@ async def revoke_all_user_refresh(session, user_id: str):
     return -> The number of tokens revoked (int).
     """
 
-    rows = await session.exec(
-        Select(Token)
+    await session.exec(
+        Update(Token)
         .Where(
-            (Token.user_id == user_id) & 
-            (Token.revoked == False) & 
-            (Token.token_type=="refresh")
+            (Token.user_id == user_id) &
+            (Token.revoked == False) &
+            (Token.token_type == "refresh")
         )
-    ).all()
-
-    for r in rows:
-        r.revoked = True
-        session.add(r)
-        
+        .Set(revoked=True)
+    )
     await session.flush()
-    return len(rows)
 
 async def get_refresh_by_hash(session, refresh_token: str) -> Token | None:
         
