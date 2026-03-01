@@ -12,7 +12,7 @@ class BaseAppSettings(BaseSettings):
 
     # File uploads configuration
     UPLOAD_DIR: str = os.getenv("UPLOAD_DIR", "/var/www/gt360/uploads")
-    UPLOAD_BASE_URL: str = os.getenv("UPLOAD_BASE_URL", "https://api.gt360.app/uploads")
+    UPLOAD_BASE_URL: str = os.getenv("UPLOAD_BASE_URL")
     MAX_UPLOAD_SIZE: int = 4 * 1024 * 1024  # 4 MB
     POSTGRES_SERVER: str = os.getenv("POSTGRES_SERVER")
     POSTGRES_PORT: str = os.getenv("POSTGRES_PORT")
@@ -25,6 +25,9 @@ class BaseAppSettings(BaseSettings):
     ALGORITHM: str = os.getenv("ALGORITHM")
     PEPPER: Optional[str] = os.getenv("PEPPER")
     WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET")
+    REDIS_HOST: str = os.getenv("REDIS_HOST", "redis")
+    REDIS_PORT: int = int(os.getenv("REDIS_PORT", "6379"))
+    REDIS_DB: int = int(os.getenv("REDIS_DB", "0"))
     GROQ_API_KEY: Optional[str] = os.getenv("GROQ_API_KEY")
     AIRLABS_API_KEY: Optional[str] = os.getenv("AIRLABS_API_KEY")
     # Stripe billing
