@@ -363,7 +363,7 @@ async def get_refresh_by_hash(session, refresh_token: str) -> Token | None:
 
     return token
 
-async def revoke_refresh(session, refresh_id) -> Token:
+async def revoke_refresh(session, refresh_id) -> None:
 
     """
     Revokes a specific refresh token by its ID.
@@ -375,13 +375,15 @@ async def revoke_refresh(session, refresh_id) -> Token:
     return -> The updated Token object.
     """
 
-    refresh = await session.get(Token, refresh_id)  
-    if refresh and not refresh.revoked:
-        refresh.revoked = True
-        session.add(refresh)
-        await session.commit()
-        await session.refresh(refresh)
-    return refresh
+    await session.exec(
+        Update(Token)
+        .Where(
+            (Token.id == refresh_id) &
+            (Token.revoked == False)
+        )
+        .Set(revoked=True)
+    )
+    await session.flush()
 
 async def validate_refresh(session, refresh_token) -> Token:
 
