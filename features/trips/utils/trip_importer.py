@@ -26,12 +26,12 @@ FLIGHT_DAY_RE = re.compile(
     re.I
 )
 
-# Vuelos + fecha opcional + hora:
+# Vuelos + mes opcional + hora:
 # - "WN 2668-01 Nov 04:55"
 # - "WN 4285-16 Nov 04:45"
 # - también soporta sin mes: "WN 1322-01 17:20"
 FLIGHT_TIME_RE = re.compile(
-    r"(?P<flight>[A-Z0-9]{2}\s*\d{3,4}(?:-\d{2})?)\s+(?:[A-Za-z]{3}\s+)?(?P<hour>\d{1,2}):(?P<minute>\d{2})"
+    r"(?P<flight>[A-Z0-9]{2}\s*\d{3,4}(?:-\d{2})?)\s+(?:(?P<month>[A-Za-z]{3})\s+)?(?P<hour>\d{1,2}):(?P<minute>\d{2})"
 )
 
 
@@ -197,9 +197,17 @@ def _parse_flight_and_time(value: str, service_date: date) -> Tuple[Optional[str
     hour = int(m.group("hour"))
     minute = int(m.group("minute"))
 
+    month_str = m.group("month")
+    month = service_date.month
+    if month_str:
+        try:
+            month = datetime.strptime(month_str, "%b").month
+        except ValueError:
+            pass  # abreviatura inválida, usar el mes del DATE
+
     dt = datetime(
         year=service_date.year,
-        month=service_date.month,
+        month=month,
         day=service_date.day,
         hour=hour,
         minute=minute,
