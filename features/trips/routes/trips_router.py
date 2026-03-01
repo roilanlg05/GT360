@@ -1246,14 +1246,6 @@ async def delete_trips_by_airline(
             }
         }
 
-    # Publicar batch_delete_started ANTES del DELETE para que el frontend suprima notificaciones WAL
-    await safe_redis_call(
-        redis.publish,
-        f"loc:{location_id}",
-        json.dumps({"type": "batch_delete_started", "location_id": location_id, "airline": airline}),
-        context=f"publish loc:{location_id} batch_delete_started",
-    )
-
     # Construir DELETE statement con los mismos filtros
     del_stmt = (
         Delete(TripDB)
@@ -1267,34 +1259,8 @@ async def delete_trips_by_airline(
     if status:
         del_stmt = del_stmt.Where(TripDB.status == status)
 
-    # Ejecutar DELETE
     await session.exec(del_stmt)
     await session.commit()
-
-    # Fix #1: Limpiar Redis cache para los trips borrados
-    trip_id_strings = [str(row[0]) for row in trips_to_delete]
-    pipe = redis.pipeline()
-    idx_key = f"loc:{location_id}:trips"
-    for tid in trip_id_strings:
-        pipe.delete(f"trip:{tid}")
-        pipe.srem(idx_key, tid)
-    await pipe.execute()
-    print(f"[DELETE_AIRLINE] Cleared {trips_count} trip keys from Redis for loc:{location_id}/airline:{airline}")
-
-    # Fix #2: Notificar via WebSocket que los trips fueron borrados
-    await safe_redis_call(
-        redis.publish,
-        f"loc:{location_id}",
-        json.dumps({
-            "type": "trips_deleted",
-            "location_id": location_id,
-            "trips_deleted_count": trips_count,
-            "airline": airline,
-            "pick_up_date": pick_up_date,
-            "status": status
-        }),
-        context=f"publish loc:{location_id} trips_deleted",
-    )
 
     return {
         "status": "ok",
