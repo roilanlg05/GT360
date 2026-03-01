@@ -69,6 +69,7 @@ scripts/
 *.key
 
 # Docker / compose local overrides
+Dockerfile
 docker-compose.override.yml
 .envrc
 
