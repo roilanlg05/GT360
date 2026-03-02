@@ -13,7 +13,7 @@ from features.auth.utils import(
     decode_token, get_user_by_email, verify_password,
     gen_refresh_token, save_refresh_in_db, set_cookies,
     revoke_all_user_refresh, get_current_user, validate_refresh,
-    now, delete_cookies, blacklist_token, get_token
+    now, delete_cookies, blacklist_token, get_token, set_active_jti
 )
 from ..utils.smtp import send_email, get_confirmation_email_template, get_password_reset_email_template
 import secrets
@@ -311,9 +311,12 @@ async def sign_in(
                 metadata["organization_id"] = str(driver_row.organization_id)
                 metadata["location_id"] = str(driver_row.location_id)
 
-    access_token = encode_token(str(user.id), metadata)
-    raw, token_hash, exp = gen_refresh_token()
+    await revoke_all_user_refresh(session, user.id)
 
+    access_token = encode_token(str(user.id), metadata)
+    await set_active_jti(str(user.id), access_token["jti"])
+
+    raw, token_hash, exp = gen_refresh_token()
     await save_refresh_in_db(session, user.id, token_hash, exp)
 
     set_cookies(response, {
@@ -410,6 +413,7 @@ async def refresh_token(
                
 
     access_token = encode_token(str(user.id), metadata)
+    await set_active_jti(str(user.id), access_token["jti"])
 
     metadata.update({"id": user.id})
 

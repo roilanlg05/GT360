@@ -10,6 +10,7 @@ from shared.redis.redis_client import redis_client
 from shared.redis.redis_safe import safe_redis_call
 import secrets
 import hashlib
+from uuid import uuid4
 from features.trips.utils import get_locations_by_org_id
 
 ph = PasswordHasher()
@@ -141,14 +142,20 @@ def encode_token(sub: str,
             "exp": exp
         }
 
+        jti = None
+        if type == "access":
+            jti = str(uuid4())
+            payload["jti"] = jti
+
         if metadata:
             payload["metadata"] = metadata
 
         token = jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.ALGORITHM)
-        
+
         return {
             f"{type}_token": token,
-            "exp": exp
+            "exp": exp,
+            "jti": jti
         }
 
 def decode_token(token: str) -> dict:
@@ -436,6 +443,15 @@ def get_token(request):
     if not token:
         raise ValueError("Missing authentication token")
     return token
+
+async def set_active_jti(user_id: str, jti: str) -> None:
+    await safe_redis_call(
+        redis_client.set,
+        f"active_jti:{user_id}",
+        jti,
+        context=f"set active_jti:{user_id}",
+    )
+
 
 async def blacklist_token(token: str, exp_seconds: int = 300):
     """

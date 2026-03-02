@@ -63,6 +63,19 @@ class VerifyToken:
                 )
                 if blacklisted:
                     raise ValueError("Token revoked")
+
+                # Check jti — ensures only the latest session is valid
+                jti = payload.get("jti")
+                if jti:
+                    user_id = payload.get("sub")
+                    active_jti = await safe_redis_call(
+                        redis_client.get,
+                        f"active_jti:{user_id}",
+                        context=f"jti check:{user_id}",
+                        default=None,
+                    )
+                    if active_jti is not None and active_jti != jti:
+                        raise ValueError("Session invalidated")
             except ValueError as e:
                 # Send 401 response with CORS headers
                 await self._send_error_response(scope, send, 401, str(e))
