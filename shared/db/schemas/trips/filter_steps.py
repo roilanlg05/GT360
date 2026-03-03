@@ -17,7 +17,7 @@ class FilterStep(PSQLModel):
 
     This allows:
     - Order-free filter application (any order of reduce/combine/expand)
-    - Per-day configuration (each step targets a specific pick_up_date)
+    - Global configuration per location+airline (not per-date)
     - Time windows per filter
     - Scalable revert by marking steps as inactive
 
@@ -45,9 +45,10 @@ class FilterStep(PSQLModel):
         index=True
     )
 
-    # Day this step applies to
+    # Kept as nullable for backwards compatibility with pre-v2 rows.
+    # New steps do not use this field (filters are now global per location+airline).
     pick_up_date: date = Column(
-        nullable=False,
+        nullable=True,
         index=True
     )
 
@@ -103,4 +104,4 @@ class FilterStep(PSQLModel):
 
     # Unique constraint: one step per location+airline+date+order
     class Config:
-        unique_together = [("location_id", "airline", "pick_up_date", "step_order")]
+        unique_together = [("location_id", "airline", "step_order")]

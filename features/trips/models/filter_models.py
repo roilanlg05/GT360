@@ -200,7 +200,6 @@ class FilterStepConfig(BaseModel):
 
     Supports:
     - Order-free application (any sequence of reduce/combine/expand)
-    - Per-day configuration (pick_up_date)
     - Time windows with config per window (1..N per step)
     - Minute precision (no rounding to multiples of 5)
 
@@ -209,9 +208,6 @@ class FilterStepConfig(BaseModel):
     """
     filter_type: str = Field(
         description="Filter type: 'reduce', 'combine', or 'expand'"
-    )
-    pick_up_date: str = Field(
-        description="Target date in YYYY-MM-DD format"
     )
     windows: list[TimeWindow] = Field(
         default_factory=lambda: [TimeWindow()],
@@ -226,22 +222,11 @@ class FilterStepConfig(BaseModel):
             raise ValueError(f"filter_type must be one of {valid_types}")
         return v
 
-    @field_validator('pick_up_date')
-    @classmethod
-    def validate_date_format(cls, v):
-        from datetime import date as dt_date
-        try:
-            dt_date.fromisoformat(v)
-        except ValueError:
-            raise ValueError(f"Invalid date format: {v}. Use YYYY-MM-DD")
-        return v
-
 
 class StepResult(BaseModel):
     """Result of applying or previewing a step (v2)."""
     step_id: Optional[UUID] = None  # None for preview
     filter_type: str
-    pick_up_date: str
     trips_modified: int
     changes: list[TripChange]
     exclusions: list[FilterExclusion]
@@ -262,10 +247,9 @@ class FilterStepInfo(BaseModel):
 
 
 class StackState(BaseModel):
-    """Current state of the filter stack for a day (v2)."""
+    """Current state of the filter stack (v2)."""
     location_id: UUID
     airline: str
-    pick_up_date: str
     steps: list[FilterStepInfo]
     total_trips_affected: int
 
@@ -280,10 +264,9 @@ class StepRevertResult(BaseModel):
 
 
 class EligibilityResult(BaseModel):
-    """Result of checking filter eligibility for a day (v2)."""
+    """Result of checking filter eligibility (v2)."""
     location_id: UUID
     airline: str
-    pick_up_date: str
     filter_type: Optional[str] = None  # "reduce" | "combine" | "expand" (if checking specific type)
     total_trips: int
     eligible_trips: int
@@ -344,171 +327,3 @@ class AutoApplyResult(BaseModel):
     days_with_existing_stack: int = 0  # Days where we applied existing stack to new trips
 
 
-# =============================================================================
-# Bulk Operations (Multi-Day)
-# =============================================================================
-
-class BulkFilterConfig(BaseModel):
-    """
-    Configuration for bulk filter operations (multiple days).
-
-    Allows applying the same filter config to all future trips
-    or a specific date range.
-    """
-    filter_type: str = Field(
-        description="Filter type: 'reduce', 'combine', or 'expand'"
-    )
-    date_from: str = Field(
-        description="Start date in YYYY-MM-DD format"
-    )
-    date_to: Optional[str] = Field(
-        default=None,
-        description="End date in YYYY-MM-DD format (None = all future)"
-    )
-    windows: list[TimeWindow] = Field(
-        default_factory=lambda: [TimeWindow()],
-        description="Time windows with config (applied to all days)"
-    )
-    skip_days_with_stack: bool = Field(
-        default=True,
-        description="Skip days that already have filter steps applied"
-    )
-
-    @field_validator('filter_type')
-    @classmethod
-    def validate_filter_type(cls, v):
-        valid_types = {'reduce', 'combine', 'expand'}
-        if v not in valid_types:
-            raise ValueError(f"filter_type must be one of {valid_types}")
-        return v
-
-    @field_validator('date_from', 'date_to')
-    @classmethod
-    def validate_date_format(cls, v):
-        if v is None:
-            return v
-        from datetime import date as dt_date
-        try:
-            dt_date.fromisoformat(v)
-        except ValueError:
-            raise ValueError(f"Invalid date format: {v}. Use YYYY-MM-DD")
-        return v
-
-
-class DayResult(BaseModel):
-    """Result for a single day in bulk operation."""
-    pick_up_date: str
-    trips_modified: int
-    exclusions_count: int
-    step_id: Optional[UUID] = None  # None for preview, UUID for apply
-    skipped: bool = False
-    skip_reason: Optional[str] = None
-
-
-class BulkStepResult(BaseModel):
-    """Result of bulk preview or apply operation."""
-    filter_type: str
-    date_from: str
-    date_to: Optional[str]
-
-    # Summary
-    total_days: int
-    days_processed: int
-    days_skipped: int
-    total_trips_modified: int
-    total_exclusions: int
-
-    # Per-day details
-    by_date: list[DayResult] = Field(default_factory=list)
-
-    # All changes (optional, can be large)
-    all_changes: list[TripChange] = Field(default_factory=list)
-    all_exclusions: list[FilterExclusion] = Field(default_factory=list)
-
-
-class BulkEligibilityResult(BaseModel):
-    """Result of bulk eligibility check."""
-    location_id: UUID
-    airline: str
-    date_from: str
-    date_to: Optional[str]
-    filter_type: Optional[str] = None  # If provided, shows filter-specific counts
-
-    # Summary
-    total_days: int
-    total_trips: int
-    total_eligible: int
-    trips_with_filter: Optional[int] = None  # Total trips with this filter applied (across all days)
-    trips_new: Optional[int] = None  # Total trips WITHOUT this filter (available for filtering)
-
-    # Per-day breakdown
-    by_date: list[dict] = Field(default_factory=list)  # [{pick_up_date, eligible, trips_with_filter, trips_new, by_hotel}]
-
-
-class BulkRevertConfig(BaseModel):
-    """
-    Configuration for bulk revert operations.
-
-    Allows reverting filter steps across multiple days or all future.
-    Can optionally filter by filter_type to only revert specific filter types.
-    """
-    date_from: str = Field(
-        description="Start date in YYYY-MM-DD format"
-    )
-    date_to: Optional[str] = Field(
-        default=None,
-        description="End date in YYYY-MM-DD format (None = all future)"
-    )
-    filter_type: Optional[str] = Field(
-        default=None,
-        description="Filter type to revert: 'reduce', 'combine', 'expand', or null for all types"
-    )
-
-    @field_validator('filter_type')
-    @classmethod
-    def validate_filter_type(cls, v):
-        if v is None:
-            return v
-        valid_types = {'reduce', 'combine', 'expand'}
-        if v not in valid_types:
-            raise ValueError(f"filter_type must be one of {valid_types} or null")
-        return v
-
-    @field_validator('date_from', 'date_to')
-    @classmethod
-    def validate_date_format(cls, v):
-        if v is None:
-            return v
-        from datetime import date as dt_date
-        try:
-            dt_date.fromisoformat(v)
-        except ValueError:
-            raise ValueError(f"Invalid date format: {v}. Use YYYY-MM-DD")
-        return v
-
-
-class DayRevertResult(BaseModel):
-    """Result for a single day in bulk revert operation."""
-    pick_up_date: str
-    steps_reverted: int
-    step_ids: list[UUID] = Field(default_factory=list)
-    trips_recalculated: int
-    skipped: bool = False
-    skip_reason: Optional[str] = None
-
-
-class BulkRevertResult(BaseModel):
-    """Result of bulk revert operation."""
-    date_from: str
-    date_to: Optional[str]
-    filter_type: Optional[str]
-
-    # Summary
-    total_days: int
-    days_with_reverts: int
-    days_skipped: int
-    total_steps_reverted: int
-    total_trips_recalculated: int
-
-    # Per-day details
-    by_date: list[DayRevertResult] = Field(default_factory=list)

@@ -351,28 +351,23 @@ async def upload_trips(
 
         if trips_to_create and airline:
             from features.trips.services.filter_preset_service import FilterPresetService
-            from collections import defaultdict
 
-            # Group new trip IDs by pick_up_date
-            # This allows us to apply filters to ONLY the new trips
-            trips_by_date = defaultdict(list)
-            for trip in trips_to_create:
-                trips_by_date[trip.pick_up_date].append(trip.id)
+            new_trip_ids = [trip.id for trip in trips_to_create]
 
             print(
                 f"[AUTO_PRESET] Processing {len(trips_to_create)} new trips "
-                f"across {len(trips_by_date)} dates"
+                f"for {location.id}/{airline}"
             )
 
             # Auto-apply preset to new trips
-            # - For dates WITHOUT stack: Creates new stack from preset
-            # - For dates WITH stack: Applies existing stack to new trips only
+            # - If stack exists: Applies existing stack to new trips only
+            # - If no stack but preset: Creates new stack from preset
             preset_service = FilterPresetService(session)
             try:
                 auto_apply_result = await preset_service.auto_apply_to_new_trips(
                     location_id=location.id,
                     airline=airline,
-                    trips_by_date=dict(trips_by_date)
+                    trip_ids=new_trip_ids,
                 )
 
                 # Prepare response for frontend
