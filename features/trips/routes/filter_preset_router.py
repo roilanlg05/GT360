@@ -7,7 +7,6 @@ Endpoints for managing global filter presets (auto-apply on import).
 from fastapi import APIRouter, HTTPException, Depends, Query
 from psqlmodel import AsyncSession, Select
 from uuid import UUID
-from datetime import date
 
 from shared.db.db_config import get_db
 from shared.db.schemas import FilterStep
@@ -165,72 +164,59 @@ async def delete_preset(
 async def test_preset(
     location_id: str,
     airline: str,
-    pick_up_date: str,
     session: AsyncSession = Depends(get_db),
     _role=Depends(verify_role(["manager"]))
 ) -> AutoApplyResult:
     """
-    Test how preset would be applied to a specific day.
+    Test how preset would be applied for this location+airline.
 
     This is a dry-run that shows what would happen without actually applying.
 
     - **location_id**: Location UUID
     - **airline**: Airline code
-    - **pick_up_date**: Date to test (YYYY-MM-DD)
 
     Returns summary of what would be applied.
     """
     try:
         location_uuid = UUID(location_id)
-        target_date = date.fromisoformat(pick_up_date)
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid ID or date format")
+        raise HTTPException(status_code=400, detail="Invalid location_id format")
 
     service = FilterPresetService(session)
 
-    # Simulate auto-apply for ONE day
-    result = await service.auto_apply_preset(
-        location_uuid, airline, [target_date]
-    )
+    result = await service.auto_apply_preset(location_uuid, airline)
 
     return result
 
 
-@router.post("/v2/locations/{location_id}/airlines/{airline}/filters/preset/from-day")
-async def create_preset_from_day(
+@router.post("/v2/locations/{location_id}/airlines/{airline}/filters/preset/from-stack")
+async def create_preset_from_stack(
     location_id: str,
     airline: str,
-    pick_up_date: str = Query(..., description="Date to copy stack from (YYYY-MM-DD)"),
     session: AsyncSession = Depends(get_db),
     _role=Depends(verify_role(["manager"]))
 ) -> FilterPresetResponse:
     """
-    Create preset from an existing day's filter stack.
+    Create preset from the current active filter stack.
 
-    This copies the current stack (all active FilterSteps) from a specific day
-    and saves it as the preset for this location+airline.
-
-    Useful when you've manually configured filters for a day and want to
-    auto-apply the same configuration to future imports.
+    This copies the current active stack and saves it as the preset
+    for this location+airline.
 
     - **location_id**: Location UUID
     - **airline**: Airline code (e.g., "WN", "AA")
-    - **pick_up_date**: Date to copy filters from (YYYY-MM-DD)
 
     Returns the created preset.
     """
     try:
         location_uuid = UUID(location_id)
-        target_date = date.fromisoformat(pick_up_date)
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid ID or date format")
+        raise HTTPException(status_code=400, detail="Invalid location_id format")
 
-    # Get active steps for this day
+    # Get current active steps
     steps_query = (
         Select(FilterStep)
         .Where(FilterStep.location_id == location_uuid)
         .Where(FilterStep.airline == airline)
-        .Where(FilterStep.pick_up_date == target_date)
         .Where(FilterStep.is_active == True)
         .OrderBy(FilterStep.step_order.Asc())
     )
@@ -239,8 +225,7 @@ async def create_preset_from_day(
     if not active_steps:
         raise HTTPException(
             status_code=404,
-            detail=f"No active filter stack found for {pick_up_date}. "
-                   f"Apply filters to this day first, then copy as preset."
+            detail="No active filter stack found. Apply filters first, then save as preset."
         )
 
     # Convert steps to stack_template format

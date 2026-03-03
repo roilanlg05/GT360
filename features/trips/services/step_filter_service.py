@@ -3,8 +3,7 @@ Step-Based Filter Service (V2)
 
 Implements the new step/stack-based filtering system with:
 - Order-free filter application (any sequence of reduce/combine/expand)
-- Per-day configuration (pick_up_date)
-- Time windows per filter (1..N per day, no overlapping, no midnight crossing)
+- Time windows per filter (1..N per step, no overlapping, no midnight crossing)
 - Minute precision (no rounding to multiples of 5)
 - Smart Expand with 3 attempts (both, only A, only B)
 - Anti-drift with original_pick_up_time immutable
@@ -17,14 +16,13 @@ Rules:
 
 from __future__ import annotations
 
-import asyncio
 import logging
-from datetime import time, datetime, date
+from datetime import time, datetime
 from typing import Optional
 from uuid import UUID, uuid4
 from collections import defaultdict
 
-from psqlmodel import AsyncSession, Select, Update
+from psqlmodel import AsyncSession, Select
 
 from shared.db.schemas import Trip, TripType, TripStatus, FilterStep
 from shared.redis.redis_safe import safe_redis_call
@@ -39,13 +37,6 @@ from features.trips.models.filter_models import (
     StackState,
     FilterStepInfo,
     EligibilityResult,
-    BulkFilterConfig,
-    BulkStepResult,
-    DayResult,
-    BulkEligibilityResult,
-    BulkRevertConfig,
-    BulkRevertResult,
-    DayRevertResult,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,7 +48,7 @@ class StepFilterService:
 
     Key differences from v1:
     - Order-free: Apply reduce, combine, expand in any order
-    - Per-day: Each step targets a specific pick_up_date
+    - Global: Steps apply across all trips for a location+airline (no date scoping)
     - Time windows: 1..N windows per step
     - Minute precision: No rounding to multiples of 5
     - Stack-based revert: Pop steps or revert specific ones
@@ -91,22 +82,18 @@ class StepFilterService:
         # Validate windows
         self._validate_windows(config.windows)
 
-        # Parse date
-        pick_up_date = date.fromisoformat(config.pick_up_date)
-
-        # Get eligible trips for the day
-        trips = await self._get_eligible_trips(location_id, airline, pick_up_date)
+        # Get eligible trips
+        trips = await self._get_eligible_trips(location_id, airline)
 
         logger.info(
             f"[STEP_FILTER] Preview: {len(trips)} eligible trips for "
-            f"location={location_id}, airline={airline}, date={pick_up_date}"
+            f"location={location_id}, airline={airline}"
         )
 
         if not trips:
             return StepResult(
                 step_id=None,
                 filter_type=config.filter_type,
-                pick_up_date=config.pick_up_date,
                 trips_modified=0,
                 changes=[],
                 exclusions=[],
@@ -137,13 +124,12 @@ class StepFilterService:
         return StepResult(
             step_id=None,
             filter_type=config.filter_type,
-            pick_up_date=config.pick_up_date,
-            trips_modified=independent_count,  # Independent count (only new trips)
+            trips_modified=independent_count,
             changes=self.changes,
             exclusions=self.exclusions,
             summary={
                 "modified": independent_count,
-                "total_changes": len(self.changes),  # Total for debugging
+                "total_changes": len(self.changes),
                 "excluded": len(self.exclusions),
             },
         )
@@ -165,22 +151,18 @@ class StepFilterService:
         # Validate windows
         self._validate_windows(config.windows)
 
-        # Parse date
-        pick_up_date = date.fromisoformat(config.pick_up_date)
-
-        # Get eligible trips for the day
-        trips = await self._get_eligible_trips(location_id, airline, pick_up_date)
+        # Get eligible trips
+        trips = await self._get_eligible_trips(location_id, airline)
 
         logger.info(
             f"[STEP_FILTER] Apply: {len(trips)} eligible trips for "
-            f"location={location_id}, airline={airline}, date={pick_up_date}"
+            f"location={location_id}, airline={airline}"
         )
 
         if not trips:
             return StepResult(
                 step_id=None,
                 filter_type=config.filter_type,
-                pick_up_date=config.pick_up_date,
                 trips_modified=0,
                 changes=[],
                 exclusions=[],
@@ -203,7 +185,7 @@ class StepFilterService:
             await self._apply_expand(trips, config)
 
         # Get next step order
-        next_order = await self._get_next_step_order(location_id, airline, pick_up_date)
+        next_order = await self._get_next_step_order(location_id, airline)
 
         # Create FilterStep record
         step_id = uuid4()
@@ -211,7 +193,6 @@ class StepFilterService:
             id=step_id,
             location_id=location_id,
             airline=airline,
-            pick_up_date=pick_up_date,
             step_order=next_order,
             filter_type=config.filter_type,
             config={"filter_type": config.filter_type},  # Minimal metadata
@@ -225,6 +206,15 @@ class StepFilterService:
         # Build trip lookup and persist changes
         trip_lookup = {t.id: t for t in trips}
         now = datetime.utcnow()
+
+        # Pre-load active steps once — avoids N+1 inside the loop
+        active_steps_for_order = await self.session.exec(
+            Select(FilterStep)
+            .Where(FilterStep.location_id == location_id)
+            .Where(FilterStep.airline == airline)
+            .Where(FilterStep.is_active == True)
+            .OrderBy(FilterStep.step_order.Asc())
+        ).all()
 
         for change in self.changes:
             trip = trip_lookup.get(change.trip_id)
@@ -250,9 +240,9 @@ class StepFilterService:
 
             trip.filtered_at = now
 
-            # Build filter_order string for frontend display
+            # Build filter_order string — passes pre-loaded steps (no extra query per trip)
             trip.filter_order = await self._build_filter_order_string(
-                trip, location_id, airline, pick_up_date
+                trip, location_id, airline, active_steps=active_steps_for_order
             )
 
             self.session.add(trip)
@@ -281,8 +271,8 @@ class StepFilterService:
                     total_changes=len(self.changes)
                 )
 
-            # AUTO-SAVE PRESET: Update preset with current day's stack
-            await self._auto_save_preset(location_id, airline, pick_up_date)
+            # AUTO-SAVE PRESET: Update preset with current stack
+            await self._auto_save_preset(location_id, airline)
 
         except Exception as e:
             logger.error(f"[STEP_FILTER] Apply failed: {e}")
@@ -292,7 +282,6 @@ class StepFilterService:
         return StepResult(
             step_id=step_id,
             filter_type=config.filter_type,
-            pick_up_date=config.pick_up_date,
             trips_modified=independent_count,  # Independent count (only new trips)
             changes=self.changes,
             exclusions=self.exclusions,
@@ -307,13 +296,12 @@ class StepFilterService:
         self,
         location_id: UUID,
         airline: str,
-        pick_up_date: date,
         trip_ids: list[UUID],
     ) -> int:
         """
         Apply existing filter stack to specific trips (for newly imported trips).
 
-        This is called when new trips are imported for a date that already has
+        This is called when new trips are imported for a location+airline that already has
         a filter stack. Instead of creating new FilterStep records, it applies
         the existing stack's filters to only the specified trips.
 
@@ -322,12 +310,11 @@ class StepFilterService:
         if not trip_ids:
             return 0
 
-        # Get all active FilterSteps for this date, ordered by step_order
+        # Get all active FilterSteps ordered by step_order
         steps_query = (
             Select(FilterStep)
             .Where(FilterStep.location_id == location_id)
             .Where(FilterStep.airline == airline)
-            .Where(FilterStep.pick_up_date == pick_up_date)
             .Where(FilterStep.is_active == True)
             .OrderBy(FilterStep.step_order.Asc())
         )
@@ -335,18 +322,18 @@ class StepFilterService:
 
         if not active_steps:
             logger.debug(
-                f"[STACK_APPLY] No active stack for {location_id}/{airline}/{pick_up_date}"
+                f"[STACK_APPLY] No active stack for {location_id}/{airline}"
             )
             return 0
 
         logger.info(
             f"[STACK_APPLY] Applying {len(active_steps)} steps to {len(trip_ids)} new trips "
-            f"for {location_id}/{airline}/{pick_up_date}"
+            f"for {location_id}/{airline}"
         )
 
         # Get only the specified trips that are eligible
         trips = await self._get_eligible_trips(
-            location_id, airline, pick_up_date, trip_ids=trip_ids
+            location_id, airline, trip_ids=trip_ids
         )
 
         if not trips:
@@ -364,7 +351,6 @@ class StepFilterService:
             windows = [TimeWindow(**w) for w in step.windows] if step.windows else []
             config = FilterStepConfig(
                 filter_type=step.filter_type,
-                pick_up_date=str(pick_up_date),
                 windows=windows,
             )
 
@@ -402,9 +388,9 @@ class StepFilterService:
 
                 trip.filtered_at = now
 
-                # Update filter_order for frontend display
+                # Update filter_order — passes pre-loaded steps (no extra query per trip)
                 trip.filter_order = await self._build_filter_order_string(
-                    trip, location_id, airline, pick_up_date
+                    trip, location_id, airline, active_steps=active_steps
                 )
 
                 self.session.add(trip)
@@ -434,19 +420,15 @@ class StepFilterService:
         self,
         location_id: UUID,
         airline: str,
-        pick_up_date_str: str,
     ) -> StepRevertResult:
         """
         Revert the last active step (pop from stack).
         """
-        pick_up_date = date.fromisoformat(pick_up_date_str)
-
         # Get last active step
         query = (
             Select(FilterStep)
             .Where(FilterStep.location_id == location_id)
             .Where(FilterStep.airline == airline)
-            .Where(FilterStep.pick_up_date == pick_up_date)
             .Where(FilterStep.is_active == True)
             .OrderBy(FilterStep.step_order.Desc())
             .Limit(1)
@@ -455,11 +437,10 @@ class StepFilterService:
 
         if not last_step:
             raise ValueError(
-                f"No active steps found for location={location_id}, "
-                f"airline={airline}, date={pick_up_date_str}"
+                f"No active steps found for location={location_id}, airline={airline}"
             )
 
-        return await self._revert_step_internal(last_step, location_id, airline, pick_up_date)
+        return await self._revert_step_internal(last_step, location_id, airline)
 
     async def revert_step(
         self,
@@ -479,25 +460,21 @@ class StepFilterService:
             raise ValueError(f"Step {step_id} is already reverted")
 
         return await self._revert_step_internal(
-            step, step.location_id, step.airline, step.pick_up_date
+            step, step.location_id, step.airline
         )
 
     async def get_stack(
         self,
         location_id: UUID,
         airline: str,
-        pick_up_date_str: str,
     ) -> StackState:
         """
-        Get current stack state for a day.
+        Get current stack state for a location+airline.
         """
-        pick_up_date = date.fromisoformat(pick_up_date_str)
-
         query = (
             Select(FilterStep)
             .Where(FilterStep.location_id == location_id)
             .Where(FilterStep.airline == airline)
-            .Where(FilterStep.pick_up_date == pick_up_date)
             .Where(FilterStep.is_active == True)
             .OrderBy(FilterStep.step_order.Asc())
         )
@@ -523,7 +500,6 @@ class StepFilterService:
         return StackState(
             location_id=location_id,
             airline=airline,
-            pick_up_date=pick_up_date_str,
             steps=step_infos,
             total_trips_affected=total_affected,
         )
@@ -532,24 +508,20 @@ class StepFilterService:
         self,
         location_id: UUID,
         airline: str,
-        pick_up_date_str: str,
         filter_type: str = None,
     ) -> EligibilityResult:
         """
-        Check filter eligibility for a day.
+        Check filter eligibility for a location+airline.
 
         If filter_type is provided, returns breakdown of trips that:
         - Already have this specific filter applied
         - Would be NEW for this filter
         """
-        pick_up_date = date.fromisoformat(pick_up_date_str)
-
-        # Get all outbound scheduled trips for the day
+        # Get all outbound scheduled trips
         query = (
             Select(Trip)
             .Where(Trip.location_id == location_id)
             .Where(Trip.airline == airline)
-            .Where(Trip.pick_up_date == pick_up_date)
             .Where(Trip.trip_type == TripType.OUTBOUND)
             .Where(Trip.status == TripStatus.SCHEDULED)
         )
@@ -582,7 +554,6 @@ class StepFilterService:
         return EligibilityResult(
             location_id=location_id,
             airline=airline,
-            pick_up_date=pick_up_date_str,
             filter_type=filter_type,
             total_trips=len(trips),
             eligible_trips=len(trips),  # All outbound scheduled are eligible
@@ -662,6 +633,7 @@ class StepFilterService:
         Rule A: A trip modified by Combine cannot be modified again in this step.
         NUEVO: Requiere pickup_location y drop_off_location idénticos.
         Procesa cada ventana con su propia config.
+        Trips grouped by pick_up_date — cross-day pairing is never allowed.
         """
         for window in config.windows:
             # Skip window if disabled or no config
@@ -680,92 +652,98 @@ class StepFilterService:
                 )
             ]
 
-            # Sort by effective pickup time
-            sorted_trips = sorted(
-                window_trips,
-                key=lambda t: self._time_to_minutes(self._get_effective_time(t))
-            )
+            # Group by date: trips from different days must never be paired
+            date_groups: dict = defaultdict(list)
+            for t in window_trips:
+                date_groups[t.pick_up_date].append(t)
 
-            i = 0
-            while i < len(sorted_trips) - 1:
-                trip_a = sorted_trips[i]
-                trip_b = sorted_trips[i + 1]
+            for date_trips in date_groups.values():
+                # Sort by effective pickup time within this day
+                sorted_trips = sorted(
+                    date_trips,
+                    key=lambda t: self._time_to_minutes(self._get_effective_time(t))
+                )
 
-                # Rule A check
-                if (trip_a.id in self.modified_by_combine_expand or
-                    trip_b.id in self.modified_by_combine_expand):
-                    i += 1
-                    continue
+                i = 0
+                while i < len(sorted_trips) - 1:
+                    trip_a = sorted_trips[i]
+                    trip_b = sorted_trips[i + 1]
 
-                # SKIP trips that already have combine_applied (re-preview case)
-                if trip_a.combine_applied or trip_b.combine_applied:
-                    # Record exclusion for trips already combined
-                    if trip_a.combine_applied:
-                        self._record_exclusion(
-                            f"combine({trip_a.id})",
-                            [trip_a.id],
-                            "Already has Combine applied",
-                            0, 0,
-                            trips=[trip_a],
+                    # Rule A check
+                    if (trip_a.id in self.modified_by_combine_expand or
+                        trip_b.id in self.modified_by_combine_expand):
+                        i += 1
+                        continue
+
+                    # SKIP trips that already have combine_applied (re-preview case)
+                    if trip_a.combine_applied or trip_b.combine_applied:
+                        # Record exclusion for trips already combined
+                        if trip_a.combine_applied:
+                            self._record_exclusion(
+                                f"combine({trip_a.id})",
+                                [trip_a.id],
+                                "Already has Combine applied",
+                                0, 0,
+                                trips=[trip_a],
+                            )
+                        if trip_b.combine_applied and trip_b.id != trip_a.id:
+                            self._record_exclusion(
+                                f"combine({trip_b.id})",
+                                [trip_b.id],
+                                "Already has Combine applied",
+                                0, 0,
+                                trips=[trip_b],
+                            )
+                        i += 1
+                        continue
+
+                    # PRIORITY RULE: Expand has absolute priority
+                    if trip_a.expand_applied or trip_b.expand_applied:
+                        logger.info(
+                            f"[PRIORITY_RULE] Combine skipping pair "
+                            f"({trip_a.id}, {trip_b.id}): "
+                            f"Expand already claimed these trips "
+                            f"(expand_applied: {trip_a.expand_applied}, {trip_b.expand_applied})"
                         )
-                    if trip_b.combine_applied and trip_b.id != trip_a.id:
                         self._record_exclusion(
-                            f"combine({trip_b.id})",
-                            [trip_b.id],
-                            "Already has Combine applied",
-                            0, 0,
-                            trips=[trip_b],
+                            f"combine({trip_a.id}, {trip_b.id})",
+                            [trip_a.id, trip_b.id],
+                            "Skipped: Expand has priority (applied in earlier step)",
+                            0,
+                            0,
+                            trips=[trip_a, trip_b],
                         )
-                    i += 1
-                    continue
+                        i += 1
+                        continue
 
-                # PRIORITY RULE: Expand has absolute priority
-                if trip_a.expand_applied or trip_b.expand_applied:
-                    logger.info(
-                        f"[PRIORITY_RULE] Combine skipping pair "
-                        f"({trip_a.id}, {trip_b.id}): "
-                        f"Expand already claimed these trips "
-                        f"(expand_applied: {trip_a.expand_applied}, {trip_b.expand_applied})"
-                    )
-                    self._record_exclusion(
-                        f"combine({trip_a.id}, {trip_b.id})",
-                        [trip_a.id, trip_b.id],
-                        "Skipped: Expand has priority (applied in earlier step)",
-                        0,
-                        0,
-                        trips=[trip_a, trip_b],
-                    )
-                    i += 1
-                    continue
+                    # PUNTO 9: Combine requiere pickup y dropoff idénticos
+                    if (trip_a.pick_up_location != trip_b.pick_up_location or
+                        trip_a.drop_off_location != trip_b.drop_off_location):
+                        logger.debug(
+                            f"[STEP_FILTER] Skipping Combine: location mismatch "
+                            f"({trip_a.pick_up_location}→{trip_a.drop_off_location}) vs "
+                            f"({trip_b.pick_up_location}→{trip_b.drop_off_location})"
+                        )
+                        i += 1
+                        continue
 
-                # PUNTO 9: Combine requiere pickup y dropoff idénticos
-                if (trip_a.pick_up_location != trip_b.pick_up_location or
-                    trip_a.drop_off_location != trip_b.drop_off_location):
-                    logger.debug(
-                        f"[STEP_FILTER] Skipping Combine: location mismatch "
-                        f"({trip_a.pick_up_location}→{trip_a.drop_off_location}) vs "
-                        f"({trip_b.pick_up_location}→{trip_b.drop_off_location})"
-                    )
-                    i += 1
-                    continue
+                    time_a = self._get_effective_time(trip_a)
+                    time_b = self._get_effective_time(trip_b)
 
-                time_a = self._get_effective_time(trip_a)
-                time_b = self._get_effective_time(trip_b)
+                    gap = self._minutes_between(time_a, time_b)
 
-                gap = self._minutes_between(time_a, time_b)
+                    if window.min_gap <= gap <= window.max_gap:
+                        midpoint = self._calculate_midpoint(time_a, time_b)
 
-                if window.min_gap <= gap <= window.max_gap:
-                    midpoint = self._calculate_midpoint(time_a, time_b)
+                        self._record_change(trip_a, time_a, midpoint, "combine")
+                        self._record_change(trip_b, time_b, midpoint, "combine")
 
-                    self._record_change(trip_a, time_a, midpoint, "combine")
-                    self._record_change(trip_b, time_b, midpoint, "combine")
+                        self.modified_by_combine_expand.add(trip_a.id)
+                        self.modified_by_combine_expand.add(trip_b.id)
 
-                    self.modified_by_combine_expand.add(trip_a.id)
-                    self.modified_by_combine_expand.add(trip_b.id)
-
-                    i += 2  # Skip both
-                else:
-                    i += 1
+                        i += 2  # Skip both
+                    else:
+                        i += 1
 
     async def _apply_expand(self, trips: list[Trip], config: FilterStepConfig):
         """
@@ -843,15 +821,15 @@ class StepFilterService:
             if len(available_trips) < 2:
                 continue
 
-            # Group by location (pickup_location, drop_off_location)
+            # Group by date + location — cross-day chaining is never allowed
             from collections import defaultdict
             location_groups = defaultdict(list)
             for trip in available_trips:
-                key = (trip.pick_up_location, trip.drop_off_location)
+                key = (trip.pick_up_date, trip.pick_up_location, trip.drop_off_location)
                 location_groups[key].append(trip)
 
-            # Process each location group independently
-            for (pickup_loc, dropoff_loc), group_trips in location_groups.items():
+            # Process each date+location group independently
+            for (_, pickup_loc, dropoff_loc), group_trips in location_groups.items():
                 if len(group_trips) < 2:
                     continue
 
@@ -1199,13 +1177,12 @@ class StepFilterService:
         step: FilterStep,
         location_id: UUID,
         airline: str,
-        pick_up_date: date,
     ) -> StepRevertResult:
         """
         Internal method to revert a step.
 
         1. Mark step as inactive
-        2. Reset all trips for this day to original_pick_up_time
+        2. Reset all filtered trips to original_pick_up_time
         3. Re-apply remaining active steps in order
         4. Single commit at the end (atomic operation)
 
@@ -1219,12 +1196,11 @@ class StepFilterService:
         step.is_active = False
         self.session.add(step)
 
-        # Get all trips for this day that have filters applied
+        # Get all trips that have filters applied
         trips_query = (
             Select(Trip)
             .Where(Trip.location_id == location_id)
             .Where(Trip.airline == airline)
-            .Where(Trip.pick_up_date == pick_up_date)
             .Where(Trip.original_pick_up_time != None)
         )
         trips = await self.session.exec(trips_query).all()
@@ -1250,7 +1226,6 @@ class StepFilterService:
             Select(FilterStep)
             .Where(FilterStep.location_id == location_id)
             .Where(FilterStep.airline == airline)
-            .Where(FilterStep.pick_up_date == pick_up_date)
             .Where(FilterStep.is_active == True)
             .Where(FilterStep.id != step_id)  # Exclude the step being reverted
             .OrderBy(FilterStep.step_order.Asc())
@@ -1267,7 +1242,6 @@ class StepFilterService:
                 # Rebuild config from stored data
                 config = FilterStepConfig(
                     filter_type=active_step.filter_type,
-                    pick_up_date=str(pick_up_date),
                     windows=[TimeWindow(**w) for w in active_step.windows],
                 )
 
@@ -1300,9 +1274,9 @@ class StepFilterService:
                         elif config.filter_type == "expand":
                             trip.expand_applied = True
 
-                        # Update filter_order for this trip
+                        # Update filter_order — passes pre-loaded steps (no extra query per trip)
                         trip.filter_order = await self._build_filter_order_string(
-                            trip, location_id, airline, pick_up_date
+                            trip, location_id, airline, active_steps=active_steps
                         )
 
                         self.session.add(trip)
@@ -1321,13 +1295,13 @@ class StepFilterService:
         # AUTO-UPDATE PRESET: Update preset after step revert
         if active_steps:
             # Some filters remain → update preset with current config
-            await self._auto_save_preset(location_id, airline, pick_up_date)
+            await self._auto_save_preset(location_id, airline)
         else:
-            # No filters remain for this day → check if ANY filters remain globally
+            # No filters remain → check if preset should be deleted
             await self._update_preset_after_revert(location_id, airline, filter_type)
 
         # Get updated stack state
-        stack_state = await self.get_stack(location_id, airline, str(pick_up_date))
+        stack_state = await self.get_stack(location_id, airline)
 
         # No delay needed - single commit is already fully propagated
         # Send notification immediately
@@ -1391,7 +1365,6 @@ class StepFilterService:
         self,
         location_id: UUID,
         airline: str,
-        pick_up_date: date,
         trip_ids: Optional[list[UUID]] = None,
     ) -> list[Trip]:
         """
@@ -1404,7 +1377,6 @@ class StepFilterService:
             Select(Trip)
             .Where(Trip.location_id == location_id)
             .Where(Trip.airline == airline)
-            .Where(Trip.pick_up_date == pick_up_date)
             .Where(Trip.trip_type == TripType.OUTBOUND)
             .Where(Trip.status == TripStatus.SCHEDULED)
         )
@@ -1419,14 +1391,12 @@ class StepFilterService:
         self,
         location_id: UUID,
         airline: str,
-        pick_up_date: date,
     ) -> int:
         """Get the next step order number."""
         query = (
             Select(FilterStep.step_order)
             .Where(FilterStep.location_id == location_id)
             .Where(FilterStep.airline == airline)
-            .Where(FilterStep.pick_up_date == pick_up_date)
             .OrderBy(FilterStep.step_order.Desc())
             .Limit(1)
         )
@@ -1442,33 +1412,31 @@ class StepFilterService:
         trip: Trip,
         location_id: UUID,
         airline: str,
-        pick_up_date: date,
+        active_steps: list[FilterStep] = None,
     ) -> Optional[str]:
         """
         Construye string con el orden cronológico de filtros aplicados (sin duplicados).
 
         Ejemplo: "expand,reduce" significa expand se aplicó primero, reduce después.
 
-        Maneja correctamente casos con múltiples steps del mismo tipo activos
-        (solo incluye cada tipo UNA vez, usando el step_order más bajo).
-
         Args:
             trip: Trip con flags actualizados
-            location_id, airline, pick_up_date: Para buscar steps activos
+            location_id, airline: Para buscar steps activos (solo si active_steps=None)
+            active_steps: Steps ya cargados (evita N+1 cuando se llama en un loop)
 
         Returns:
             String como "expand,reduce" o "reduce,combine,expand" o None si no hay filtros
         """
-        # Obtener steps activos para este día
-        steps_query = (
-            Select(FilterStep)
-            .Where(FilterStep.location_id == location_id)
-            .Where(FilterStep.airline == airline)
-            .Where(FilterStep.pick_up_date == pick_up_date)
-            .Where(FilterStep.is_active == True)
-            .OrderBy(FilterStep.step_order.Asc())
-        )
-        active_steps = await self.session.exec(steps_query).all()
+        # Usar steps pre-cargados si los hay, o hacer la query una sola vez
+        if active_steps is None:
+            steps_query = (
+                Select(FilterStep)
+                .Where(FilterStep.location_id == location_id)
+                .Where(FilterStep.airline == airline)
+                .Where(FilterStep.is_active == True)
+                .OrderBy(FilterStep.step_order.Asc())
+            )
+            active_steps = await self.session.exec(steps_query).all()
 
         if not active_steps:
             return None
@@ -1476,7 +1444,6 @@ class StepFilterService:
         # Construir mapa: filter_type -> step_order más bajo (sin duplicados)
         filter_step_map = {}
         for step in active_steps:
-            # Solo agregar si el trip tiene ese filtro Y no lo hemos agregado antes
             if step.filter_type == "reduce" and trip.reduce_applied:
                 if "reduce" not in filter_step_map:
                     filter_step_map["reduce"] = step.step_order
@@ -1490,7 +1457,6 @@ class StepFilterService:
         if not filter_step_map:
             return None
 
-        # Ordenar por step_order y crear string (sin duplicados)
         filters_ordered = sorted(filter_step_map.items(), key=lambda x: x[1])
         return ",".join(f[0] for f in filters_ordered)
 
@@ -1592,7 +1558,6 @@ class StepFilterService:
             new_time=new_time,
             filter_applied=filter_type,
             hotel_name=trip.pick_up_location or "",
-            pick_up_date=str(trip.pick_up_date) if trip.pick_up_date else None,
             airline=trip.airline,
             flight_number=trip.flight_number,
         ))
@@ -1623,7 +1588,6 @@ class StepFilterService:
                     airline=trip.airline,
                     flight_number=trip.flight_number,
                     hotel_name=trip.pick_up_location or "",
-                    pick_up_date=str(trip.pick_up_date) if trip.pick_up_date else None,
                     pick_up_time=pick_up_time_str,
                     original_pick_up_time=original_time_str,
                 ))
@@ -1704,21 +1668,19 @@ class StepFilterService:
         self,
         location_id: UUID,
         airline: str,
-        pick_up_date: date,
     ):
         """
-        Auto-save the current day's stack as the preset for this location+airline.
+        Auto-save the current stack as the preset for this location+airline.
 
         Called after successfully applying a filter step.
         This ensures the preset always reflects the latest configuration.
         """
         try:
-            # Get all active steps for this day (the one we just modified)
+            # Get all active steps
             steps_query = (
                 Select(FilterStep)
                 .Where(FilterStep.location_id == location_id)
                 .Where(FilterStep.airline == airline)
-                .Where(FilterStep.pick_up_date == pick_up_date)
                 .Where(FilterStep.is_active == True)
                 .OrderBy(FilterStep.step_order.Asc())
             )
@@ -1726,7 +1688,7 @@ class StepFilterService:
 
             if not active_steps:
                 logger.debug(
-                    f"[AUTO_PRESET] No active steps for {pick_up_date}, skipping preset save"
+                    f"[AUTO_PRESET] No active steps for {location_id}/{airline}, skipping preset save"
                 )
                 return
 
@@ -1763,10 +1725,10 @@ class StepFilterService:
         filter_type: Optional[str],
     ):
         """
-        Update or delete preset after bulk revert.
+        Update or delete preset after a step revert.
 
-        - If all filter types were reverted (filter_type=None) → DELETE preset
-        - If specific filter type was reverted → UPDATE preset to reflect remaining filters
+        - If no active steps remain → DELETE preset
+        - If some steps remain → UPDATE preset to reflect remaining filters
         """
         try:
             # Import here to avoid circular import
@@ -1789,30 +1751,14 @@ class StepFilterService:
                 await preset_service.delete_preset(location_id, airline)
                 logger.info(
                     f"[AUTO_PRESET] Deleted preset for {location_id}/{airline}: "
-                    f"No active filters remain after bulk revert"
+                    f"No active filters remain after revert"
                 )
             else:
-                # Some filters remain → UPDATE preset with any day's current config
-                # Get the most recent day with active steps
-                day_query = (
-                    Select(FilterStep.pick_up_date)
-                    .Where(FilterStep.location_id == location_id)
-                    .Where(FilterStep.airline == airline)
-                    .Where(FilterStep.is_active == True)
-                    .OrderBy(FilterStep.pick_up_date.Desc())
-                    .Limit(1)
+                # Some filters remain → UPDATE preset with current stack
+                await self._auto_save_preset(location_id, airline)
+                logger.info(
+                    f"[AUTO_PRESET] Updated preset for {location_id}/{airline} after partial revert"
                 )
-                recent_date_row = await self.session.exec(day_query).first()
-
-                if recent_date_row:
-                    # Extract date from row result
-                    recent_date = recent_date_row[0] if hasattr(recent_date_row, '__getitem__') else recent_date_row
-
-                    # Get that day's stack and save as preset
-                    await self._auto_save_preset(location_id, airline, recent_date)
-                    logger.info(
-                        f"[AUTO_PRESET] Updated preset from {recent_date} after partial revert"
-                    )
 
         except Exception as e:
             # Don't fail the main operation if preset update fails
@@ -1906,608 +1852,3 @@ class StepFilterService:
         )
 
         logger.info(f"[STEP_FILTER] Revert notification sent: step={step_id}")
-
-    # =========================================================================
-    # Bulk Operations (Multi-Day)
-    # =========================================================================
-
-    async def _get_dates_with_eligible_trips(
-        self,
-        location_id: UUID,
-        airline: str,
-        date_from: date,
-        date_to: Optional[date] = None,
-    ) -> list[date]:
-        """
-        Get all unique pick_up_dates that have eligible trips in the date range.
-
-        If date_to is None, returns all future dates from date_from.
-        """
-        from psqlmodel import Select
-
-        query = (
-            Select(Trip.pick_up_date)
-            .Where(Trip.location_id == location_id)
-            .Where(Trip.airline == airline)
-            .Where(Trip.pick_up_date >= date_from)
-            .Where(Trip.trip_type == TripType.OUTBOUND)
-            .Where(Trip.status == TripStatus.SCHEDULED)
-            .Distinct()
-            .OrderBy(Trip.pick_up_date.Asc())
-        )
-
-        if date_to:
-            query = query.Where(Trip.pick_up_date <= date_to)
-
-        results = await self.session.exec(query).all()
-        # Results come as RowResult objects (date,) when selecting single column
-        # Access [0] to extract the actual date value
-        return [r[0] if hasattr(r, '__getitem__') else r for r in results]
-
-    async def _day_has_active_stack(
-        self,
-        location_id: UUID,
-        airline: str,
-        pick_up_date: date,
-        filter_type: str | None = None,
-    ) -> bool:
-        """
-        Check if a day already has active filter steps.
-
-        Args:
-            location_id: Location UUID
-            airline: Airline code
-            pick_up_date: Date to check
-            filter_type: If provided, only check for steps of this specific type.
-                        This allows stacking different filter types (reduce → combine → expand)
-                        while preventing duplicate application of the same filter type.
-
-        Returns:
-            True if matching active step(s) exist.
-        """
-        query = (
-            Select(FilterStep.id)
-            .Where(FilterStep.location_id == location_id)
-            .Where(FilterStep.airline == airline)
-            .Where(FilterStep.pick_up_date == pick_up_date)
-            .Where(FilterStep.is_active == True)
-        )
-
-        if filter_type:
-            query = query.Where(FilterStep.filter_type == filter_type)
-
-        query = query.Limit(1)
-        result = await self.session.exec(query).first()
-        return result is not None
-
-    async def preview_bulk(
-        self,
-        location_id: UUID,
-        airline: str,
-        config: BulkFilterConfig,
-    ) -> BulkStepResult:
-        """
-        Preview a filter across multiple days (bulk operation).
-
-        Iterates through all dates with eligible trips and simulates
-        the filter for each day.
-        """
-        date_from = date.fromisoformat(config.date_from)
-        date_to = date.fromisoformat(config.date_to) if config.date_to else None
-
-        # Get all dates with eligible trips
-        dates = await self._get_dates_with_eligible_trips(
-            location_id, airline, date_from, date_to
-        )
-
-        logger.info(
-            f"[BULK_FILTER] Preview: {len(dates)} dates found for "
-            f"location={location_id}, airline={airline}, "
-            f"range={date_from} to {date_to or 'future'}"
-        )
-
-        if not dates:
-            return BulkStepResult(
-                filter_type=config.filter_type,
-                date_from=config.date_from,
-                date_to=config.date_to,
-                total_days=0,
-                days_processed=0,
-                days_skipped=0,
-                total_trips_modified=0,
-                total_exclusions=0,
-                by_date=[],
-            )
-
-        by_date = []
-        all_changes = []
-        all_exclusions = []
-        days_processed = 0
-        days_skipped = 0
-
-        for pick_up_date in dates:
-            # Check if we should skip days with existing stack OF THE SAME TYPE
-            if config.skip_days_with_stack:
-                has_stack = await self._day_has_active_stack(
-                    location_id, airline, pick_up_date,
-                    filter_type=config.filter_type  # Only skip if same type exists
-                )
-                if has_stack:
-                    by_date.append(DayResult(
-                        pick_up_date=str(pick_up_date),
-                        trips_modified=0,
-                        exclusions_count=0,
-                        skipped=True,
-                        skip_reason=f"Day already has active {config.filter_type} filter"
-                    ))
-                    days_skipped += 1
-                    continue
-
-            # Create per-day config
-            day_config = FilterStepConfig(
-                filter_type=config.filter_type,
-                pick_up_date=str(pick_up_date),
-                windows=config.windows,
-            )
-
-            # Preview for this day
-            try:
-                result = await self.preview_step(location_id, airline, day_config)
-
-                by_date.append(DayResult(
-                    pick_up_date=str(pick_up_date),
-                    trips_modified=result.trips_modified,
-                    exclusions_count=len(result.exclusions),
-                    step_id=None,
-                    skipped=False,
-                ))
-
-                all_changes.extend(result.changes)
-                all_exclusions.extend(result.exclusions)
-                days_processed += 1
-
-            except Exception as e:
-                logger.error(f"[BULK_FILTER] Error previewing {pick_up_date}: {e}")
-                by_date.append(DayResult(
-                    pick_up_date=str(pick_up_date),
-                    trips_modified=0,
-                    exclusions_count=0,
-                    skipped=True,
-                    skip_reason=f"Error: {str(e)}"
-                ))
-                days_skipped += 1
-
-        return BulkStepResult(
-            filter_type=config.filter_type,
-            date_from=config.date_from,
-            date_to=config.date_to,
-            total_days=len(dates),
-            days_processed=days_processed,
-            days_skipped=days_skipped,
-            total_trips_modified=sum(d.trips_modified for d in by_date if not d.skipped),
-            total_exclusions=len(all_exclusions),
-            by_date=by_date,
-            all_changes=all_changes,
-            all_exclusions=all_exclusions,
-        )
-
-    async def apply_bulk(
-        self,
-        location_id: UUID,
-        airline: str,
-        config: BulkFilterConfig,
-    ) -> BulkStepResult:
-        """
-        Apply a filter across multiple days (bulk operation).
-
-        Iterates through all dates with eligible trips and applies
-        the filter for each day, creating one step per day.
-        """
-        date_from = date.fromisoformat(config.date_from)
-        date_to = date.fromisoformat(config.date_to) if config.date_to else None
-
-        # Get all dates with eligible trips
-        dates = await self._get_dates_with_eligible_trips(
-            location_id, airline, date_from, date_to
-        )
-
-        logger.info(
-            f"[BULK_FILTER] Apply: {len(dates)} dates found for "
-            f"location={location_id}, airline={airline}, "
-            f"range={date_from} to {date_to or 'future'}"
-        )
-
-        if not dates:
-            return BulkStepResult(
-                filter_type=config.filter_type,
-                date_from=config.date_from,
-                date_to=config.date_to,
-                total_days=0,
-                days_processed=0,
-                days_skipped=0,
-                total_trips_modified=0,
-                total_exclusions=0,
-                by_date=[],
-            )
-
-        by_date = []
-        all_changes = []
-        all_exclusions = []
-        days_processed = 0
-        days_skipped = 0
-
-        for pick_up_date in dates:
-            # Check if we should skip days with existing stack OF THE SAME TYPE
-            if config.skip_days_with_stack:
-                has_stack = await self._day_has_active_stack(
-                    location_id, airline, pick_up_date,
-                    filter_type=config.filter_type  # Only skip if same type exists
-                )
-                if has_stack:
-                    by_date.append(DayResult(
-                        pick_up_date=str(pick_up_date),
-                        trips_modified=0,
-                        exclusions_count=0,
-                        skipped=True,
-                        skip_reason=f"Day already has active {config.filter_type} filter"
-                    ))
-                    days_skipped += 1
-                    continue
-
-            # Create per-day config
-            day_config = FilterStepConfig(
-                filter_type=config.filter_type,
-                pick_up_date=str(pick_up_date),
-                windows=config.windows,
-            )
-
-            # Apply for this day
-            try:
-                result = await self.apply_step(location_id, airline, day_config)
-
-                by_date.append(DayResult(
-                    pick_up_date=str(pick_up_date),
-                    trips_modified=result.trips_modified,
-                    exclusions_count=len(result.exclusions),
-                    step_id=result.step_id,
-                    skipped=False,
-                ))
-
-                all_changes.extend(result.changes)
-                all_exclusions.extend(result.exclusions)
-                days_processed += 1
-
-            except Exception as e:
-                logger.error(f"[BULK_FILTER] Error applying to {pick_up_date}: {e}")
-                by_date.append(DayResult(
-                    pick_up_date=str(pick_up_date),
-                    trips_modified=0,
-                    exclusions_count=0,
-                    skipped=True,
-                    skip_reason=f"Error: {str(e)}"
-                ))
-                days_skipped += 1
-
-        # Apply to dates OUTSIDE the requested range that don't have this filter
-        # This handles "orphan" dates (e.g., Jan 31 in a Feb upload)
-        processed_dates = set(d.date() if hasattr(d, 'date') else d for d in dates)
-        all_location_dates = await self._get_dates_with_eligible_trips(
-            location_id, airline, date(2000, 1, 1), None
-        )
-
-        for pick_up_date in all_location_dates:
-            if pick_up_date in processed_dates:
-                continue
-
-            has_this_filter = await self._day_has_active_stack(
-                location_id, airline, pick_up_date,
-                filter_type=config.filter_type
-            )
-            if has_this_filter:
-                continue
-
-            day_config = FilterStepConfig(
-                filter_type=config.filter_type,
-                pick_up_date=str(pick_up_date),
-                windows=config.windows,
-            )
-
-            try:
-                result = await self.apply_step(location_id, airline, day_config)
-                by_date.append(DayResult(
-                    pick_up_date=str(pick_up_date),
-                    trips_modified=result.trips_modified,
-                    exclusions_count=len(result.exclusions),
-                    step_id=result.step_id,
-                    skipped=False,
-                ))
-                all_changes.extend(result.changes)
-                days_processed += 1
-
-                logger.info(
-                    f"[BULK_FILTER] Orphan date {pick_up_date}: applied {config.filter_type}"
-                )
-            except Exception as e:
-                logger.error(f"[BULK_FILTER] Error on orphan {pick_up_date}: {e}")
-
-        logger.info(
-            f"[BULK_FILTER] Completed: {days_processed} days processed, "
-            f"{days_skipped} skipped, {sum(d.trips_modified for d in by_date)} trips modified"
-        )
-
-        return BulkStepResult(
-            filter_type=config.filter_type,
-            date_from=config.date_from,
-            date_to=config.date_to,
-            total_days=len(dates),
-            days_processed=days_processed,
-            days_skipped=days_skipped,
-            total_trips_modified=sum(d.trips_modified for d in by_date if not d.skipped),
-            total_exclusions=len(all_exclusions),
-            by_date=by_date,
-            all_changes=all_changes,
-            all_exclusions=all_exclusions,
-        )
-
-    async def get_bulk_eligibility(
-        self,
-        location_id: UUID,
-        airline: str,
-        date_from_str: str,
-        date_to_str: Optional[str] = None,
-        filter_type: Optional[str] = None,
-    ) -> BulkEligibilityResult:
-        """
-        Check filter eligibility across multiple days.
-
-        Returns summary and per-day breakdown of eligible trips.
-        If filter_type is provided, includes filter-specific counts.
-        """
-        date_from = date.fromisoformat(date_from_str)
-        date_to = date.fromisoformat(date_to_str) if date_to_str else None
-
-        # Get all dates with eligible trips
-        dates = await self._get_dates_with_eligible_trips(
-            location_id, airline, date_from, date_to
-        )
-
-        by_date = []
-        total_eligible = 0
-        total_trips_with_filter = 0
-        total_trips_new = 0
-
-        for pick_up_date in dates:
-            try:
-                result = await self.get_eligibility(
-                    location_id, airline, str(pick_up_date), filter_type
-                )
-                day_data = {
-                    "pick_up_date": str(pick_up_date),
-                    "total_trips": result.total_trips,
-                    "eligible_trips": result.eligible_trips,
-                    "already_filtered": result.already_filtered,
-                    "by_hotel": result.by_hotel,
-                }
-
-                # Add filter-specific fields if filter_type provided
-                if filter_type:
-                    day_data["filter_type"] = filter_type
-                    day_data["trips_with_filter"] = result.trips_with_filter or 0
-                    day_data["trips_new"] = result.trips_new or 0
-                    total_trips_with_filter += result.trips_with_filter or 0
-                    total_trips_new += result.trips_new or 0
-
-                by_date.append(day_data)
-                total_eligible += result.eligible_trips
-            except Exception as e:
-                logger.error(f"[BULK_FILTER] Error getting eligibility for {pick_up_date}: {e}")
-                by_date.append({
-                    "pick_up_date": str(pick_up_date),
-                    "eligible_trips": 0,
-                    "error": str(e),
-                })
-
-        return BulkEligibilityResult(
-            location_id=location_id,
-            airline=airline,
-            date_from=date_from_str,
-            date_to=date_to_str,
-            filter_type=filter_type,
-            total_days=len(dates),
-            total_trips=total_eligible,
-            total_eligible=total_eligible,
-            trips_with_filter=total_trips_with_filter if filter_type else None,
-            trips_new=total_trips_new if filter_type else None,
-            by_date=by_date,
-        )
-
-    async def revert_bulk(
-        self,
-        location_id: UUID,
-        airline: str,
-        config: BulkRevertConfig,
-    ) -> BulkRevertResult:
-        """
-        Revert filter steps across multiple days (bulk operation).
-
-        This allows reverting all steps of a specific filter_type (or all types)
-        across a date range or all future dates.
-
-        Args:
-            location_id: Location UUID
-            airline: Airline code
-            config: BulkRevertConfig with date_from, date_to, filter_type
-
-        Returns:
-            BulkRevertResult with summary and per-day details
-        """
-        date_from = date.fromisoformat(config.date_from)
-        date_to = date.fromisoformat(config.date_to) if config.date_to else None
-
-        logger.info(
-            f"[BULK_REVERT] Starting: location={location_id}, airline={airline}, "
-            f"range={config.date_from} to {config.date_to or 'future'}, "
-            f"filter_type={config.filter_type or 'all'}"
-        )
-
-        # Get all dates with active steps in range
-        dates = await self._get_dates_with_active_steps(
-            location_id, airline, date_from, date_to, config.filter_type
-        )
-
-        if not dates:
-            logger.info("[BULK_REVERT] No dates with matching active steps found")
-            return BulkRevertResult(
-                date_from=config.date_from,
-                date_to=config.date_to,
-                filter_type=config.filter_type,
-                total_days=0,
-                days_with_reverts=0,
-                days_skipped=0,
-                total_steps_reverted=0,
-                total_trips_recalculated=0,
-                by_date=[],
-            )
-
-        by_date = []
-        total_steps_reverted = 0
-        total_trips_recalculated = 0
-        days_with_reverts = 0
-        days_skipped = 0
-
-        for pick_up_date in dates:
-            try:
-                # Get active steps for this day matching filter_type
-                steps_to_revert = await self._get_steps_to_revert(
-                    location_id, airline, pick_up_date, config.filter_type
-                )
-
-                if not steps_to_revert:
-                    by_date.append(DayRevertResult(
-                        pick_up_date=str(pick_up_date),
-                        steps_reverted=0,
-                        step_ids=[],
-                        trips_recalculated=0,
-                        skipped=True,
-                        skip_reason="No matching active steps",
-                    ))
-                    days_skipped += 1
-                    continue
-
-                # Revert each step
-                step_ids = []
-                trips_recalculated = 0
-
-                for step in steps_to_revert:
-                    result = await self._revert_step_internal(
-                        step, location_id, airline, pick_up_date
-                    )
-                    step_ids.append(step.id)
-                    trips_recalculated += result.trips_recalculated
-
-                by_date.append(DayRevertResult(
-                    pick_up_date=str(pick_up_date),
-                    steps_reverted=len(step_ids),
-                    step_ids=step_ids,
-                    trips_recalculated=trips_recalculated,
-                    skipped=False,
-                ))
-
-                total_steps_reverted += len(step_ids)
-                total_trips_recalculated += trips_recalculated
-                days_with_reverts += 1
-
-                logger.debug(
-                    f"[BULK_REVERT] Reverted {len(step_ids)} steps for {pick_up_date}"
-                )
-
-            except Exception as e:
-                logger.error(f"[BULK_REVERT] Error reverting {pick_up_date}: {e}")
-                by_date.append(DayRevertResult(
-                    pick_up_date=str(pick_up_date),
-                    steps_reverted=0,
-                    step_ids=[],
-                    trips_recalculated=0,
-                    skipped=True,
-                    skip_reason=str(e),
-                ))
-                days_skipped += 1
-
-        logger.info(
-            f"[BULK_REVERT] Completed: {days_with_reverts} days reverted, "
-            f"{total_steps_reverted} steps, {total_trips_recalculated} trips"
-        )
-
-        # AUTO-UPDATE/DELETE PRESET after bulk revert
-        if total_steps_reverted > 0:
-            await self._update_preset_after_revert(location_id, airline, config.filter_type)
-
-        return BulkRevertResult(
-            date_from=config.date_from,
-            date_to=config.date_to,
-            filter_type=config.filter_type,
-            total_days=len(dates),
-            days_with_reverts=days_with_reverts,
-            days_skipped=days_skipped,
-            total_steps_reverted=total_steps_reverted,
-            total_trips_recalculated=total_trips_recalculated,
-            by_date=by_date,
-        )
-
-    async def _get_dates_with_active_steps(
-        self,
-        location_id: UUID,
-        airline: str,
-        date_from: date,
-        date_to: Optional[date],
-        filter_type: Optional[str] = None,
-    ) -> list[date]:
-        """
-        Get all unique pick_up_dates that have active steps matching criteria.
-        """
-        query = (
-            Select(FilterStep.pick_up_date)
-            .Where(FilterStep.location_id == location_id)
-            .Where(FilterStep.airline == airline)
-            .Where(FilterStep.pick_up_date >= date_from)
-            .Where(FilterStep.is_active == True)
-            .Distinct()
-            .OrderBy(FilterStep.pick_up_date.Asc())
-        )
-
-        if date_to:
-            query = query.Where(FilterStep.pick_up_date <= date_to)
-
-        if filter_type:
-            query = query.Where(FilterStep.filter_type == filter_type)
-
-        results = await self.session.exec(query).all()
-        # Results come as RowResult objects, extract the date value
-        return [r[0] if hasattr(r, '__getitem__') else r for r in results]
-
-    async def _get_steps_to_revert(
-        self,
-        location_id: UUID,
-        airline: str,
-        pick_up_date: date,
-        filter_type: Optional[str] = None,
-    ) -> list[FilterStep]:
-        """
-        Get active steps for a day that should be reverted.
-
-        Returns steps in reverse order (highest step_order first) so that
-        reverts happen in correct stack order.
-        """
-        query = (
-            Select(FilterStep)
-            .Where(FilterStep.location_id == location_id)
-            .Where(FilterStep.airline == airline)
-            .Where(FilterStep.pick_up_date == pick_up_date)
-            .Where(FilterStep.is_active == True)
-            .OrderBy(FilterStep.step_order.Desc())
-        )
-
-        if filter_type:
-            query = query.Where(FilterStep.filter_type == filter_type)
-
-        return await self.session.exec(query).all()

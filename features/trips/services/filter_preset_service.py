@@ -5,7 +5,7 @@ Manages global filter presets per Location + Airline and auto-application on imp
 """
 
 import logging
-from datetime import date, datetime
+from datetime import datetime
 from typing import Optional
 from uuid import UUID, uuid4
 
@@ -157,17 +157,14 @@ class FilterPresetService:
         self,
         location_id: UUID,
         airline: str,
-        pick_up_dates: list[date],
     ) -> AutoApplyResult:
         """
-        Auto-apply preset to new days.
+        Auto-apply preset to a location+airline.
 
         Logic:
         1. Get preset for location+airline
-        2. For each pick_up_date:
-           - If day has NO stack → clone preset and apply
-           - If day HAS stack → skip (respect existing config)
-        3. Return summary
+        2. If no active stack exists → apply preset
+        3. If stack already exists → skip (respect existing config)
 
         This is called after import commits trips to DB.
         """
@@ -182,88 +179,58 @@ class FilterPresetService:
                 reason="No preset found for this location+airline"
             )
 
-        logger.info(
-            f"[AUTO_PRESET] Preset found for location={location_id}, airline={airline}. "
-            f"Processing {len(pick_up_dates)} dates"
+        # 2. Check if stack already exists
+        existing_query = (
+            Select(FilterStep.id)
+            .Where(FilterStep.location_id == location_id)
+            .Where(FilterStep.airline == airline)
+            .Where(FilterStep.is_active == True)
+            .Limit(1)
         )
+        existing_step = await self.session.exec(existing_query).first()
 
-        # 2. Filter days that DON'T have stack yet
-        days_to_process = []
-        days_skipped = []
-
-        for pick_up_date in pick_up_dates:
-            # Check if day already has steps
-            existing_query = (
-                Select(FilterStep.id)
-                .Where(FilterStep.location_id == location_id)
-                .Where(FilterStep.airline == airline)
-                .Where(FilterStep.pick_up_date == pick_up_date)
-                .Where(FilterStep.is_active == True)
-                .Limit(1)
-            )
-            existing_step = await self.session.exec(existing_query).first()
-
-            if existing_step:
-                days_skipped.append(pick_up_date)
-                logger.debug(
-                    f"[AUTO_PRESET] Skipping {pick_up_date} (already has stack)"
-                )
-            else:
-                days_to_process.append(pick_up_date)
-
-        if not days_to_process:
+        if existing_step:
             logger.info(
-                f"[AUTO_PRESET] All days already have stack. Skipped {len(days_skipped)} days"
+                f"[AUTO_PRESET] Stack already exists for {location_id}/{airline}, skipping"
             )
             return AutoApplyResult(
                 applied=False,
-                reason="All days already have stack",
-                days_skipped=len(days_skipped)
+                reason="Stack already exists",
+                days_skipped=1,
             )
 
-        # 3. Clone preset to each day
+        # 3. Apply preset stack
         total_trips_affected = 0
         step_filter_service = StepFilterService(self.session)
 
-        for pick_up_date in days_to_process:
-            logger.debug(
-                f"[AUTO_PRESET] Cloning preset to {pick_up_date}"
+        for template in preset.stack_template:
+            config = FilterStepConfig(
+                filter_type=template.filter_type,
+                windows=[TimeWindow(**w) for w in template.windows]
             )
 
-            # Apply each step from template in order
-            for template in preset.stack_template:
-                config = FilterStepConfig(
-                    filter_type=template.filter_type,
-                    pick_up_date=str(pick_up_date),
-                    windows=[TimeWindow(**w) for w in template.windows]
+            try:
+                result = await step_filter_service.apply_step(
+                    location_id, airline, config
+                )
+                total_trips_affected += result.trips_modified
+                logger.debug(
+                    f"[AUTO_PRESET] Applied {template.filter_type}: "
+                    f"{result.trips_modified} trips modified"
+                )
+            except Exception as e:
+                logger.error(
+                    f"[AUTO_PRESET] Error applying {template.filter_type}: {e}"
                 )
 
-                try:
-                    result = await step_filter_service.apply_step(
-                        location_id, airline, config
-                    )
-                    total_trips_affected += result.trips_modified
-
-                    logger.debug(
-                        f"[AUTO_PRESET] Applied {template.filter_type} to {pick_up_date}: "
-                        f"{result.trips_modified} trips modified"
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"[AUTO_PRESET] Error applying {template.filter_type} "
-                        f"to {pick_up_date}: {e}"
-                    )
-                    # Continue with next template
-
         logger.info(
-            f"[AUTO_PRESET] Completed. Processed {len(days_to_process)} days, "
-            f"skipped {len(days_skipped)} days, affected {total_trips_affected} trips"
+            f"[AUTO_PRESET] Completed for {location_id}/{airline}: "
+            f"{total_trips_affected} trips affected"
         )
 
         return AutoApplyResult(
             applied=True,
-            days_processed=len(days_to_process),
-            days_skipped=len(days_skipped),
+            days_processed=1,
             trips_affected=total_trips_affected,
             stack_cloned_from_preset=True,
         )
@@ -272,30 +239,64 @@ class FilterPresetService:
         self,
         location_id: UUID,
         airline: str,
-        trips_by_date: dict[date, list[UUID]],
+        trip_ids: list[UUID],
     ) -> AutoApplyResult:
         """
         Auto-apply filters to newly imported trips (efficient version).
 
-        This is more efficient than auto_apply_preset because it:
-        1. For dates WITHOUT stack: Creates new stack from preset (applies to all trips)
-        2. For dates WITH stack: Re-applies existing stack to ONLY the new trips
+        Logic:
+        1. If active stack exists → apply existing stack to ONLY the new trips
+        2. If no stack but preset exists → apply preset (creates new stack for all trips)
 
         Args:
             location_id: Location UUID
             airline: Airline code
-            trips_by_date: Dict mapping pick_up_date -> list of new trip IDs
+            trip_ids: List of new trip IDs to apply filters to
 
         Returns:
             AutoApplyResult with summary of what was applied
         """
-        if not trips_by_date:
+        if not trip_ids:
             return AutoApplyResult(
                 applied=False,
                 reason="No trips to process"
             )
 
-        # 1. Get preset for location+airline
+        step_filter_service = StepFilterService(self.session)
+
+        # 1. Check if active stack already exists
+        existing_query = (
+            Select(FilterStep.id)
+            .Where(FilterStep.location_id == location_id)
+            .Where(FilterStep.airline == airline)
+            .Where(FilterStep.is_active == True)
+            .Limit(1)
+        )
+        existing_step = await self.session.exec(existing_query).first()
+
+        if existing_step:
+            # Apply existing stack to only the new trips
+            logger.info(
+                f"[AUTO_TRIPS] Applying existing stack to {len(trip_ids)} new trips "
+                f"for {location_id}/{airline}"
+            )
+            try:
+                modified = await step_filter_service.apply_existing_stack_to_trips(
+                    location_id, airline, trip_ids
+                )
+                logger.info(f"[AUTO_TRIPS] Applied stack to {modified} new trips")
+                return AutoApplyResult(
+                    applied=True,
+                    days_processed=0,
+                    trips_affected=modified,
+                    stack_cloned_from_preset=False,
+                    days_with_existing_stack=1,
+                )
+            except Exception as e:
+                logger.error(f"[AUTO_TRIPS] Error applying stack to new trips: {e}")
+                return AutoApplyResult(applied=False, reason=str(e))
+
+        # 2. No stack exists — check for preset and apply it
         preset = await self.get_preset(location_id, airline)
         if not preset:
             logger.debug(
@@ -307,106 +308,34 @@ class FilterPresetService:
             )
 
         logger.info(
-            f"[AUTO_TRIPS] Processing {len(trips_by_date)} dates with new trips "
-            f"for {location_id}/{airline}"
+            f"[AUTO_TRIPS] No stack found, applying preset for {location_id}/{airline}"
         )
 
-        step_filter_service = StepFilterService(self.session)
-
-        # 2. Separate dates by whether they have an existing stack
-        dates_with_stack: dict[date, list[UUID]] = {}
-        dates_without_stack: list[date] = []
-
-        for pick_up_date, trip_ids in trips_by_date.items():
-            # Check if day already has steps
-            existing_query = (
-                Select(FilterStep.id)
-                .Where(FilterStep.location_id == location_id)
-                .Where(FilterStep.airline == airline)
-                .Where(FilterStep.pick_up_date == pick_up_date)
-                .Where(FilterStep.is_active == True)
-                .Limit(1)
-            )
-            existing_step = await self.session.exec(existing_query).first()
-
-            if existing_step:
-                dates_with_stack[pick_up_date] = trip_ids
-                logger.debug(
-                    f"[AUTO_TRIPS] {pick_up_date}: Has stack, will apply to {len(trip_ids)} new trips"
-                )
-            else:
-                dates_without_stack.append(pick_up_date)
-                logger.debug(
-                    f"[AUTO_TRIPS] {pick_up_date}: No stack, will create from preset"
-                )
-
         total_trips_affected = 0
-        days_processed = 0
-        days_with_existing_stack = 0
-
-        # 3. For dates WITHOUT stack: Create new stack from preset (applies to ALL trips)
-        for pick_up_date in dates_without_stack:
-            logger.debug(f"[AUTO_TRIPS] Creating stack for {pick_up_date}")
-
-            for template in preset.stack_template:
-                config = FilterStepConfig(
-                    filter_type=template.filter_type,
-                    pick_up_date=str(pick_up_date),
-                    windows=[TimeWindow(**w) for w in template.windows]
-                )
-
-                try:
-                    result = await step_filter_service.apply_step(
-                        location_id, airline, config
-                    )
-                    total_trips_affected += result.trips_modified
-
-                    logger.debug(
-                        f"[AUTO_TRIPS] {pick_up_date}: Applied {template.filter_type}, "
-                        f"{result.trips_modified} trips"
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"[AUTO_TRIPS] Error applying {template.filter_type} "
-                        f"to {pick_up_date}: {e}"
-                    )
-
-            days_processed += 1
-
-        # 4. For dates WITH stack: Apply existing stack to ONLY the new trips
-        for pick_up_date, trip_ids in dates_with_stack.items():
-            logger.debug(
-                f"[AUTO_TRIPS] Applying existing stack to {len(trip_ids)} new trips for {pick_up_date}"
+        for template in preset.stack_template:
+            config = FilterStepConfig(
+                filter_type=template.filter_type,
+                windows=[TimeWindow(**w) for w in template.windows]
             )
-
             try:
-                modified = await step_filter_service.apply_existing_stack_to_trips(
-                    location_id, airline, pick_up_date, trip_ids
+                result = await step_filter_service.apply_step(
+                    location_id, airline, config
                 )
-                total_trips_affected += modified
-                days_with_existing_stack += 1
-
+                total_trips_affected += result.trips_modified
                 logger.debug(
-                    f"[AUTO_TRIPS] {pick_up_date}: Applied stack to new trips, "
-                    f"{modified} modifications"
+                    f"[AUTO_TRIPS] Applied {template.filter_type}: "
+                    f"{result.trips_modified} trips modified"
                 )
             except Exception as e:
-                logger.error(
-                    f"[AUTO_TRIPS] Error applying stack to new trips for {pick_up_date}: {e}"
-                )
+                logger.error(f"[AUTO_TRIPS] Error applying {template.filter_type}: {e}")
 
         logger.info(
-            f"[AUTO_TRIPS] Completed. "
-            f"Created {days_processed} new stacks, "
-            f"applied to {days_with_existing_stack} existing stacks, "
-            f"{total_trips_affected} total trips affected"
+            f"[AUTO_TRIPS] Completed: {total_trips_affected} total trips affected"
         )
 
         return AutoApplyResult(
             applied=True,
-            days_processed=days_processed,
-            days_skipped=0,
+            days_processed=1,
             trips_affected=total_trips_affected,
-            stack_cloned_from_preset=days_processed > 0,
-            days_with_existing_stack=days_with_existing_stack,
+            stack_cloned_from_preset=True,
         )
