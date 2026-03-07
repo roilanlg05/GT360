@@ -2,6 +2,11 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 import os

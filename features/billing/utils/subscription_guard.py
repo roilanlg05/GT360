@@ -3,11 +3,18 @@ Subscription guard utilities.
 
 Use check_can_add_location() and check_can_add_driver() inside route handlers
 to enforce plan limits before performing the restricted action.
+
+For generic manager write endpoints use the FastAPI dependency:
+
+    from features.billing.utils.subscription_guard import ActiveSubscription
+    ...
+    _sub=Depends(ActiveSubscription),
 """
 from datetime import datetime, timezone
-from fastapi import HTTPException
+from fastapi import HTTPException, Depends, Request
 from psqlmodel import Select, Count, AsyncSession
 
+from shared.db.db_config import get_db
 from shared.db.schemas.billing.subscriptions import Subscription, SubscriptionStatus, PlanType
 
 
@@ -56,6 +63,25 @@ def _resolve_effective_plan(sub: Subscription) -> str | None:
     )
 
 
+async def _get_or_create_trial(session: AsyncSession, org_id: str) -> "Subscription":
+    """Return subscription, auto-creating a trial for orgs that pre-date billing."""
+    from datetime import timedelta
+    from shared.settings import settings
+    sub = await get_subscription(session, org_id)
+    if not sub:
+        now_utc = datetime.now(timezone.utc)
+        sub = Subscription(
+            organization_id=org_id,
+            status=SubscriptionStatus.TRIALING,
+            trial_start=now_utc,
+            trial_end=now_utc + timedelta(days=settings.FREE_TRIAL_DAYS),
+        )
+        session.add(sub)
+        await session.commit()
+        await session.refresh(sub)
+    return sub
+
+
 async def check_can_add_location(session: AsyncSession, org_id: str) -> None:
     """
     Raise HTTP 402/403 if the org is not allowed to create a new location.
@@ -63,12 +89,7 @@ async def check_can_add_location(session: AsyncSession, org_id: str) -> None:
     """
     from shared.db.schemas import Location
 
-    sub = await get_subscription(session, org_id)
-    if not sub:
-        raise HTTPException(
-            status_code=402,
-            detail="No subscription found. Please activate a subscription to use this feature."
-        )
+    sub = await _get_or_create_trial(session, org_id)
 
     effective_plan = _resolve_effective_plan(sub)
 
@@ -101,12 +122,35 @@ async def check_can_add_driver(session: AsyncSession, org_id: str) -> None:
     Raise HTTP 402 if the org is not allowed to create a new driver.
     Any active subscription (including valid trial) allows adding drivers.
     """
-    sub = await get_subscription(session, org_id)
-    if not sub:
-        raise HTTPException(
-            status_code=402,
-            detail="No subscription found. Please activate a subscription to use this feature."
-        )
-
+    sub = await _get_or_create_trial(session, org_id)
     # This will raise if trial expired or status is non-active
+    _resolve_effective_plan(sub)
+
+
+async def check_can_upload_schedule(session: AsyncSession, org_id: str) -> None:
+    """
+    Raise HTTP 402 if the org is not allowed to upload a trip schedule.
+    Any active subscription (including valid trial) allows uploads.
+    This check runs ALWAYS, regardless of whether a new location is created.
+    """
+    sub = await _get_or_create_trial(session, org_id)
+    _resolve_effective_plan(sub)
+
+
+async def ActiveSubscription(
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+) -> None:
+    """
+    FastAPI dependency — blocks any manager write operation when the
+    subscription is expired or inactive.
+
+    Usage:
+        @router.post("/path")
+        async def endpoint(..., _sub=Depends(ActiveSubscription)):
+    """
+    org_id = request.state.user_data.get("organization_id")
+    if not org_id:
+        raise HTTPException(status_code=403, detail="Organization not found in session.")
+    sub = await _get_or_create_trial(session, str(org_id))
     _resolve_effective_plan(sub)

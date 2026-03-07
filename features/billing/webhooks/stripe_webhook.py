@@ -112,7 +112,10 @@ async def _handle_checkout_completed(event: stripe.Event, session: AsyncSession)
 
     session.add(sub)
     await session.commit()
-    logger.info(f"[BILLING] Checkout completed: org={org_id} plan={plan_type} status={status}")
+    print(
+        f"[BILLING] checkout.session.completed | org={org_id} plan={plan_type} "
+        f"status={status} period={sub.current_period_start} → {sub.current_period_end}"
+    )
 
 
 async def _handle_subscription_updated(event: stripe.Event, session: AsyncSession) -> None:
@@ -133,14 +136,22 @@ async def _handle_subscription_updated(event: stripe.Event, session: AsyncSessio
 
     sub.plan_type = plan_type
     sub.status = status
-    sub.current_period_start = _ts(stripe_sub.get("current_period_start"))
-    sub.current_period_end = _ts(stripe_sub.get("current_period_end"))
+    # Only update period if Stripe actually provides them — never overwrite with None
+    period_start = _ts(stripe_sub.get("current_period_start"))
+    period_end = _ts(stripe_sub.get("current_period_end"))
+    if period_start is not None:
+        sub.current_period_start = period_start
+    if period_end is not None:
+        sub.current_period_end = period_end
     sub.cancel_at_period_end = stripe_sub.get("cancel_at_period_end", False)
     sub.updated_at = datetime.now(timezone.utc)
 
     session.add(sub)
     await session.commit()
-    logger.info(f"[BILLING] Subscription updated: org={sub.organization_id} plan={plan_type} status={status}")
+    print(
+        f"[BILLING] customer.subscription.updated | org={sub.organization_id} plan={plan_type} "
+        f"status={status} period={period_start} → {period_end}"
+    )
 
 
 async def _handle_subscription_deleted(event: stripe.Event, session: AsyncSession) -> None:
@@ -167,16 +178,19 @@ async def _handle_subscription_deleted(event: stripe.Event, session: AsyncSessio
         ),
         "subscription_status": SubscriptionStatus.CANCELED,
     })
-    logger.info(f"[BILLING] Subscription canceled for org {org_id}")
+    print(f"[BILLING] customer.subscription.deleted | org={org_id} → CANCELED")
 
 
 async def _handle_invoice_paid(event: stripe.Event, session: AsyncSession) -> None:
     invoice = event["data"]["object"]
     stripe_sub_id = invoice.get("subscription")
+    print(f"[BILLING] invoice.paid → stripe_sub_id={stripe_sub_id}")
     if not stripe_sub_id:
+        print("[BILLING] invoice.paid → no stripe_sub_id, skipping")
         return
 
     sub = await _get_sub_by_stripe_id(session, stripe_sub_id)
+    print(f"[BILLING] invoice.paid → local sub found: {sub is not None} | org={getattr(sub, 'organization_id', None)}")
     if not sub:
         return
 
@@ -191,13 +205,28 @@ async def _handle_invoice_paid(event: stripe.Event, session: AsyncSession) -> No
             "subscription_status": SubscriptionStatus.ACTIVE,
         })
 
-    # Update period from the lines (take the first subscription line item)
-    for line in invoice.get("lines", {}).get("data", []):
-        if line.get("type") == "subscription":
+    # Prefer top-level period fields on the invoice (always present)
+    period_start = _ts(invoice.get("period_start"))
+    period_end = _ts(invoice.get("period_end"))
+
+    # Fallback: scan line items for the subscription charge
+    if not period_start or not period_end:
+        for line in invoice.get("lines", {}).get("data", []):
             period = line.get("period", {})
-            sub.current_period_start = _ts(period.get("start"))
-            sub.current_period_end = _ts(period.get("end"))
-            break
+            period_start = period_start or _ts(period.get("start"))
+            period_end = period_end or _ts(period.get("end"))
+            if period_start and period_end:
+                break
+
+    if period_start is not None:
+        sub.current_period_start = period_start
+    if period_end is not None:
+        sub.current_period_end = period_end
+
+    print(
+        f"[BILLING] invoice.paid | org={sub.organization_id} "
+        f"period={period_start} → {period_end}"
+    )
 
     sub.updated_at = datetime.now(timezone.utc)
     session.add(sub)
@@ -238,7 +267,7 @@ async def _handle_payment_failed(event: stripe.Event, session: AsyncSession) -> 
         "subscription_status": SubscriptionStatus.PAST_DUE,
         "attempt_count": attempt_count,
     })
-    logger.warning(f"[BILLING] Payment failed for org {org_id} (attempt {attempt_count})")
+    print(f"[BILLING] invoice.payment_failed | org={org_id} attempt={attempt_count} next={next_attempt_str}")
 
 
 # ─── Webhook Endpoint ─────────────────────────────────────────────────────────
@@ -268,6 +297,7 @@ async def stripe_webhook(request: Request):
 
     async with _AsyncSession(engine) as session:
         try:
+            print(f"[BILLING] Event received: {event['type']}")
             match event["type"]:
                 case "checkout.session.completed":
                     await _handle_checkout_completed(event, session)
@@ -280,9 +310,9 @@ async def stripe_webhook(request: Request):
                 case "invoice.payment_failed":
                     await _handle_payment_failed(event, session)
                 case _:
-                    logger.debug(f"[BILLING] Unhandled Stripe event: {event['type']}")
+                    print(f"[BILLING] Unhandled event (ignored): {event['type']}")
         except Exception as e:
-            logger.error(f"[BILLING] Error processing event {event['type']}: {e}")
+            print(f"[BILLING] ERROR processing {event['type']}: {e}")
             # Return 200 anyway to prevent Stripe retries for non-transient errors
             return {"received": True, "error": str(e)}
 

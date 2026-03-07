@@ -3,6 +3,7 @@ from psqlmodel import Select, Delete, AsyncSession
 from shared.db.db_config import get_db
 from shared.db.schemas import Driver, User, Organization, Location, Trip as TripDB, TripStatus
 from features.auth.utils import verify_role, encode_token, revoke_all_user_refresh
+from features.billing.utils.subscription_guard import ActiveSubscription
 from features.auth.utils.smtp import send_email, get_confirmation_email_template
 from features.drivers.models.driver_models import DriverActiveUpdate, DriverDetailsUpdate, DriverResponse, DriverStatusResponse, DriverLocationSharingUpdate, DriverLocationUpdate
 from features.drivers.utils.location_ws_manager import driver_location_manager
@@ -432,7 +433,8 @@ async def update_driver_location_sharing(
     data: DriverLocationSharingUpdate,
     request: Request,
     session: AsyncSession = Depends(get_db),
-    _role=Depends(verify_role(["manager"]))
+    _role=Depends(verify_role(["manager"])),
+    _sub=Depends(ActiveSubscription),
 ):
     """Toggle driver-to-driver location sharing for an organization."""
     user_data = request.state.user_data
@@ -537,7 +539,8 @@ async def delete_driver_from_organization(
     driver_id: UUID,
     request: Request,
     session: AsyncSession = Depends(get_db),
-    _role=Depends(verify_role(["manager"]))
+    _role=Depends(verify_role(["manager"])),
+    _sub=Depends(ActiveSubscription),
 ):
     """Remove a driver from the organization. This permanently deletes the driver's account."""
     user_data = request.state.user_data

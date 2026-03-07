@@ -12,6 +12,7 @@ from datetime import date, datetime, timezone
 
 from shared.db.db_config import get_db
 from features.auth.utils import verify_role
+from features.billing.utils.subscription_guard import ActiveSubscription
 from features.drivers.services.tax_service import (
     get_drivers_for_1099,
     calculate_1099_data,
@@ -140,7 +141,8 @@ async def generate_all_1099s(
     year: int,
     min_earnings: float = 600.00,
     session: AsyncSession = Depends(get_db),
-    _role=Depends(verify_role(["manager"]))
+    _role=Depends(verify_role(["manager"])),
+    _sub=Depends(ActiveSubscription),
 ):
     """
     Generate PDF 1099 forms for all eligible drivers.

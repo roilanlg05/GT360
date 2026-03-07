@@ -185,7 +185,7 @@ async def register_driver(
     ) -> dict:
 
     try:
-        await verify_if_exist(session, user_data.email)
+        await verify_if_exist(session, user_data.email, user_data.phone)
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
 

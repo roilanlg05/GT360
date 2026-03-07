@@ -23,6 +23,11 @@ class RequestLoggerMiddleware:
             await self.app(scope, receive, send)
             return
 
+        # Skip health/readiness probes
+        if scope.get("path") in ("/health", "/ready"):
+            await self.app(scope, receive, send)
+            return
+
         # Extract request info from scope
         client = scope.get("client")
         client_ip = client[0] if client else "unknown"

@@ -33,6 +33,7 @@ from zoneinfo import ZoneInfo
 from typing import Optional
 from uuid import UUID
 from features.auth.utils import verify_role
+from features.billing.utils.subscription_guard import ActiveSubscription
 from features.trips.utils import get_locations_by_org_id, tz_from_latlon
 from features.trips.utils.trip_classifier import classify_trip_type
 from shared.db.schemas import TripType, TripStatus
@@ -81,8 +82,12 @@ async def upload_trips(
     user_data = request.state.user_data
     org_id = user_data.get("organization_id")
 
+    # Check subscription before any processing
+    from features.billing.utils.subscription_guard import check_can_upload_schedule
+    await check_can_upload_schedule(session, str(org_id))
+
     print(f"ORGANIZATION: {org_id}")
-    
+
     organization = await session.exec(
         Select(Organization)
         .Where(Organization.id == org_id)
@@ -478,7 +483,8 @@ async def create_trip(
     request: Request,
     trip_data: CreateTrip,
     session: AsyncSession = Depends(get_db),
-    _role=Depends(verify_role(["manager"]))
+    _role=Depends(verify_role(["manager"])),
+    _sub=Depends(ActiveSubscription),
     ):
     """
     Crea un nuevo trip en una location específica.
@@ -1029,10 +1035,11 @@ async def get_trip_details(
 
 
 @router.delete("/v1/locations/{location_id}/trips/all")
-async def delete_all_trips(    
+async def delete_all_trips(
     location_id: str,
     session: AsyncSession = Depends(get_db),
-    _role=Depends(verify_role(["manager"]))
+    _role=Depends(verify_role(["manager"])),
+    _sub=Depends(ActiveSubscription),
 ):
     """
     Elimina todos los trips de una location específica.
@@ -1097,7 +1104,8 @@ async def delete_trips(
     location_id: str,
     trip_ids: list[str] = Query(..., description="Lista de IDs de trips a eliminar"),
     session: AsyncSession = Depends(get_db),
-    _role=Depends(verify_role(["manager"]))
+    _role=Depends(verify_role(["manager"])),
+    _sub=Depends(ActiveSubscription),
 ):
     """
     Elimina múltiples trips por sus IDs y location_id.
@@ -1158,7 +1166,8 @@ async def delete_trips_by_airline(
     status: Optional[str] = Query(None, description="Opcional: Borrar solo trips con este status"),
     confirm: str = Query(..., description="Escribe 'DELETE_ALL' para confirmar"),
     session: AsyncSession = Depends(get_db),
-    _role=Depends(verify_role(["manager"]))
+    _role=Depends(verify_role(["manager"])),
+    _sub=Depends(ActiveSubscription),
 ):
     """
     Elimina todos los trips de una aerolínea específica en una location.
@@ -1277,7 +1286,8 @@ async def edit_trip(
     trip_id: str,
     trip_update: TripUpdate,
     session: AsyncSession = Depends(get_db),
-    _role=Depends(verify_role(["manager"]))
+    _role=Depends(verify_role(["manager"])),
+    _sub=Depends(ActiveSubscription),
 ):
     """
     Actualiza un trip por su ID y location_id.
@@ -1440,7 +1450,8 @@ async def delete_location(
     location_id: str,
     request: Request,
     session: AsyncSession = Depends(get_db),
-    _role=Depends(verify_role(["manager"]))
+    _role=Depends(verify_role(["manager"])),
+    _sub=Depends(ActiveSubscription),
 ):
     from uuid import UUID
 
@@ -2258,7 +2269,8 @@ async def edit_hotel(
     location_id: str,
     hotel_data: HotelPointUpdate,
     session: AsyncSession = Depends(get_db),
-    _role=Depends(verify_role(["manager"]))
+    _role=Depends(verify_role(["manager"])),
+    _sub=Depends(ActiveSubscription),
 ):
     """
     Actualiza el point y/o radio_zone de un hotel.
@@ -2306,7 +2318,8 @@ async def create_hotel(
     location_id: str,
     hotel_data: HotelCreate,
     session: AsyncSession = Depends(get_db),
-    _role=Depends(verify_role(["manager"]))
+    _role=Depends(verify_role(["manager"])),
+    _sub=Depends(ActiveSubscription),
 ):
     """
     Crea un nuevo hotel para una location.
@@ -3279,7 +3292,8 @@ async def get_or_create_qr_code(
     request: Request,
     response: Response,
     session: AsyncSession = Depends(get_db),
-    _role=Depends(verify_role(["manager"]))
+    _role=Depends(verify_role(["manager"])),
+    _sub=Depends(ActiveSubscription),
 ):
     """
     Get or create the QR code for a location (idempotent).

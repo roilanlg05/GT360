@@ -11,6 +11,7 @@ from decimal import Decimal
 
 from shared.db.db_config import get_db
 from features.auth.utils import verify_role
+from features.billing.utils.subscription_guard import ActiveSubscription
 from features.drivers.models.expense_models import (
     ResolveExpenseRequest,
     ResolveExpenseResponse
@@ -134,7 +135,8 @@ async def resolve_expense(
     request_data: ResolveExpenseRequest,
     request: Request,
     session: AsyncSession = Depends(get_db),
-    _role=Depends(verify_role(["manager"]))
+    _role=Depends(verify_role(["manager"])),
+    _sub=Depends(ActiveSubscription),
 ):
     """
     Resolve an expense review.

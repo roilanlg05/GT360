@@ -96,9 +96,9 @@ async def verify_if_exist(
     if not row:
         return
 
-    if row["email"] and row["email"].lower() == email.lower():
+    if row[0] and row[0].lower() == email.lower():
         raise ValueError("Email already in use")
-    if phone and row["phone"] == phone:
+    if phone and row[1] == phone:
         raise ValueError("Phone already in use")
 
 

@@ -11,6 +11,7 @@ from uuid import UUID
 
 from shared.db.db_config import get_db
 from features.auth.utils import verify_role
+from features.billing.utils.subscription_guard import ActiveSubscription
 from features.drivers.models.shift_models import (
     ResolveShiftRequest,
     ResolveShiftResponse
@@ -135,7 +136,8 @@ async def resolve_shift(
     request_data: ResolveShiftRequest,
     request: Request,
     session: AsyncSession = Depends(get_db),
-    _role=Depends(verify_role(["manager"]))
+    _role=Depends(verify_role(["manager"])),
+    _sub=Depends(ActiveSubscription),
 ):
     """
     Resolve a shift under review.

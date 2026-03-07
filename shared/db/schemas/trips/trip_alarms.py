@@ -1,5 +1,5 @@
 from psqlmodel import table, Column, PSQLModel, UniqueConstraint
-from psqlmodel.orm.types import uuid, timestamptz, timestamp
+from psqlmodel.orm.types import uuid, timestamptz
 from psqlmodel.utils import gen_default_uuid, now
 
 
@@ -27,7 +27,7 @@ class TripAlarm(PSQLModel):
         index=True,
     )
 
-    alarm_at: timestamp = Column(
+    alarm_at: timestamptz = Column(
         nullable=False,
     )
 

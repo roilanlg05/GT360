@@ -12,6 +12,7 @@ from features.trips.models.review_models import (
     ReviewResponse,
 )
 from features.auth.utils import verify_role
+from features.billing.utils.subscription_guard import ActiveSubscription
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from uuid import UUID
@@ -233,7 +234,8 @@ async def resolve_review(
     request: Request,
     request_data: ReviewResolveRequest,
     session: AsyncSession = Depends(get_db),
-    _role=Depends(verify_role(["manager"]))
+    _role=Depends(verify_role(["manager"])),
+    _sub=Depends(ActiveSubscription),
 ):
     """
     Marca pickup o dropoff de un review como revisado por el manager.

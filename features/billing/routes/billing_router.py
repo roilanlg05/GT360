@@ -38,7 +38,19 @@ async def get_subscription_status(
     ).first()
 
     if not sub:
-        raise HTTPException(status_code=404, detail="No subscription record found for this organization.")
+        # Org registered before billing was introduced — backfill a trial subscription
+        from shared.db.schemas.billing.subscriptions import PlanType
+        from datetime import timedelta
+        now_utc = datetime.now(timezone.utc)
+        sub = Subscription(
+            organization_id=org_id,
+            status=SubscriptionStatus.TRIALING,
+            trial_start=now_utc,
+            trial_end=now_utc + timedelta(days=settings.FREE_TRIAL_DAYS),
+        )
+        session.add(sub)
+        await session.commit()
+        await session.refresh(sub)
 
     now_utc = datetime.now(timezone.utc)
     trial_end = sub.trial_end
